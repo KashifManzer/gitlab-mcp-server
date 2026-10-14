@@ -381,7 +381,7 @@ func main() {
 	}
 
 	if probeHealth {
-		deps := probeDeps{peers: livePeers, stdinIsNull: peerStdinIsNull}
+		deps := probeDeps{peers: livePeers, stdinIsNull: peerStdinIsNull, workingDir: peerWorkingDir}
 		exitProcess(runProbe(context.Background(), flag.Args(), hcfg.tlsCert, deps, os.Stderr))
 		return
 	}
@@ -606,9 +606,10 @@ FLAGS
   -telemetry-identity str   What telemetry records about the caller: none|pseudonymous|full (default none)
   -telemetry-identity-rotation str
                             How long a generated pseudonymisation key lives, e.g. 24h (empty keeps it for the process)
-  -telemetry-tool-name str  Whether the tool name is a metric dimension: auto|on|off (default auto:
-                            on for dynamic and meta, off for individual, where ~1000 tools would
-                            exhaust the cardinality limit and collapse the long tail)
+  -telemetry-tool-name str  Whether the tool name and the action are metric dimensions, the two
+                            together: auto|on|off (default auto: on for dynamic and meta, off for
+                            individual, where ~1000 tools would exhaust the cardinality limit and
+                            collapse the long tail; the domain is kept either way)
 
   Off by default, and it goes to a collector you configure through the
   standard OTEL_EXPORTER_OTLP_* environment; nothing is ever sent anywhere
@@ -670,8 +671,8 @@ ENVIRONMENT VARIABLES (stdio mode)
   GITLAB_MCP_TELEMETRY_IDENTITY_ROTATION
                                     How long a generated pseudonymisation key lives, e.g. 24h
                                     (default: process lifetime)
-  GITLAB_MCP_TELEMETRY_TOOL_NAME    Whether gen_ai.tool.name is a metric dimension: auto|on|off
-                                    (default auto)
+  GITLAB_MCP_TELEMETRY_TOOL_NAME    Whether gen_ai.tool.name and gitlab_mcp.action are metric
+                                    dimensions, the two together: auto|on|off (default auto)
   GITLAB_MCP_LOG_LEVEL              Logging: debug/info/warn/error (default info)
   GITLAB_MCP_PPROF_ADDR             Loopback address for Go's profiling handlers, e.g. 127.0.0.1:6060
                                     (default empty: nothing served). Both transports
@@ -2130,20 +2131,6 @@ func newServerShell(
 		server.AddReceivingMiddleware(clientcompat.Middleware())
 	}
 
-	// Operator-defined catalog text substitutions, for MCP gateways whose
-	// validators reject characters this server's descriptions carry
-	// (GITLAB_MCP_DESCRIPTION_SUBSTITUTIONS). In stdio mode this runs before
-	// the transport is connected, so a parse error here is still a startup
-	// failure; in HTTP mode runHTTP already validated the value before the
-	// listener came up.
-	gatewaySubs, substErr := gatewaycompat.FromEnv()
-	if substErr != nil {
-		return nil, substErr
-	}
-	if rewrite := catalogTextRewriter(gatewaySubs); rewrite != nil {
-		server.AddReceivingMiddleware(rewrite)
-	}
-
 	// Capability/method consistency: the SDK dispatches logging/setLevel
 	// unconditionally although this server never declares the logging
 	// capability, and on the minimal capability surface prompts/list would
@@ -2168,9 +2155,31 @@ func newServerShell(
 
 	// Inject JSON Schema numeric bounds on the standard pagination
 	// parameters so LLM clients see `page >= 1` and `1 <= per_page <= 100`
-	// directly in tools/list. Installed after the lockdown so it sits inside
-	// it in the chain and operates on the same finalized schema set.
+	// directly in tools/list. Installed after the lockdown, so it wraps it:
+	// the lockdown sees the first listing first and this pass then rewrites
+	// the same registered tools.
 	toolutil.EnrichPaginationConstraints(server)
+
+	// Operator-defined catalog text substitutions, for MCP gateways whose
+	// validators reject characters this server's descriptions carry
+	// (GITLAB_MCP_DESCRIPTION_SUBSTITUTIONS). In stdio mode this runs before
+	// the transport is connected, so a parse error here is still a startup
+	// failure; in HTTP mode runHTTP already validated the value before the
+	// listener came up.
+	//
+	// Installed after both one-time schema passes, so it wraps them and sees a
+	// listing only once they have finalized the registered tools. The rewriter
+	// answers with copies, and installed inside them it handed the passes its
+	// copies instead: the registered tools were never finalized, and setting any
+	// substitution changed the schemas every tool served (issue 1330). A pass of
+	// that kind added later belongs above this line for the same reason.
+	gatewaySubs, substErr := gatewaycompat.FromEnv()
+	if substErr != nil {
+		return nil, substErr
+	}
+	if rewrite := catalogTextRewriter(gatewaySubs); rewrite != nil {
+		server.AddReceivingMiddleware(rewrite)
+	}
 
 	// Ceiling on concurrent open subscriptions/listen streams. Installed for
 	// every server rather than beside the subscription runtime, because that
@@ -5057,7 +5066,7 @@ func doToolSearch(query, toolSurface string, tier edition.Tier) error {
 	// EffectiveToolSurface answers one of exactly these three, so there is no
 	// fourth case to refuse.
 	surface := config.EffectiveToolSurface(toolSurface)
-	matches := matchCatalogActions(catalog.Actions(), terms, surface)
+	matches := matchCatalogActions(catalog.Actions(), terms, surface, standaloneToolGroups(catalog))
 	if len(matches) == 0 {
 		fmt.Printf("No actions found matching %q (tier %s, %s surface)\n", query, tier, surface)
 		return nil
@@ -5074,8 +5083,10 @@ func doToolSearch(query, toolSurface string, tier edition.Tier) error {
 }
 
 // matchCatalogActions returns the actions whose searchable text contains every
-// term, ordered by canonical ID so two runs of one query agree.
-func matchCatalogActions(actions []actioncatalog.Action, terms []string, surface string) []toolSearchMatch {
+// term, ordered by canonical ID so two runs of one query agree. standalone
+// names the catalog groups whose actions are tools of their own rather than
+// arguments of a dispatcher ([standaloneToolGroups]).
+func matchCatalogActions(actions []actioncatalog.Action, terms []string, surface string, standalone map[string]bool) []toolSearchMatch {
 	matches := make([]toolSearchMatch, 0, len(actions))
 	for _, action := range actions {
 		if !matchesAllTerms(actionSearchText(action), terms) {
@@ -5083,7 +5094,7 @@ func matchCatalogActions(actions []actioncatalog.Action, terms []string, surface
 		}
 		matches = append(matches, toolSearchMatch{
 			action:      string(action.ID),
-			tool:        toolSearchCallForm(surface, action),
+			tool:        toolSearchCallForm(surface, action, standalone[action.ToolName]),
 			description: truncateDescription(actionSearchDescription(action)),
 		})
 	}
@@ -5133,14 +5144,36 @@ func actionSearchDescription(action actioncatalog.Action) string {
 	return strings.TrimSpace(action.Usage)
 }
 
+// standaloneToolGroups names the catalog groups whose actions the meta surface
+// registers as tools of their own rather than as values of a dispatcher's
+// action argument: the standalone utilities, project discovery and the guided
+// flows, which join the search catalog from their surface specs and keep the
+// kind those specs declare. Every group built from domain ActionSpecs is a
+// meta dispatcher.
+func standaloneToolGroups(catalog *actioncatalog.Catalog) map[string]bool {
+	groups := make(map[string]bool)
+	for _, group := range catalog.Groups() {
+		if group.SurfaceKind == actioncatalog.SurfaceKindRuntimeUtility || group.SurfaceKind == actioncatalog.SurfaceKindInteractiveUtility {
+			groups[group.ToolName] = true
+		}
+	}
+	return groups
+}
+
 // toolSearchCallForm is how the configured surface names one action.
-func toolSearchCallForm(surface string, action actioncatalog.Action) string {
-	if surface == config.ToolSurfaceMeta {
+// standalone says the action's group is a standalone utility, which the meta
+// surface serves as one tool per action under the action's own tool name,
+// taking no action argument: `gitlab_interactive action=issue_create` named a
+// tool meta does not list, and `gitlab_discover_project action=resolve` an
+// argument its schema refuses.
+func toolSearchCallForm(surface string, action actioncatalog.Action, standalone bool) string {
+	if surface == config.ToolSurfaceMeta && !standalone {
 		return action.ToolName + " action=" + action.Name
 	}
 	// Individual and dynamic both show the individual tool name: on one it is
 	// the call, and on the other it is the cross-reference a reader coming
-	// from another client's tool list needs.
+	// from another client's tool list needs. A standalone utility on meta is
+	// registered under that same name.
 	if name := strings.TrimSpace(action.IndividualTool.Name); name != "" {
 		return name
 	}
@@ -5154,7 +5187,7 @@ func toolSearchCallHint(surface string) string {
 	case config.ToolSurfaceIndividual:
 		return `Call the tool named under TOOL. An action shown as "-" is not registered on this surface.`
 	case config.ToolSurfaceMeta:
-		return "Call the tool named under TOOL with that action argument."
+		return "Call the tool named under TOOL, with the action argument it shows when it shows one."
 	default:
 		return `Call gitlab_execute_action with {"action": "<ACTION>", "params": {...}}. TOOL is the name the individual surface would register.`
 	}

@@ -6,16 +6,19 @@ package gitlab
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -102,6 +105,74 @@ func TestDestinationGuard_OperatorNamedInstance_IsExempt(t *testing.T) {
 	})
 }
 
+// socketNeverCreated reports whether err says the operating system refused to
+// create the socket at all, which is the one dial failure that happens before
+// [guardDestination] can run.
+//
+// The standard library calls a ControlContext hook from inside the dial,
+// after socket(2) has succeeded, so a host that refuses the address family
+// (a kernel booted with ipv6.disable=1, or a sandbox whose seccomp policy
+// answers socket(AF_INET6) with EAFNOSUPPORT) fails the dial before the
+// guard is asked. Every other failure, a refused connect included, comes
+// after the guard and says nothing about it either way. A container that
+// merely has no IPv6 address still creates the socket, so the guard runs
+// there and the row is held.
+//
+// The syscall name is what the standard library wraps that failure in on
+// every platform it builds a socket on; the errno is checked as well for a
+// path that reports it bare.
+func socketNeverCreated(err error) bool {
+	var sysErr *os.SyscallError
+	if errors.As(err, &sysErr) && sysErr.Syscall == "socket" {
+		return true
+	}
+	return errors.Is(err, syscall.EAFNOSUPPORT)
+}
+
+// TestSocketNeverCreated_TellsTheSocketFailureFromTheGuard holds the skip
+// below to the one failure it is for. A skip that also matched the guard's
+// own refusal would turn every row of the transport test into a skip on the
+// host where it matters most, and one that matched a connect failure would
+// skip a row whose guard did run.
+func TestSocketNeverCreated_TellsTheSocketFailureFromTheGuard(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "the address family refused when the socket is created",
+			err:  &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("socket", syscall.EAFNOSUPPORT)},
+			want: true,
+		},
+		{
+			name: "any refusal of socket(2), whatever its errno",
+			err:  &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("socket", syscall.EPERM)},
+			want: true,
+		},
+		{name: "the errno reported bare", err: syscall.EAFNOSUPPORT, want: true},
+		{
+			name: "the guard's refusal",
+			err:  &net.OpError{Op: "dial", Net: "tcp", Err: ErrDestinationRefused},
+			want: false,
+		},
+		{
+			name: "a refused connect, which comes after the guard",
+			err:  &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)},
+			want: false,
+		},
+		{name: "no error", err: nil, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := socketNeverCreated(tt.err); got != tt.want {
+				t.Errorf("socketNeverCreated(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestBaseTransport_RefusesPrivateDestinations checks each address class tier B
 // covers, through the transport every client dials with.
 //
@@ -110,6 +181,10 @@ func TestDestinationGuard_OperatorNamedInstance_IsExempt(t *testing.T) {
 // that inspects the URL can refuse it. Only a check made after resolution can,
 // which is the whole reason the guard is a ControlContext hook rather than a
 // round tripper.
+//
+// A row is skipped only where the host refused to create its socket, since the
+// guard is never asked there; [TestGuardDestination_CallerNamedStamp_JudgesWithoutASocket]
+// holds the classification on such a host.
 func TestBaseTransport_RefusesPrivateDestinations(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -128,6 +203,43 @@ func TestBaseTransport_RefusesPrivateDestinations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := dialThroughBaseTransport(t, callerChosenTarget(), tt.address)
+			if socketNeverCreated(err) {
+				t.Skipf("this host refused to create the socket, so the guard was never asked: %v", err)
+			}
+
+			if got := errors.Is(err, ErrDestinationRefused); got != tt.wantRefused {
+				t.Fatalf("refused = %v, want %v (err = %v)", got, tt.wantRefused, err)
+			}
+		})
+	}
+}
+
+// TestGuardDestination_CallerNamedStamp_JudgesWithoutASocket asks the guard
+// directly about the addresses the transport test dials, under the stamp a
+// caller-named instance carries.
+//
+// It opens no socket, so it holds the classification on a host whose kernel
+// or sandbox refuses an address family, where the transport row is skipped:
+// ::1 is refused there exactly as everywhere else, and a public address is
+// still let through, which is what tells a refusal from a guard that refuses
+// everything.
+func TestGuardDestination_CallerNamedStamp_JudgesWithoutASocket(t *testing.T) {
+	tests := []struct {
+		name        string
+		address     string
+		wantRefused bool
+	}{
+		{name: "loopback ipv6", address: "[::1]:9", wantRefused: true},
+		{name: "loopback ipv4", address: "127.0.0.1:9", wantRefused: true},
+		{name: "unique local ipv6", address: "[fd00::1]:9", wantRefused: true},
+		{name: "public ipv6", address: "[2001:db8::1]:9", wantRefused: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := withDialTarget(t.Context(), *callerChosenTarget())
+
+			err := guardDestination(ctx, "tcp", tt.address, nil)
 
 			if got := errors.Is(err, ErrDestinationRefused); got != tt.wantRefused {
 				t.Fatalf("refused = %v, want %v (err = %v)", got, tt.wantRefused, err)
@@ -159,6 +271,16 @@ func TestGuardDestination_TierAAppliesWithNoPolicy(t *testing.T) {
 		// ignores it for a destination that is not link-local, so this is the
 		// metadata address and must be refused as one.
 		{name: "metadata over ipv6 with a zone", address: "[fd00:ec2::254%eth0]:80", wantRefused: true},
+		// RFC 6052 embeds the IPv4 address a NAT64 translator reaches in the
+		// IPv6 one, so these reach the metadata endpoint wherever NAT64 does.
+		{name: "metadata behind the nat64 well-known prefix", address: "[64:ff9b::a9fe:a9fe]:80", wantRefused: true},
+		{name: "metadata behind the local-use nat64 prefix, /96 layout", address: "[64:ff9b:1::a9fe:a9fe]:80", wantRefused: true},
+		{name: "metadata behind the local-use nat64 prefix, /48 layout", address: "[64:ff9b:1:a9fe:a9:fe00::]:80", wantRefused: true},
+		{name: "metadata behind the local-use nat64 prefix, /56 layout", address: "[64:ff9b:1:a9:fe:a9fe::]:80", wantRefused: true},
+		{name: "metadata behind the local-use nat64 prefix, /64 layout", address: "[64:ff9b:1:0:a9:fea9:fe00:0]:80", wantRefused: true},
+		{name: "container credentials behind the nat64 well-known prefix", address: "[64:ff9b::a9fe:aa02]:80", wantRefused: true},
+		{name: "a public address behind the nat64 well-known prefix", address: "[64:ff9b::cb00:7101]:80", wantRefused: false},
+		{name: "a local-use address whose reserved octet is set embeds nothing", address: "[64:ff9b:1:0:ff00::a9fe:a9fe]:80", wantRefused: false},
 		{name: "an ordinary private address", address: "10.0.0.1:9", wantRefused: false},
 	}
 
@@ -170,6 +292,89 @@ func TestGuardDestination_TierAAppliesWithNoPolicy(t *testing.T) {
 				t.Fatalf("refused = %v, want %v (err = %v)", got, tt.wantRefused, err)
 			}
 		})
+	}
+}
+
+// TestDestinationRefusal_TierAIsItsOwnSentinel holds the two tiers apart in the
+// error a refusal carries, so the hint can tell a reader the one thing that
+// differs between them: tier B has a flag that permits the address, and tier A
+// has none.
+//
+// The tier A sentinel unwraps to [ErrDestinationRefused], so everything that
+// recognizes a refusal still does, the failure table of the tenant policy
+// register included, and the refusal's text is the same as before.
+func TestDestinationRefusal_TierAIsItsOwnSentinel(t *testing.T) {
+	callerNamed := withDialTarget(t.Context(), *callerChosenTarget())
+	tests := []struct {
+		name         string
+		refuse       func() error
+		wantMetadata bool
+		wantText     string
+	}{
+		{
+			name:         "the metadata address at the dialer",
+			refuse:       func() error { return guardDestination(t.Context(), "tcp", "169.254.169.254:80", nil) },
+			wantMetadata: true,
+			wantText:     "outbound destination refused: 169.254.169.254 is the cloud instance metadata address",
+		},
+		{
+			name:         "the metadata address behind a NAT64 prefix",
+			refuse:       func() error { return guardDestination(t.Context(), "tcp", "[64:ff9b::a9fe:a9fe]:80", nil) },
+			wantMetadata: true,
+			wantText:     "behind a NAT64 prefix",
+		},
+		{
+			name:         "the metadata address named at the door",
+			refuse:       func() error { return CheckCallerNamedInstance("http://169.254.169.254") },
+			wantMetadata: true,
+			wantText:     "outbound destination refused: 169.254.169.254 is the cloud instance metadata address",
+		},
+		{
+			name:     "a private address tier B refuses",
+			refuse:   func() error { return guardDestination(callerNamed, "tcp", "10.0.0.1:443", nil) },
+			wantText: "the GITLAB-URL header named an instance on the private address 10.0.0.1",
+		},
+		{
+			name:     "a private address named at the door",
+			refuse:   func() error { return CheckCallerNamedInstance("http://10.0.0.1") },
+			wantText: "--allow-private-instances",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.refuse()
+
+			if !errors.Is(err, ErrDestinationRefused) {
+				t.Fatalf("err = %v, want a destination refusal", err)
+			}
+			if got := errors.Is(err, ErrMetadataDestinationRefused); got != tt.wantMetadata {
+				t.Errorf("tier A sentinel = %v, want %v (err = %v)", got, tt.wantMetadata, err)
+			}
+			if !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("refusal = %q, want it to contain %q", err, tt.wantText)
+			}
+		})
+	}
+}
+
+// TestDestinationRefusedHintFor_NamesTheFlagOnlyWhereItHelps holds the hint
+// to the tier that refused: the flag for tier B, and for tier A a sentence
+// that sends the reader to the instance or the redirect, since no setting
+// changes that outcome and naming the flag there only invites a reader to
+// try it and find it did nothing.
+func TestDestinationRefusedHintFor_NamesTheFlagOnlyWhereItHelps(t *testing.T) {
+	metadata := fmt.Errorf("%w: 169.254.169.254 is the cloud instance metadata address", ErrMetadataDestinationRefused)
+	private := fmt.Errorf("%w: a redirect away from gitlab.example.com reached the private address 10.0.0.1", ErrDestinationRefused)
+
+	if got := DestinationRefusedHintFor(metadata); strings.Contains(got, "--allow-private-instances") || !strings.Contains(got, "metadata") {
+		t.Errorf("tier A hint = %q, want one about the metadata address that names no flag", got)
+	}
+	if got := DestinationRefusedHintFor(private); got != DestinationRefusedHint || !strings.Contains(got, "--allow-private-instances") {
+		t.Errorf("tier B hint = %q, want %q, which names the flag", got, DestinationRefusedHint)
+	}
+	if got := DestinationRefusedHintFor(errors.New("unrelated")); got != DestinationRefusedHint {
+		t.Errorf("hint for an unrelated error = %q, want the general one", got)
 	}
 }
 
@@ -269,6 +474,28 @@ func TestIsPrivateAddress_ClassifiesTheRefusedRanges(t *testing.T) {
 		{name: "rfc 1918 as a mapped ipv6", addr: netip.MustParseAddr("::ffff:10.0.0.1"), want: true, because: "the same address written differently"},
 		{name: "cgnat as a mapped ipv6", addr: netip.MustParseAddr("::ffff:100.64.0.1"), want: true, because: "the same address written differently"},
 		{name: "invalid", addr: netip.Addr{}, want: true, because: "an address that cannot be classified is not one to dial"},
+		{name: "rfc 1918 behind the nat64 well-known prefix", addr: netip.MustParseAddr("64:ff9b::a00:1"), want: true, because: "a NAT64 translator reaches 10.0.0.1"},
+		{name: "loopback behind the nat64 well-known prefix", addr: netip.MustParseAddr("64:ff9b::7f00:1"), want: true, because: "a NAT64 translator reaches 127.0.0.1"},
+		{name: "public behind the nat64 well-known prefix", addr: netip.MustParseAddr("64:ff9b::cb00:7101"), want: false, because: "203.0.113.1 translated is still public"},
+		{name: "rfc 1918 behind the local-use nat64 prefix, /96 layout", addr: netip.MustParseAddr("64:ff9b:1::a00:1"), want: true, because: "RFC 8215 local-use prefix, RFC 6052 /96 layout"},
+		{name: "loopback behind the local-use nat64 prefix, /48 layout", addr: netip.MustParseAddr("64:ff9b:1:7f00:0:100::"), want: true, because: "RFC 6052 /48 layout of 127.0.0.1"},
+		{name: "public behind the local-use nat64 prefix", addr: netip.MustParseAddr("64:ff9b:1::cb00:7101"), want: false, because: "only the /96 layout is consistent, and it is public"},
+		// A shorter layout leaves zeros where a longer one reads its IPv4
+		// bytes, so the /96 reading of every /48 and /56 address is 0.0.0.0.
+		// That reading is the suffix and not an address: no translator
+		// forwards to 0.0.0.0, and counting it made every public host behind
+		// those layouts private.
+		{name: "public behind the local-use nat64 prefix, /48 layout", addr: netip.MustParseAddr("64:ff9b:1:cb00:71:500::"), want: false, because: "RFC 6052 /48 layout of 203.0.113.5, whose other readings are 0.113.5.0 and 113.5.0.0"},
+		{name: "public behind the local-use nat64 prefix, /56 layout", addr: netip.MustParseAddr("64:ff9b:1:cb:0:7105::"), want: false, because: "RFC 6052 /56 layout of 203.0.113.5, whose other reading is 0.113.5.0"},
+		{name: "public behind the local-use nat64 prefix, /64 layout", addr: netip.MustParseAddr("64:ff9b:1:0:cb:71:500::"), want: false, because: "RFC 6052 /64 layout of 203.0.113.5, whose /96 reading is 5.0.0.0"},
+		{name: "the local-use prefix with nothing embedded", addr: netip.MustParseAddr("64:ff9b:1::"), want: false, because: "every reading is 0.0.0.0, the zero suffix of a longer layout"},
+		// Which prefix length a deployment chose is not written in the
+		// address, so a refusal holds it to every layout: 203.0.113.10 under
+		// a /64 prefix is 10.0.0.0 under a /96 one (ADR-0022, NEG-007).
+		{name: "a /64 address whose /96 reading is private", addr: netip.MustParseAddr("64:ff9b:1:0:cb:71:a00::"), want: true, because: "203.0.113.10 under a /64 prefix and 10.0.0.0 under a /96 one"},
+		{name: "a 6to4 address", addr: netip.MustParseAddr("2002:a9fe:a9fe::"), want: true, because: "2002::/16 names a tunnel endpoint, refused for tier B"},
+		{name: "an ipv4-compatible address", addr: netip.MustParseAddr("::a9fe:a9fe"), want: true, because: "::/96 is deprecated and names a tunnel endpoint"},
+		{name: "a 6to4 address with a zone", addr: netip.MustParseAddr("2002:a9fe:a9fe::%eth0"), want: true, because: "a zone does not take an address out of its prefix"},
 		{name: "public ipv4", addr: netip.MustParseAddr("192.0.2.1"), want: false, because: "documentation range, but publicly routable in form"},
 		{name: "public ipv6", addr: netip.MustParseAddr("2001:db8::1"), want: false, because: "documentation range, but publicly routable in form"},
 		{name: "just above cgnat", addr: netip.MustParseAddr("100.128.0.1"), want: false, because: "outside 100.64.0.0/10"},
@@ -477,6 +704,19 @@ func TestDestinationPolicy_InstanceIsPrivate(t *testing.T) {
 		{name: "private address in fullwidth digits", instance: "https://１０.0.0.1", lookupErr: errors.New("no such host"), want: true},
 		{name: "private address with ideographic full stops", instance: "https://10。0。0。1", lookupErr: errors.New("no such host"), want: true},
 		{name: "public address in fullwidth digits", instance: "https://２０３.0.113.1", lookupErr: errors.New("no such host"), want: false},
+		// The exemption is granted to an instance that is private in fact,
+		// so it asks the opposite of what a refusal asks: a NAT64 address
+		// counts only when every IPv4 address it can stand for is private,
+		// and the tunnel prefixes a refusal treats as private never count.
+		// Calling a public instance private here would let its redirects
+		// reach the private network.
+		{name: "literal nat64 address of a private host", instance: "https://[64:ff9b::a00:5]", want: true},
+		{name: "literal nat64 address of a public host, /48 layout", instance: "https://[64:ff9b:1:cb00:71:500::]", want: false},
+		{name: "literal nat64 address with one private reading", instance: "https://[64:ff9b:1:0:cb:71:a00::]", want: false},
+		{name: "literal nat64 address whose every reading is private", instance: "https://[64:ff9b:1:0:a:0:a00::]", want: true},
+		{name: "name resolving to a nat64 address with one private reading", instance: "https://gitlab.example.com", resolved: []string{"64:ff9b:1:0:cb:71:a00::"}, want: false},
+		{name: "literal 6to4 address", instance: "https://[2002:a00:1::]", want: false},
+		{name: "literal ipv4-compatible address", instance: "https://[::a00:1]", want: false},
 	}
 
 	for _, tt := range tests {
@@ -560,11 +800,17 @@ func TestDestinationPolicy_InstanceIsPrivate_ResolvesTheNameTheDialerDials(t *te
 // the instance's own host, which is what decides whether a redirect hop is
 // judged at all.
 //
-// The spelling rows hold the comparison [credentialSafeRedirect] makes: ASCII
+// Only the exact host does. A subdomain is a different name with addresses of
+// its own, and a subdomain that resolves to loopback or to the server's own
+// network behind a public instance is exactly the destination tier B exists
+// for; counting it as the instance put the hop in the permissive pool with no
+// tier B at all. The credential headers still follow a subdomain, which is
+// [credentialSafeRedirect]'s relation and a different question.
+//
+// The spelling rows hold the folding [credentialSafeRedirect] applies: ASCII
 // letters are folded and nothing else is, so a host spelled with U+0130 is
 // not the instance whose name it folds to under strings.ToLower. It is
-// dialed as its IDNA form, a different host, and counting it as the
-// instance's own put the hop in the permissive pool with no tier B at all.
+// dialed as its IDNA form, a different host.
 func TestDestinationPolicy_CoversInstance(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -573,7 +819,9 @@ func TestDestinationPolicy_CoversInstance(t *testing.T) {
 		want     bool
 	}{
 		{name: "the instance itself", instance: "https://gitlab.example.com", dest: "https://gitlab.example.com/x", want: true},
-		{name: "a subdomain of it", instance: "https://gitlab.example.com", dest: "https://storage.gitlab.example.com/x", want: true},
+		{name: "a subdomain of it", instance: "https://gitlab.example.com", dest: "https://storage.gitlab.example.com/x", want: false},
+		{name: "a subdomain in ascii upper case", instance: "https://gitlab.example.com", dest: "https://STORAGE.GitLab.example.com/x", want: false},
+		{name: "the parent domain of the instance", instance: "https://gitlab.example.com", dest: "https://example.com/x", want: false},
 		{name: "a different port", instance: "https://gitlab.example.com", dest: "https://gitlab.example.com:9443/x", want: true},
 		{name: "an https to http downgrade", instance: "https://gitlab.example.com", dest: "http://gitlab.example.com/x", want: true},
 		{name: "another host", instance: "https://gitlab.example.com", dest: "https://storage.example.net/x", want: false},
@@ -966,6 +1214,101 @@ func TestDestinationTransport_RoutesByWhatTierBAnswers(t *testing.T) {
 	}
 }
 
+// TestDestinationTransport_SubdomainHop_IsJudgedByTheAddressItReaches drives a
+// redirect hop to a subdomain of the operator's instance through the routing
+// and then through the dialer, the two halves that have to agree.
+//
+// The subdomain resolves to 127.0.0.2, as a split-horizon name under the
+// instance's domain would. Behind a public instance that is a private address
+// no operator chose, so the hop is refused at the dial and served from the
+// strict pool; behind an instance that is itself private it is the
+// self-managed object store, and is allowed. The instance's exact host stays
+// exempt and asks no question.
+func TestDestinationTransport_SubdomainHop_IsJudgedByTheAddressItReaches(t *testing.T) {
+	const instanceURL = "https://pub.test.example"
+	tests := []struct {
+		name          string
+		requestURL    string
+		instanceAddr  string
+		dialed        string
+		wantPool      string
+		wantRefused   bool
+		wantLookups   int
+		wantOffOrigin bool
+	}{
+		{
+			name:       "a subdomain resolving to loopback behind a public instance",
+			requestURL: "https://x.pub.test.example:9002/object", instanceAddr: "203.0.113.1", dialed: "127.0.0.2:9002",
+			wantPool: "strict", wantRefused: true, wantLookups: 1, wantOffOrigin: true,
+		},
+		{
+			name:       "a subdomain resolving to a private address behind a private instance",
+			requestURL: "https://x.pub.test.example:9002/object", instanceAddr: "10.0.0.1", dialed: "10.0.0.7:9002",
+			wantPool: "permissive", wantRefused: false, wantLookups: 1, wantOffOrigin: true,
+		},
+		{
+			name:       "a subdomain resolving to a public address behind a public instance",
+			requestURL: "https://x.pub.test.example/object", instanceAddr: "203.0.113.1", dialed: "203.0.113.9:443",
+			wantPool: "strict", wantRefused: false, wantLookups: 1, wantOffOrigin: true,
+		},
+		{
+			name:       "the instance's exact host on loopback",
+			requestURL: "https://pub.test.example/api/v4/version", instanceAddr: "203.0.113.1", dialed: "127.0.0.2:443",
+			wantPool: "permissive", wantRefused: false, wantLookups: 0, wantOffOrigin: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := newDestinationPolicy(instanceURL, false, false)
+			lookups := 0
+			policy.lookupIP = func(ctx context.Context, host string) ([]netip.Addr, error) {
+				lookups++
+				return resolverAnswering(tt.instanceAddr)(ctx, host)
+			}
+			client := &Client{}
+			client.destination.Store(policy)
+
+			var stamp dialTarget
+			served := ""
+			poolNamed := func(name string) http.RoundTripper {
+				return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					served = name
+					stamp, _ = dialTargetFrom(req.Context())
+					return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+				})
+			}
+			transport := &destinationTransport{
+				pools:  destinationPools{permissive: poolNamed("permissive"), strict: poolNamed("strict")},
+				client: client,
+			}
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, tt.requestURL, http.NoBody)
+			if err != nil {
+				t.Fatalf("http.NewRequestWithContext() unexpected error: %v", err)
+			}
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip() unexpected error: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			if served != tt.wantPool {
+				t.Errorf("served from the %s pool, want the %s pool", served, tt.wantPool)
+			}
+			if stamp.offOrigin != tt.wantOffOrigin {
+				t.Errorf("offOrigin = %v, want %v", stamp.offOrigin, tt.wantOffOrigin)
+			}
+			err = guardDestination(withDialTarget(t.Context(), stamp), "tcp", tt.dialed, nil)
+			if got := errors.Is(err, ErrDestinationRefused); got != tt.wantRefused {
+				t.Errorf("dialing %s: refused = %v, want %v (err = %v)", tt.dialed, got, tt.wantRefused, err)
+			}
+			if lookups != tt.wantLookups {
+				t.Errorf("the instance was resolved %d times, want %d", lookups, tt.wantLookups)
+			}
+		})
+	}
+}
+
 // versionAnswer is what the loopback stubs below answer every request with: a
 // version document, which is all [Client.Ping] asks for.
 func versionAnswer(w http.ResponseWriter, _ *http.Request) {
@@ -1326,6 +1669,57 @@ func TestDestinationTransport_ProxiedDestinationSpelledAsAnAddress_IsJudged(t *t
 			name: "a hop to a private address with a circled digit", instanceURL: "http://gitlab.example.com",
 			resolves: "203.0.113.1", redirectTo: "http://①⓪.0.0.5:9000" + versionAPIPath, wantText: "reached the private address 10.0.0.5",
 		},
+		// A libc proxy reads a host that ends in a number with inet_aton, so
+		// each of these reaches the address it encodes. They are judged as
+		// that address, as a browser would read them.
+		{
+			name: "a hop to the metadata address as one decimal number", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://2852039166/latest/meta-data/", wantText: "metadata",
+		},
+		{
+			name: "a hop to the metadata address as one hexadecimal number", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://0xa9fea9fe/latest/meta-data/", wantText: "metadata",
+		},
+		{
+			name: "a hop to the metadata address in hexadecimal parts", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://0xa9.0xfe.0xa9.0xfe/latest/meta-data/", wantText: "metadata",
+		},
+		{
+			name: "a hop to the metadata address in octal parts", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://0251.0376.0251.0376/latest/meta-data/", wantText: "metadata",
+		},
+		{
+			name: "a hop to the metadata address in three parts", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://169.254.43518/latest/meta-data/", wantText: "metadata",
+		},
+		{
+			name: "a hop to the metadata address with a trailing dot", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://169.254.169.254./latest/meta-data/", wantText: "metadata",
+		},
+		{
+			name: "a hop to loopback as one decimal number", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://2130706434:9002" + versionAPIPath, wantText: "reached the private address 127.0.0.2",
+		},
+		{
+			name: "a hop to loopback in two parts", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://0x7f.1:9002" + versionAPIPath, wantText: "reached the private address 127.0.0.1",
+		},
+		{
+			name: "a hop to a host that ends in a number and is no address", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://4294967296/latest/meta-data/", wantText: "ends in a number",
+		},
+		{
+			name: "a hop to the metadata address behind the nat64 prefix", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://[64:ff9b::a9fe:a9fe]/latest/meta-data/", wantText: "metadata",
+		},
+		{
+			name: "a hop to a private address behind the nat64 prefix", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://[64:ff9b::a00:1]:9000" + versionAPIPath, wantText: "reached the private address 64:ff9b::a00:1",
+		},
+		{
+			name: "a hop to a 6to4 address", instanceURL: "http://gitlab.example.com",
+			resolves: "203.0.113.1", redirectTo: "http://[2002:a9fe:a9fe::]/latest/meta-data/", wantText: "reached the private address 2002:a9fe:a9fe::",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1367,6 +1761,189 @@ func TestDestinationTransport_ProxiedDestinationSpelledAsAnAddress_IsJudged(t *t
 			t.Errorf("the proxy was asked for %v, want %v", got, want)
 		}
 	})
+
+	t.Run("the operator's instance ending in a number that is no address is the proxy's to resolve", func(t *testing.T) {
+		const instanceURL = "http://gitlab.123"
+		stub := newProxyStub(t, versionAnswer)
+		client := proxiedClient(instanceURL, proxiedPools(t, stub.url), newDestinationPolicy(instanceURL, false, false))
+
+		if _, err := client.versionDirect(t.Context()); err != nil {
+			t.Fatalf("versionDirect() = %v: an instance --gitlab-url named is never checked", err)
+		}
+		if got := stub.asked(); !slices.Equal(got, []string{"gitlab.123"}) {
+			t.Errorf("the proxy was asked for %v, want the operator's instance", got)
+		}
+	})
+
+	t.Run("a host whose last label is not a number is still a name", func(t *testing.T) {
+		const instanceURL = "http://gitlab.example.com"
+		stub := newProxyStub(t, redirectingFrom("gitlab.example.com", "http://169.254.169.254.example.net"+versionAPIPath))
+		client := proxiedClient(instanceURL, proxiedPools(t, stub.url), publicPolicy(instanceURL))
+
+		if _, err := client.versionDirect(t.Context()); err != nil {
+			t.Fatalf("versionDirect() = %v: a name that starts with digits is the proxy's to resolve", err)
+		}
+		if got, want := stub.asked(), []string{"gitlab.example.com", "169.254.169.254.example.net"}; !slices.Equal(got, want) {
+			t.Errorf("the proxy was asked for %v, want %v", got, want)
+		}
+	})
+}
+
+// TestNumericHostAddress_ReadsTheInetAtonGrammar holds the parse a host that
+// ends in a number is judged by to the WHATWG URL standard's IPv4 parser,
+// which is the inet_aton grammar a libc proxy resolves such a host with: one
+// to four parts, each decimal, 0x hexadecimal or 0-prefixed octal, the last
+// filling the bytes the others leave.
+func TestNumericHostAddress_ReadsTheInetAtonGrammar(t *testing.T) {
+	tests := []struct {
+		host       string
+		wantNumber bool
+		want       string
+	}{
+		{host: "2852039166", wantNumber: true, want: "169.254.169.254"},
+		{host: "0xa9fea9fe", wantNumber: true, want: "169.254.169.254"},
+		{host: "0XA9FEA9FE", wantNumber: true, want: "169.254.169.254"},
+		{host: "0xa9.0xfe.0xa9.0xfe", wantNumber: true, want: "169.254.169.254"},
+		{host: "0251.0376.0251.0376", wantNumber: true, want: "169.254.169.254"},
+		{host: "169.254.43518", wantNumber: true, want: "169.254.169.254"},
+		{host: "169.16689662", wantNumber: true, want: "169.254.169.254"},
+		{host: "0x7f.1", wantNumber: true, want: "127.0.0.1"},
+		{host: "127.1", wantNumber: true, want: "127.0.0.1"},
+		{host: "0x", wantNumber: true, want: "0.0.0.0"},
+		{host: "0", wantNumber: true, want: "0.0.0.0"},
+		{host: "00", wantNumber: true, want: "0.0.0.0"},
+		{host: "169.254.169.254.", wantNumber: true, want: "169.254.169.254"},
+		{host: "4294967295", wantNumber: true, want: "255.255.255.255"},
+		// A part that is not the last may be a whole byte, 255 included.
+		{host: "255.0.0.1", wantNumber: true, want: "255.0.0.1"},
+		// Ends in a number and is no address: the host is invalid, and
+		// refused rather than handed to a proxy that may read it anyway.
+		{host: "4294967296", wantNumber: true},
+		{host: "99999999999999999999999", wantNumber: true},
+		{host: "1.2.3.4.5", wantNumber: true},
+		{host: "256.1.1.1", wantNumber: true},
+		{host: "1.2.65536", wantNumber: true},
+		{host: "1.2.3.256", wantNumber: true},
+		{host: "foo.123", wantNumber: true},
+		{host: "1..2", wantNumber: true},
+		{host: "09", wantNumber: true},
+		{host: "0xg", wantNumber: false},
+		// Not a number at the end: a name, left to whatever resolves it.
+		{host: "gitlab.example.com", wantNumber: false},
+		{host: "169.254.169.254.example.net", wantNumber: false},
+		{host: "123.example", wantNumber: false},
+		// A last label mixing digits with a character below '0' is a
+		// name too, as one mixing them with a letter is.
+		{host: "release.1-2", wantNumber: false},
+		{host: "", wantNumber: false},
+		{host: ".", wantNumber: false},
+		{host: "example.", wantNumber: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			addr, number, err := numericHostAddress(tt.host)
+
+			if number != tt.wantNumber {
+				t.Fatalf("numericHostAddress(%q) number = %v, want %v", tt.host, number, tt.wantNumber)
+			}
+			if tt.want == "" {
+				if number && err == nil {
+					t.Fatalf("numericHostAddress(%q) = %v, want it refused as no address", tt.host, addr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("numericHostAddress(%q) unexpected error: %v", tt.host, err)
+			}
+			if addr != netip.MustParseAddr(tt.want) {
+				t.Errorf("numericHostAddress(%q) = %v, want %v", tt.host, addr, tt.want)
+			}
+		})
+	}
+}
+
+// TestRefusalWithoutDialError_KeepsWhatAnEmptyDialErrorWraps covers the stop
+// condition of the unwrapping: a dial error that carries no error of its own
+// has nothing to hand on, and replacing the error with its nil Err would lose
+// the refusal it sat beside. The chain is returned as it came, still wrapping
+// [ErrDestinationRefused].
+func TestRefusalWithoutDialError_KeepsWhatAnEmptyDialErrorWraps(t *testing.T) {
+	empty := errors.Join(&net.OpError{Op: "dial", Net: "tcp"}, ErrDestinationRefused)
+
+	got := refusalWithoutDialError(empty)
+
+	if !errors.Is(got, empty) {
+		t.Errorf("refusalWithoutDialError(%v) = %v, want the error unchanged", empty, got)
+	}
+	if !errors.Is(got, ErrDestinationRefused) {
+		t.Errorf("refusalWithoutDialError(%v) = %v, want it to still wrap ErrDestinationRefused", empty, got)
+	}
+}
+
+// TestDestinationTransport_RefusedHop_IsNotRetried holds a refusal to what it
+// is: final. client-go retries a dial error up to five times, because a dial
+// that failed sent nothing, and a refusal by the guard reached it wrapped as
+// one. The instance then answered the same request again for each retry and
+// the caller waited out the backoff before learning what had been decided
+// before the first packet.
+func TestDestinationTransport_RefusedHop_IsNotRetried(t *testing.T) {
+	var hits atomic.Int64
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	t.Cleanup(instance.Close)
+
+	client, err := newTokenClient(instance.URL, "glpat-x", false, false, time.Millisecond)
+	if err != nil {
+		t.Fatalf("newTokenClient() unexpected error: %v", err)
+	}
+
+	_, err = client.Ping(t.Context())
+
+	if !errors.Is(err, ErrDestinationRefused) {
+		t.Fatalf("err = %v, want the refusal of the metadata hop", err)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("the instance answered %d requests for one refused call, want 1: the refusal was retried", n)
+	}
+	if opErr, isDialError := errors.AsType[*net.OpError](err); isDialError {
+		t.Errorf("the refusal still carries a *net.OpError (%v), which client-go reads as a dial worth retrying", opErr)
+	}
+}
+
+// TestDestinationTransport_OrdinaryDialError_KeepsItsDialError holds the other
+// half of the rule above: only a refusal loses its *net.OpError. A dial that
+// failed for any other reason, here a closed port on the operator's own
+// loopback instance, reaches client-go as the dial error it is, which is what
+// its retry policy reads as worth asking again.
+func TestDestinationTransport_OrdinaryDialError_KeepsItsDialError(t *testing.T) {
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() unexpected error: %v", err)
+	}
+	closedAddr := listener.Addr().String()
+	if closeErr := listener.Close(); closeErr != nil {
+		t.Fatalf("listener.Close() unexpected error: %v", closeErr)
+	}
+
+	client, err := newTokenClient("http://"+closedAddr, "glpat-x", false, false, time.Millisecond)
+	if err != nil {
+		t.Fatalf("newTokenClient() unexpected error: %v", err)
+	}
+
+	_, err = client.Ping(t.Context())
+
+	if err == nil {
+		t.Fatal("Ping() of a closed port returned no error")
+	}
+	if errors.Is(err, ErrDestinationRefused) {
+		t.Fatalf("err = %v, want a dial failure and not a refusal: the operator's loopback instance is never checked", err)
+	}
+	if _, isDialError := errors.AsType[*net.OpError](err); !isDialError {
+		t.Errorf("err = %v carries no *net.OpError, so client-go would not retry a dial that sent nothing", err)
+	}
 }
 
 // TestDestinationTransport_CallerNamedInstanceThroughAPrivateProxy states the
@@ -1713,6 +2290,16 @@ func TestJudgeProxiedDestination_JudgesOnlyWhatIsSpelledAsAnAddress(t *testing.T
 		{name: "a private address in fullwidth digits the stamp permits", target: permissive, dest: "http://１０.0.0.1/"},
 		{name: "a name outside ascii", target: strict, dest: "http://café.example.com/"},
 		{name: "a name idna refuses, dialed as written", target: strict, dest: "http://a_é.example.com/"},
+		// A host that ends in a number and is no address is refused wherever
+		// tier B could refuse the request, and is the operator's name to give
+		// on the operator's own instance, which nothing here checks. A valid
+		// numeric spelling of that instance is still the address it encodes,
+		// so tier A still reads it.
+		{name: "the operator's instance ending in a number that is no address", target: permissive, dest: "http://gitlab.123/"},
+		{name: "the operator's instance as a numeric metadata spelling", target: permissive, dest: "http://2852039166/", wantRefused: true},
+		{name: "a hop off the operator's instance ending in a number that is no address", target: dialTarget{policy: permissive.policy, offOrigin: true}, dest: "http://4294967296/", wantRefused: true},
+		{name: "a caller-named instance ending in a number that is no address", target: strict, dest: "http://gitlab.123/", wantRefused: true},
+		{name: "a host ending in a number that is no address, with no policy", target: dialTarget{}, dest: "http://gitlab.123/", wantRefused: true},
 	}
 
 	for _, tt := range tests {
@@ -1897,6 +2484,18 @@ func TestCheckCallerNamedInstance_RefusesWhatTheDialerWould(t *testing.T) {
 		{name: "rfc 1918 in fullwidth digits", rawURL: "https://１０.0.0.1", wantRefused: true, wantText: "private address 10.0.0.1"},
 		{name: "rfc 1918 percent-encoded in fullwidth digits", rawURL: "https://%EF%BC%91%EF%BC%90.0.0.1", wantRefused: true, wantText: "private address 10.0.0.1"},
 		{name: "a name with a dotted capital I, left to the dialer", rawURL: "https://gİtlab.example.com", wantRefused: false},
+		// The spellings a libc proxy reads with inet_aton, which would admit
+		// the caller's token to the address they encode.
+		{name: "cloud metadata in three parts", rawURL: "http://169.254.43518", wantRefused: true, wantText: "metadata"},
+		{name: "loopback as one decimal number", rawURL: "http://2130706433:9001", wantRefused: true, wantText: "private address 127.0.0.1"},
+		{name: "loopback as one hexadecimal number", rawURL: "http://0x7f000001:9001", wantRefused: true, wantText: "private address 127.0.0.1"},
+		{name: "a public address as one decimal number", rawURL: "https://3405803777", wantRefused: false},
+		{name: "a public address with a trailing dot", rawURL: "https://203.0.113.1.", wantRefused: false},
+		{name: "a host that ends in a number and is no address", rawURL: "http://1.2.3.4.5", wantRefused: true, wantText: "ends in a number"},
+		{name: "cloud metadata behind the nat64 prefix", rawURL: "http://[64:ff9b::a9fe:a9fe]", wantRefused: true, wantText: "metadata"},
+		{name: "loopback behind the nat64 prefix", rawURL: "http://[64:ff9b::7f00:1]:9001", wantRefused: true, wantText: "--allow-private-instances"},
+		{name: "a 6to4 address", rawURL: "http://[2002:a9fe:a9fe::]", wantRefused: true, wantText: "--allow-private-instances"},
+		{name: "an ipv4-compatible address", rawURL: "http://[::169.254.169.254]", wantRefused: true, wantText: "--allow-private-instances"},
 	}
 
 	for _, tt := range tests {

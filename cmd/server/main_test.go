@@ -6189,24 +6189,110 @@ func TestToolSearchCallForm_NamesWhatEachSurfaceRegisters(t *testing.T) {
 		IndividualTool: toolutil.IndividualToolSpec{Name: "gitlab_issue_list"},
 	}
 	unprojected := actioncatalog.Action{ID: "issue.hidden", ToolName: "gitlab_issue", Domain: "issue", Name: "hidden"}
+	guided := actioncatalog.Action{
+		ID:             "interactive.issue_create",
+		ToolName:       "gitlab_interactive",
+		Domain:         "interactive",
+		Name:           "issue_create",
+		IndividualTool: toolutil.IndividualToolSpec{Name: "gitlab_interactive_issue_create"},
+	}
 
 	tests := []struct {
-		name    string
-		surface string
-		action  actioncatalog.Action
-		want    string
+		name       string
+		surface    string
+		action     actioncatalog.Action
+		standalone bool
+		want       string
 	}{
 		{name: "dynamic names the individual tool as a cross-reference", surface: config.ToolSurfaceDynamic, action: action, want: "gitlab_issue_list"},
 		{name: "individual names the tool it registers", surface: config.ToolSurfaceIndividual, action: action, want: "gitlab_issue_list"},
 		{name: "meta names the group tool and the action argument", surface: config.ToolSurfaceMeta, action: action, want: "gitlab_issue action=list"},
 		{name: "an action with no individual tool", surface: config.ToolSurfaceIndividual, action: unprojected, want: toolSearchNoTool},
+		// The guided flows and project discovery are tools of their own on
+		// meta, one per action, and take no action argument.
+		{name: "meta names a standalone action's own tool", surface: config.ToolSurfaceMeta, action: guided, standalone: true, want: "gitlab_interactive_issue_create"},
+		{name: "meta, a standalone action with no tool of its own", surface: config.ToolSurfaceMeta, action: unprojected, standalone: true, want: toolSearchNoTool},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := toolSearchCallForm(tt.surface, tt.action); got != tt.want {
+			if got := toolSearchCallForm(tt.surface, tt.action, tt.standalone); got != tt.want {
 				t.Errorf("toolSearchCallForm(%q) = %q, want %q", tt.surface, got, tt.want)
 			}
 		})
+	}
+}
+
+// metaActionEnum reads the values a meta tool's action argument accepts out of
+// its input schema, or nil for a tool that takes no action argument.
+func metaActionEnum(t *testing.T, schema any) map[string]bool {
+	t.Helper()
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshaling an input schema: %v", err)
+	}
+	var shape struct {
+		Properties map[string]struct {
+			Enum []string `json:"enum"`
+		} `json:"properties"`
+	}
+	if err = json.Unmarshal(raw, &shape); err != nil {
+		t.Fatalf("reading an input schema: %v", err)
+	}
+	property, ok := shape.Properties["action"]
+	if !ok {
+		return nil
+	}
+	enum := make(map[string]bool, len(property.Enum))
+	for _, value := range property.Enum {
+		enum[value] = true
+	}
+	return enum
+}
+
+// TestToolSearchCallForm_MetaNamesOnlyWhatTheMetaSurfaceServes holds every
+// meta call form the search prints, for every action at the tier carrying the
+// most, to what a meta server at that tier lists: the tool has to be in
+// tools/list, a dispatcher's action has to be in its action enum, and a tool
+// called without an action has to take none. The five standalone actions were
+// printed as `gitlab_interactive action=issue_create` and
+// `gitlab_discover_project action=resolve`, and neither call exists on meta.
+func TestToolSearchCallForm_MetaNamesOnlyWhatTheMetaSurfaceServes(t *testing.T) {
+	t.Cleanup(tools.SetMetaParamSchemaScoped(tools.MetaParamSchema()))
+	catalog, err := buildToolSearchCatalog(edition.Ultimate)
+	if err != nil {
+		t.Fatalf("buildToolSearchCatalog: %v", err)
+	}
+	server := createServerWithin(t, newMockGitLabClient(t), &config.ServerConfig{
+		ToolSurface:  config.ToolSurfaceMeta,
+		Tier:         edition.Ultimate,
+		TierExplicit: true,
+	})
+	listed, err := connectSessionAs(t, server, &mcp.Implementation{Name: "test-client", Version: "1.0.0"}).ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	served := make(map[string]map[string]bool, len(listed.Tools))
+	for _, tool := range listed.Tools {
+		served[tool.Name] = metaActionEnum(t, tool.InputSchema)
+	}
+
+	standalone := standaloneToolGroups(catalog)
+	actions := catalog.Actions()
+	if len(actions) == 0 {
+		t.Fatal("the search catalog carries no actions")
+	}
+	for _, action := range actions {
+		form := toolSearchCallForm(config.ToolSurfaceMeta, action, standalone[action.ToolName])
+		tool, actionName, dispatched := strings.Cut(form, " action=")
+		enum, listedTool := served[tool]
+		switch {
+		case !listedTool:
+			t.Errorf("%s: meta call form %q names a tool the meta surface does not list", action.ID, form)
+		case dispatched && !enum[actionName]:
+			t.Errorf("%s: meta call form %q names an action %s does not accept", action.ID, form, tool)
+		case !dispatched && enum != nil:
+			t.Errorf("%s: meta call form %q calls the dispatcher %s with no action", action.ID, form, tool)
+		}
 	}
 }
 
@@ -6254,7 +6340,7 @@ func TestMatchCatalogActions_MatchesEveryNameAnActionAnswersTo(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			matches := matchCatalogActions(actions, tt.terms, config.ToolSurfaceDynamic)
+			matches := matchCatalogActions(actions, tt.terms, config.ToolSurfaceDynamic, nil)
 			got := make([]string, 0, len(matches))
 			for _, match := range matches {
 				got = append(got, match.action)
@@ -6304,7 +6390,7 @@ func TestMatchCatalogActions_EachColumnCarriesItsOwnValue(t *testing.T) {
 		IndividualTool: toolutil.IndividualToolSpec{Name: "gitlab_issue_list", Description: "List issues in a project."},
 	}
 
-	matches := matchCatalogActions([]actioncatalog.Action{action}, []string{"issue"}, config.ToolSurfaceMeta)
+	matches := matchCatalogActions([]actioncatalog.Action{action}, []string{"issue"}, config.ToolSurfaceMeta, nil)
 
 	if len(matches) != 1 {
 		t.Fatalf("matchCatalogActions() = %v, want the one action", matches)
@@ -11750,6 +11836,77 @@ func TestCreateServer_GatewayCompatWiring(t *testing.T) {
 		return
 	}
 	t.Fatalf("resource %s missing from the substituted server's listing", uri)
+}
+
+// listedToolSchemas lists a fresh server's tools twice and returns, per
+// listing and tool, the input and output schemas as JSON. The first listing
+// is the one the one-time schema passes finalize the registered tools on, and
+// the second is what every later client is served, so both are kept.
+func listedToolSchemas(t *testing.T, server *mcp.Server) [2]map[string]string {
+	t.Helper()
+	session := connectSessionAs(t, server, &mcp.Implementation{Name: "test-client", Version: "1.0.0"})
+	var listings [2]map[string]string
+	for i := range listings {
+		res, err := session.ListTools(t.Context(), nil)
+		if err != nil {
+			t.Fatalf("ListTools (listing %d): %v", i+1, err)
+		}
+		listings[i] = make(map[string]string, len(res.Tools))
+		for _, tool := range res.Tools {
+			schemas, marshalErr := json.Marshal([]any{tool.InputSchema, tool.OutputSchema})
+			if marshalErr != nil {
+				t.Fatalf("marshaling the schemas of %s: %v", tool.Name, marshalErr)
+			}
+			listings[i][tool.Name] = string(schemas)
+		}
+	}
+	return listings
+}
+
+// TestCreateServer_GatewaySubstitutionMatchingNothing_ServesTheSameSchemas
+// holds GITLAB_MCP_DESCRIPTION_SUBSTITUTIONS to what it is documented to
+// change, text, by serving a substitution that matches nothing and comparing
+// every tool schema with a server built without one.
+//
+// The rewriter used to be installed inside the lockdown and pagination passes,
+// so they ran on the copies it handed back rather than on the registered tools:
+// the first listing came back finalized and every later one did not, and all 29
+// meta tools and the dynamic surface's execute tool served a different
+// contract (a meta `params` envelope lost its `additionalProperties: true`)
+// the moment any substitution was set.
+func TestCreateServer_GatewaySubstitutionMatchingNothing_ServesTheSameSchemas(t *testing.T) {
+	cases := []struct {
+		name       string
+		surface    string
+		metaSchema string
+	}{
+		{name: "meta, opaque parameters", surface: config.ToolSurfaceMeta, metaSchema: config.MetaParamSchemaOpaque},
+		{name: "meta, full parameters", surface: config.ToolSurfaceMeta, metaSchema: config.MetaParamSchemaFull},
+		{name: "dynamic", surface: config.ToolSurfaceDynamic, metaSchema: config.MetaParamSchemaOpaque},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(tools.SetMetaParamSchemaScoped(tools.MetaParamSchema()))
+			cfg := &config.ServerConfig{ToolSurface: tc.surface, MetaParamSchema: tc.metaSchema}
+
+			t.Setenv(gatewaycompat.EnvVar, "")
+			want := listedToolSchemas(t, createServerWithin(t, newMockGitLabClient(t), cfg))
+			t.Setenv(gatewaycompat.EnvVar, "zz no served text says this zz=Bar")
+			got := listedToolSchemas(t, createServerWithin(t, newMockGitLabClient(t), cfg))
+
+			for i := range got {
+				if len(got[i]) != len(want[i]) {
+					t.Errorf("listing %d serves %d tools with the substitution, %d without", i+1, len(got[i]), len(want[i]))
+				}
+				for name, schemas := range want[i] {
+					if got[i][name] != schemas {
+						t.Errorf("listing %d: %s serves different schemas once a substitution that matches nothing is set:\nwithout: %.400s\nwith:    %.400s",
+							i+1, name, schemas, got[i][name])
+					}
+				}
+			}
+		})
+	}
 }
 
 // TestCreateServer_GatewayCompatInvalidValue verifies that a malformed
