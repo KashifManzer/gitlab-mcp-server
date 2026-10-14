@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	gl "gitlab.com/gitlab-org/api/client-go/v3"
@@ -47,6 +48,74 @@ func TestListInstance_Success(t *testing.T) {
 	}
 	if out.AuditEvents[0].Details.IPAddress != "127.0.0.1" {
 		t.Errorf("got ip_address %q, want %q", out.AuditEvents[0].Details.IPAddress, "127.0.0.1")
+	}
+}
+
+// TestListInstance_EntityFilters_ReachTheQuery verifies the instance list sends
+// entity_type and entity_id, which GET /audit_events takes and client-go's
+// ListAuditEventsOptions does not model (upstream register row 120), and
+// sends neither when the caller sets neither.
+func TestListInstance_EntityFilters_ReachTheQuery(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		input              ListInstanceInput
+		wantType, wantID   string
+		typeSent, idIsSent bool
+	}{
+		{"type_and_id", ListInstanceInput{EntityType: "Project", EntityID: 42}, "Project", "42", true, true},
+		{"type_alone", ListInstanceInput{EntityType: "User"}, "User", "", true, false},
+		{"neither", ListInstanceInput{}, "", "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if q.Has("entity_type") != tc.typeSent || q.Get("entity_type") != tc.wantType {
+					t.Errorf("entity_type = %q (sent %v), want %q (sent %v)", q.Get("entity_type"), q.Has("entity_type"), tc.wantType, tc.typeSent)
+				}
+				if q.Has("entity_id") != tc.idIsSent || q.Get("entity_id") != tc.wantID {
+					t.Errorf("entity_id = %q (sent %v), want %q (sent %v)", q.Get("entity_id"), q.Has("entity_id"), tc.wantID, tc.idIsSent)
+				}
+				testutil.RespondJSON(w, http.StatusOK, `[]`)
+			}))
+			if _, err := ListInstance(context.Background(), client, tc.input); err != nil {
+				t.Fatalf(fmtUnexpErr, err)
+			}
+		})
+	}
+}
+
+// TestEntityFilter_NoEntityType_IsNoOption verifies a list without an
+// entity_type gets no request option at all, so the query goes out exactly as
+// client-go encoded it rather than decoded and encoded again. ListInstance
+// refuses an entity_id without an entity_type before it gets here.
+func TestEntityFilter_NoEntityType_IsNoOption(t *testing.T) {
+	if entityFilter("", 0) != nil {
+		t.Error("entityFilter(\"\", 0) returned an option, want none")
+	}
+}
+
+// TestListInstance_EntityIDWithoutType_IsRefusedBeforeAnyRequest verifies an
+// entity_id with no entity_type is refused before any request: GitLab
+// requires entity_type whenever entity_id is given, and an ID alone names no
+// entity.
+func TestListInstance_EntityIDWithoutType_IsRefusedBeforeAnyRequest(t *testing.T) {
+	client := testutil.NewTestClient(t, testutil.ForbiddenHandler(t))
+	_, err := ListInstance(context.Background(), client, ListInstanceInput{EntityID: 42})
+	if err == nil || !strings.Contains(err.Error(), "entity_id requires entity_type") {
+		t.Errorf("ListInstance(entity_id alone) error = %v, want the entity_type requirement", err)
+	}
+}
+
+// TestListInstance_Forbidden_HintNamesAccessOnly verifies the 403 hint says
+// what the instance list requires and no longer names entity_type filters as
+// if they were something the caller could pass to get past a refusal.
+func TestListInstance_Forbidden_HintNamesAccessOnly(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusForbidden, `{"message":"403 Forbidden"}`)
+	}))
+	_, err := ListInstance(context.Background(), client, ListInstanceInput{})
+	if err == nil || !strings.Contains(err.Error(), "requires administrator access") || strings.Contains(err.Error(), "entity_type filters") {
+		t.Errorf("ListInstance(403) error = %v, want the administrator hint and no entity_type clause", err)
 	}
 }
 
@@ -540,28 +609,63 @@ func TestListInstance_NoPaginationInput_SendsNoPageParams(t *testing.T) {
 	}
 }
 
-// TestListInstance_InvalidDateSilentlyIgnored verifies the ListInstance_InvalidDateSilentlyIgnored handler.
-// The test exercises the GET path of the underlying GitLab API call.
-// It asserts the returned output matches the expected fields.
-func TestListInstance_InvalidDateSilentlyIgnored(t *testing.T) {
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		if q.Get("created_after") != "" {
-			t.Error("invalid date should not be sent")
-		}
-		if q.Get("created_before") != "" {
-			t.Error("invalid date should not be sent")
-		}
-		testutil.RespondJSONWithPagination(w, http.StatusOK, `[]`,
-			testutil.PaginationHeaders{Page: "1", PerPage: "20", Total: "0", TotalPages: "0"})
+// TestList_InvalidDate_IsRefusedBeforeAnyRequest verifies that each of the
+// three audit event lists refuses a date filter it cannot read, naming the
+// filter, and sends nothing. They used to drop it and list every event the
+// range was meant to leave out, reported as a success (issue 1308).
+func TestList_InvalidDate_IsRefusedBeforeAnyRequest(t *testing.T) {
+	var requests atomic.Int32
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		testutil.RespondJSON(w, http.StatusOK, `[]`)
 	}))
+	calls := []struct {
+		name  string
+		field string
+		call  func() error
+	}{
+		{"instance created_after", "created_after", func() error {
+			_, err := ListInstance(context.Background(), client, ListInstanceInput{CreatedAfter: "not-a-date"})
+			return err
+		}},
+		{"group created_before", "created_before", func() error {
+			_, err := ListGroup(context.Background(), client, ListGroupInput{GroupID: "7", CreatedBefore: "2026-02-30"})
+			return err
+		}},
+		{"project created_after", "created_after", func() error {
+			_, err := ListProject(context.Background(), client, ListProjectInput{ProjectID: "7", CreatedAfter: "01/04/2026"})
+			return err
+		}},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			requests.Store(0)
+			err := tc.call()
+			if err == nil || !strings.Contains(err.Error(), tc.field+" must be") {
+				t.Fatalf("error = %v, want a refusal naming %s", err, tc.field)
+			}
+			if got := requests.Load(); got != 0 {
+				t.Errorf("sent %d request(s) before refusing, want none", got)
+			}
+		})
+	}
+}
 
+// TestListInstance_TimestampFilter_ReachesTheQuery verifies that an RFC 3339
+// filter is sent, which the parser these lists used to share dropped because
+// it read only YYYY-MM-DD, and that a bare date is sent as midnight UTC.
+func TestListInstance_TimestampFilter_ReachesTheQuery(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		testutil.AssertQueryParam(t, r, "created_after", "2020-01-02T03:04:05Z")
+		testutil.AssertQueryParam(t, r, "created_before", "2020-02-01T00:00:00Z")
+		testutil.RespondJSON(w, http.StatusOK, `[]`)
+	}))
 	_, err := ListInstance(context.Background(), client, ListInstanceInput{
-		CreatedAfter:  "not-a-date",
-		CreatedBefore: "also-bad",
+		CreatedAfter:  "2020-01-02T03:04:05Z",
+		CreatedBefore: "2020-02-01",
 	})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf(fmtUnexpErr, err)
 	}
 }
 

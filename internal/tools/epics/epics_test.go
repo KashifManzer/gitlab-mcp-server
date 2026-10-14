@@ -504,10 +504,17 @@ func TestOptionBuilders_EmptyLists_SendNothing(t *testing.T) {
 		FullPath: testFullPath, LabelName: []string{}, In: []string{}, AssigneeUsernames: []string{},
 		IIDs: []string{}, IDs: []string{}, ParentIDs: []string{}, MilestoneTitle: []string{},
 	}
-	if rest := buildEpicListOptions(list); rest.Labels != nil {
+	rest, err := buildEpicListOptions(list)
+	if err != nil {
+		t.Fatalf("buildEpicListOptions() error = %v", err)
+	}
+	if rest.Labels != nil {
 		t.Errorf("REST listing labels = %v, want none for an empty label list", *rest.Labels)
 	}
-	work := buildWorkItemsListOptions(list, toolutil.GraphQLCursor{})
+	work, err := buildWorkItemsListOptions(list, toolutil.GraphQLCursor{})
+	if err != nil {
+		t.Fatalf("buildWorkItemsListOptions() error = %v", err)
+	}
 	sent := map[string][]string{
 		"in": work.In, "label_name": work.LabelName, "assignee_usernames": work.AssigneeUsernames,
 		"iids": work.IIDs, "ids": work.IDs, "parent_ids": work.ParentIDs, "milestone_title": work.MilestoneTitle,
@@ -520,11 +527,17 @@ func TestOptionBuilders_EmptyLists_SendNothing(t *testing.T) {
 		})
 	}
 
-	created := buildCreateOptions(CreateInput{FullPath: testFullPath, Title: "t", AssigneeIDs: []int64{}, LabelIDs: []int64{}})
+	created, err := buildCreateOptions(CreateInput{FullPath: testFullPath, Title: "t", AssigneeIDs: []int64{}, LabelIDs: []int64{}})
+	if err != nil {
+		t.Fatalf("buildCreateOptions() error = %v", err)
+	}
 	if created.AssigneeIDs != nil || created.LabelIDs != nil {
 		t.Errorf("creation assignees, labels = %#v, %#v; want none for empty lists", created.AssigneeIDs, created.LabelIDs)
 	}
-	updated := buildUpdateOptions(UpdateInput{FullPath: testFullPath, IID: 1, AddLabelIDs: []int64{}, RemoveLabelIDs: []int64{}})
+	updated, _, err := buildUpdateOptions(UpdateInput{FullPath: testFullPath, IID: 1, AddLabelIDs: []int64{}, RemoveLabelIDs: []int64{}})
+	if err != nil {
+		t.Fatalf("buildUpdateOptions() error = %v", err)
+	}
 	if updated.AddLabelIDs != nil || updated.RemoveLabelIDs != nil {
 		t.Errorf("update added, removed labels = %#v, %#v; want none for empty lists", updated.AddLabelIDs, updated.RemoveLabelIDs)
 	}
@@ -1502,18 +1515,18 @@ func TestUpdate_WithAllOptions(t *testing.T) {
 		FullPath:       testFullPath,
 		IID:            1,
 		Title:          "Updated",
-		Description:    "New description",
+		Description:    new("New description"),
 		StateEvent:     "CLOSE",
 		ParentID:       &parentID,
 		MilestoneID:    &milestoneID,
 		Color:          "#00FF00",
-		StartDate:      "2026-02-01",
-		DueDate:        "2026-04-30",
+		StartDate:      new("2026-02-01"),
+		DueDate:        new("2026-04-30"),
 		AddLabelIDs:    []int64{100},
 		RemoveLabelIDs: []int64{200},
 		AssigneeIDs:    []int64{1, 2, 3},
 		Weight:         &weight,
-		HealthStatus:   "needsAttention",
+		HealthStatus:   new("needsAttention"),
 	})
 	if err != nil {
 		t.Fatalf(fmtUnexpErr, err)
@@ -2108,30 +2121,46 @@ func TestFormatListMarkdown_PaginationBlocks(t *testing.T) {
 	}
 }
 
-// TestBuildCreateOptions_UnparseableTimestamps verifies that a created_at or a
-// date this handler cannot read leaves the option unset rather than failing
-// the call, which is the behavior the schema's date-time format documents.
-func TestBuildCreateOptions_UnparseableTimestamps(t *testing.T) {
-	opts := buildCreateOptions(CreateInput{
-		Title:     "X",
-		CreatedAt: "yesterday",
-		StartDate: "01/02/2026",
-		DueDate:   "",
-	})
+// TestBuildCreateOptions_UnparseableTimestamps_AreRefused verifies that a
+// created_at or a date this handler cannot read refuses the call, naming the
+// input. They used to be left unset, so an epic asked for with a due date came
+// back with none and one asked to be backdated was stamped with now, each
+// reported as a success (issues 1302 and 1308).
+func TestBuildCreateOptions_UnparseableTimestamps_AreRefused(t *testing.T) {
 	cases := []struct {
-		name string
-		set  bool
+		name  string
+		input CreateInput
 	}{
-		{"created_at", opts.CreatedAt != nil},
-		{"start_date", opts.StartDate != nil},
-		{"due_date", opts.DueDate != nil},
+		{"created_at", CreateInput{Title: "X", CreatedAt: "yesterday"}},
+		{"start_date", CreateInput{Title: "X", StartDate: "01/02/2026"}},
+		{"due_date", CreateInput{Title: "X", DueDate: "2026/12/31"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.set {
-				t.Errorf("%s was set from a value that does not parse", tc.name)
+			opts, err := buildCreateOptions(tc.input)
+			if err == nil || !strings.Contains(err.Error(), tc.name+" must be") {
+				t.Errorf("buildCreateOptions() = %+v, %v, want a refusal naming %s", opts, err, tc.name)
 			}
 		})
+	}
+}
+
+// TestBuildCreateOptions_Timestamps_AreRead verifies the spellings a caller
+// may use: a bare date for created_at is read as midnight UTC, and an RFC 3339
+// due date is read for the day it names.
+func TestBuildCreateOptions_Timestamps_AreRead(t *testing.T) {
+	opts, err := buildCreateOptions(CreateInput{Title: "X", CreatedAt: "2025-01-01", StartDate: "2026-01-02", DueDate: "2026-12-31T23:00:00-05:00"})
+	if err != nil {
+		t.Fatalf("buildCreateOptions() error = %v", err)
+	}
+	if opts.CreatedAt == nil || !opts.CreatedAt.Equal(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("created_at = %v, want 2025-01-01 midnight UTC", opts.CreatedAt)
+	}
+	if opts.StartDate == nil || opts.StartDate.String() != "2026-01-02" {
+		t.Errorf("start_date = %v, want 2026-01-02", opts.StartDate)
+	}
+	if opts.DueDate == nil || opts.DueDate.String() != "2026-12-31" {
+		t.Errorf("due_date = %v, want 2026-12-31", opts.DueDate)
 	}
 }
 
@@ -2139,7 +2168,10 @@ func TestBuildCreateOptions_UnparseableTimestamps(t *testing.T) {
 // naming no work item sends no widget, since GitLab requires a non-empty list
 // there and would refuse the whole mutation.
 func TestBuildCreateOptions_EmptyLinkedItems(t *testing.T) {
-	opts := buildCreateOptions(CreateInput{Title: "X", LinkedItems: &CreateLinkedItems{LinkType: "BLOCKS"}})
+	opts, err := buildCreateOptions(CreateInput{Title: "X", LinkedItems: &CreateLinkedItems{LinkType: "BLOCKS"}})
+	if err != nil {
+		t.Fatalf("buildCreateOptions() error = %v", err)
+	}
 	if opts.LinkedItems != nil {
 		t.Errorf("LinkedItems = %+v, want nil for an empty work_item_ids", opts.LinkedItems)
 	}
@@ -2472,6 +2504,96 @@ func TestUpdate_WithoutATitle_SendsNoTitle(t *testing.T) {
 	}
 }
 
+// recordEpicUpdate answers the global-ID lookup and the update mutation an
+// epic update sends, and hands back the mutation's input object.
+func recordEpicUpdate(t *testing.T) (http.Handler, func() map[string]any) {
+	t.Helper()
+	var input map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vars, err := testutil.ParseGraphQLVariables(r)
+		if err != nil {
+			t.Errorf("ParseGraphQLVariables: %v", err)
+			http.Error(w, "ParseGraphQLVariables", http.StatusInternalServerError)
+			return
+		}
+		mutation, isUpdate := vars["input"].(map[string]any)
+		if !isUpdate {
+			testutil.RespondJSON(w, http.StatusOK, deleteGIDResponseJSON)
+			return
+		}
+		input = mutation
+		testutil.RespondJSON(w, http.StatusOK, updateResponseJSON)
+	})
+	return handler, func() map[string]any { return input }
+}
+
+// TestUpdate_Removals_ReachTheWire drives each removal an epic update accepts
+// and asserts the leaf it becomes inside the mutation input: 0 for the parent
+// or the milestone and "" for a date or the health status arrive as null,
+// which is how GitLab's schema says each is removed, and "" for the
+// description arrives as an empty description.
+//
+// Before issue 1302 "" sent nothing, so the update answered with the epic's
+// dates and health status still in place, and 0 reached GitLab as a global ID
+// no object carries.
+func TestUpdate_Removals_ReachTheWire(t *testing.T) {
+	zero, empty := int64(0), ""
+	cases := []struct {
+		name          string
+		input         UpdateInput
+		widget, field string
+		want          any
+	}{
+		{"start_date", UpdateInput{StartDate: &empty}, "startAndDueDateWidget", "startDate", nil},
+		{"due_date", UpdateInput{DueDate: &empty}, "startAndDueDateWidget", "dueDate", nil},
+		{"health_status", UpdateInput{HealthStatus: &empty}, "healthStatusWidget", "healthStatus", nil},
+		{"parent_id", UpdateInput{ParentID: &zero}, "hierarchyWidget", "parentId", nil},
+		{"milestone_id", UpdateInput{MilestoneID: &zero}, "milestoneWidget", "milestoneId", nil},
+		{"description", UpdateInput{Description: &empty}, "descriptionWidget", "description", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, sent := recordEpicUpdate(t)
+			input := tc.input
+			input.FullPath, input.IID = testFullPath, 1
+			if _, err := Update(t.Context(), testutil.NewTestClient(t, handler), input); err != nil {
+				t.Fatalf(fmtUnexpErr, err)
+			}
+			widget, ok := sent()[tc.widget].(map[string]any)
+			if !ok {
+				t.Fatalf("mutation input carries no %s: %v", tc.widget, sent())
+			}
+			if value, present := widget[tc.field]; !present || value != tc.want {
+				t.Errorf("%s.%s = %#v (present %v), want %#v", tc.widget, tc.field, value, present, tc.want)
+			}
+		})
+	}
+}
+
+// TestUpdate_NegativeReference_IsRefusedBeforeAnyRequest verifies a negative
+// parent or milestone ID is refused, naming the field, rather than sent as a
+// global ID no object carries.
+func TestUpdate_NegativeReference_IsRefusedBeforeAnyRequest(t *testing.T) {
+	negative := int64(-1)
+	cases := []struct {
+		name  string
+		input UpdateInput
+	}{
+		{"parent_id", UpdateInput{ParentID: &negative}},
+		{"milestone_id", UpdateInput{MilestoneID: &negative}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := tc.input
+			input.FullPath, input.IID = testFullPath, 1
+			_, err := Update(t.Context(), testutil.NewTestClient(t, testutil.ForbiddenHandler(t)), input)
+			if err == nil || !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("Update(%s=-1) error = %v, want a refusal naming the field", tc.name, err)
+			}
+		})
+	}
+}
+
 // TestEpicLabels_UnmarshalJSON_SkipsANullDetail verifies that a null element in
 // the detailed labels array contributes no name rather than an empty one.
 //
@@ -2531,4 +2653,44 @@ func TestFormatOutputMarkdown_StateRow_FollowsWhatGitLabSent(t *testing.T) {
 			t.Errorf("FormatOutputMarkdown() = %q, want a row %q", got, want)
 		}
 	})
+}
+
+// TestHandlers_DateThatDoesNotParse_IsRefusedBeforeAnyRequest verifies each
+// epic handler that reads a date refuses one it cannot read, naming the field
+// and quoting the value, before any request: the REST list, the Work Items
+// list a filter such as author_username sends the call through, the creation
+// and the update. Each used to answer nil for such a value, so a list went out
+// unfiltered and a date was left unset (issues 1302 and 1308).
+func TestHandlers_DateThatDoesNotParse_IsRefusedBeforeAnyRequest(t *testing.T) {
+	client := testutil.NewTestClient(t, testutil.ForbiddenHandler(t))
+	ctx := context.Background()
+	cases := []struct {
+		name, field string
+		call        func() error
+	}{
+		{"list_rest", "created_after", func() error {
+			_, err := List(ctx, client, ListInput{FullPath: "grp", CreatedAfter: "not-a-date"})
+			return err
+		}},
+		{"list_work_items", "created_after", func() error {
+			_, err := List(ctx, client, ListInput{FullPath: "grp", AuthorUsername: "alice", CreatedAfter: "not-a-date"})
+			return err
+		}},
+		{"create", "start_date", func() error {
+			_, err := Create(ctx, client, CreateInput{FullPath: "grp", Title: "t", StartDate: "not-a-date"})
+			return err
+		}},
+		{"update", "due_date", func() error {
+			_, err := Update(ctx, client, UpdateInput{FullPath: "grp", IID: 1, DueDate: new("not-a-date")})
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			if err == nil || !strings.Contains(err.Error(), tc.field+" must be") || !strings.Contains(err.Error(), `"not-a-date"`) {
+				t.Errorf("%s error = %v, want the %s refusal quoting the value", tc.name, err, tc.field)
+			}
+		})
+	}
 }

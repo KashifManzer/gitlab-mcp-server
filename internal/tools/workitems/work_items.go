@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	gl "gitlab.com/gitlab-org/api/client-go/v3"
 
@@ -435,52 +434,16 @@ func applyPlanningFilters(opts *gl.ListWorkItemsOptions, input ListInput) {
 // items than were asked for, and nothing in the answer says the range was not
 // applied.
 func applyTimeFilters(opts *gl.ListWorkItemsOptions, input ListInput) error {
-	filters := []struct {
-		name  string
-		value string
-		dest  **time.Time
-	}{
-		{"closed_after", input.ClosedAfter, &opts.ClosedAfter},
-		{"closed_before", input.ClosedBefore, &opts.ClosedBefore},
-		{"created_after", input.CreatedAfter, &opts.CreatedAfter},
-		{"created_before", input.CreatedBefore, &opts.CreatedBefore},
-		{"due_after", input.DueAfter, &opts.DueAfter},
-		{"due_before", input.DueBefore, &opts.DueBefore},
-		{"updated_after", input.UpdatedAfter, &opts.UpdatedAfter},
-		{"updated_before", input.UpdatedBefore, &opts.UpdatedBefore},
-	}
-	for _, filter := range filters {
-		if filter.value == "" {
-			continue
-		}
-		parsed, err := parseWorkItemTime(filter.name, filter.value)
-		if err != nil {
-			return err
-		}
-		*filter.dest = parsed
-	}
-	return nil
-}
-
-// workItemTimeLayouts are the timestamp spellings the time filters accept.
-//
-// RFC 3339 is what the published schema advertises through its date-time
-// format and what GitLab's Time scalar wants. The two shorter forms are here
-// because a model told a value is a date sends exactly "2025-01-01", and
-// refusing that would cost a round trip to learn nothing.
-// internal/tools/workitemsavedviews accepts the same three spellings for the
-// same eight filter names.
-var workItemTimeLayouts = []string{time.RFC3339, "2006-01-02T15:04:05", toolutil.DateFormatISO}
-
-// parseWorkItemTime reads one timestamp, naming the field it came from so the
-// caller learns which of eight filters was malformed.
-func parseWorkItemTime(field, value string) (*time.Time, error) {
-	for _, layout := range workItemTimeLayouts {
-		if parsed, err := time.Parse(layout, value); err == nil {
-			return &parsed, nil
-		}
-	}
-	return nil, fmt.Errorf("%s must be an ISO 8601 timestamp (e.g. 2025-01-01T00:00:00Z), got %q", field, value)
+	return toolutil.ParseTimeInputs(
+		toolutil.TimeInput{Field: "closed_after", Value: input.ClosedAfter, Dest: &opts.ClosedAfter},
+		toolutil.TimeInput{Field: "closed_before", Value: input.ClosedBefore, Dest: &opts.ClosedBefore},
+		toolutil.TimeInput{Field: "created_after", Value: input.CreatedAfter, Dest: &opts.CreatedAfter},
+		toolutil.TimeInput{Field: "created_before", Value: input.CreatedBefore, Dest: &opts.CreatedBefore},
+		toolutil.TimeInput{Field: "due_after", Value: input.DueAfter, Dest: &opts.DueAfter},
+		toolutil.TimeInput{Field: "due_before", Value: input.DueBefore, Dest: &opts.DueBefore},
+		toolutil.TimeInput{Field: "updated_after", Value: input.UpdatedAfter, Dest: &opts.UpdatedAfter},
+		toolutil.TimeInput{Field: "updated_before", Value: input.UpdatedBefore, Dest: &opts.UpdatedBefore},
+	)
 }
 
 // workItemEEListFields are the five field names client-go keeps out of its
@@ -659,13 +622,11 @@ func buildCreateOptions(input CreateInput) (*gl.CreateWorkItemOptions, error) {
 	if err := applyCreateWidgets(opts, input); err != nil {
 		return nil, err
 	}
-	if input.CreatedAt != "" {
-		createdAt, err := parseWorkItemTime("created_at", input.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		opts.CreatedAt = createdAt
+	createdAt, err := toolutil.ParseTimeField("created_at", input.CreatedAt)
+	if err != nil {
+		return nil, err
 	}
+	opts.CreatedAt = createdAt
 	// Only the nil check is ours: client-go folds the linked items into a
 	// widget of its own on the same non-empty-length condition, so a second
 	// copy of that length test here decided nothing a caller could see.
@@ -722,47 +683,13 @@ func applyCreateWidgets(opts *gl.CreateWorkItemOptions, input CreateInput) error
 	if input.Color != "" {
 		opts.Color = new(input.Color)
 	}
-	return applyWorkItemDates(input.StartDate, input.DueDate, &opts.StartDate, &opts.DueDate)
-}
-
-// applyWorkItemDates parses the start and due dates create and update share,
-// refusing the call on the first one it cannot read.
-//
-// Both used to drop a malformed date and report success, so a work item asked
-// for with a due date came back without one and nothing in the answer said the
-// date had been discarded. That is the same failure the eight list filters
-// refuse and the same one created_at refuses; these two now match.
-func applyWorkItemDates(startDate, dueDate string, start, due **gl.ISOTime) error {
-	dates := []struct {
-		name  string
-		value string
-		dest  **gl.ISOTime
-	}{
-		{"start_date", startDate, start},
-		{"due_date", dueDate, due},
-	}
-	for _, date := range dates {
-		if date.value == "" {
-			continue
-		}
-		parsed, err := parseWorkItemDate(date.name, date.value)
-		if err != nil {
-			return err
-		}
-		*date.dest = parsed
-	}
-	return nil
-}
-
-// parseWorkItemDate reads one calendar date, naming the field it came from so
-// the caller learns which of the two was malformed.
-func parseWorkItemDate(field, value string) (*gl.ISOTime, error) {
-	parsed, err := time.Parse(toolutil.DateFormatISO, value)
-	if err != nil {
-		return nil, fmt.Errorf("%s must be a date in YYYY-MM-DD form (e.g. 2025-01-31), got %q", field, value)
-	}
-	isoDate := gl.ISOTime(parsed)
-	return &isoDate, nil
+	// A date that does not parse refuses the call. Both used to be dropped and
+	// the creation reported as a success, so a work item asked for with a due
+	// date came back without one and nothing in the answer said so.
+	return toolutil.ParseDateInputs(
+		toolutil.DateInput{Field: "start_date", Value: input.StartDate, Dest: &opts.StartDate},
+		toolutil.DateInput{Field: "due_date", Value: input.DueDate, Dest: &opts.DueDate},
+	)
 }
 
 // Update.
@@ -773,18 +700,18 @@ type UpdateInput struct {
 	IID            int64   `json:"work_item_iid" jsonschema:"Work item IID,required"`
 	Title          string  `json:"title,omitempty" jsonschema:"New title"`
 	StateEvent     string  `json:"state_event,omitempty" jsonschema:"State event: CLOSE or REOPEN"`
-	Description    string  `json:"description,omitempty" jsonschema:"New description"`
+	Description    *string `json:"description,omitempty" jsonschema:"New description. Pass an empty string to remove the description. Omit the field to leave it untouched"`
 	AssigneeIDs    []int64 `json:"assignee_ids,omitempty" jsonschema:"Global IDs of assignees. Replaces the current assignees. Pass an empty array [] to remove every assignee. Omit the field to leave assignees untouched"`
-	MilestoneID    *int64  `json:"milestone_id,omitempty" jsonschema:"Global ID of the milestone"`
+	MilestoneID    *int64  `json:"milestone_id,omitempty" jsonschema:"Global ID of the milestone. Pass 0 to remove the work item from its milestone. Omit the field to leave it untouched"`
 	CRMContactIDs  []int64 `json:"crm_contact_ids,omitempty" jsonschema:"CRM contact IDs. Replaces the current contacts. Pass an empty array [] to remove every contact. Omit the field to leave contacts untouched"`
-	ParentID       *int64  `json:"parent_id,omitempty" jsonschema:"Global ID of the parent work item"`
+	ParentID       *int64  `json:"parent_id,omitempty" jsonschema:"Global ID of the parent work item. Pass 0 to remove the parent. Omit the field to leave it untouched"`
 	AddLabelIDs    []int64 `json:"add_label_ids,omitempty" jsonschema:"Global IDs of labels to add"`
 	RemoveLabelIDs []int64 `json:"remove_label_ids,omitempty" jsonschema:"Global IDs of labels to remove"`
-	StartDate      string  `json:"start_date,omitempty" jsonschema:"Start date (YYYY-MM-DD)"`
-	DueDate        string  `json:"due_date,omitempty" jsonschema:"Due date (YYYY-MM-DD)"`
+	StartDate      *string `json:"start_date,omitempty" jsonschema:"Start date (YYYY-MM-DD). Pass an empty string to remove the start date. Omit the field to leave it untouched"`
+	DueDate        *string `json:"due_date,omitempty" jsonschema:"Due date (YYYY-MM-DD). Pass an empty string to remove the due date. Omit the field to leave it untouched"`
 	Weight         *int64  `json:"weight,omitempty" tier:"premium" jsonschema:"Weight of the work item"`
-	HealthStatus   string  `json:"health_status,omitempty" tier:"ultimate" jsonschema:"Health status (onTrack/needsAttention/atRisk)"`
-	IterationID    *int64  `json:"iteration_id,omitempty" tier:"premium" jsonschema:"Global ID of the iteration"`
+	HealthStatus   *string `json:"health_status,omitempty" tier:"ultimate" jsonschema:"Health status (onTrack/needsAttention/atRisk). Pass an empty string to remove the health status. Omit the field to leave it untouched"`
+	IterationID    *int64  `json:"iteration_id,omitempty" tier:"premium" jsonschema:"Global ID of the iteration. Pass 0 to remove the work item from its iteration. Omit the field to leave it untouched"`
 	Color          string  `json:"color,omitempty" tier:"premium" jsonschema:"Color hex code (e.g. #fefefe)"`
 	Status         string  `json:"status,omitempty" tier:"premium" jsonschema:"Work item status: TODO, IN_PROGRESS, DONE, WONT_DO, or DUPLICATE"`
 	// Confirm is declared so the input schema advertises the reserved confirm
@@ -802,14 +729,14 @@ func Update(ctx context.Context, client *gitlabclient.Client, input UpdateInput)
 	// The options are built before the clearing guard so a malformed date is
 	// refused without first spending a round trip to read the current
 	// assignees, which would have been read only to reject the call anyway.
-	opts, buildErr := buildUpdateOptions(input)
+	opts, removals, buildErr := buildUpdateOptions(input)
 	if buildErr != nil {
 		return GetOutput{}, fmt.Errorf("update_work_item: %w", buildErr)
 	}
 	if err := confirmListClearing(ctx, client, input); err != nil {
 		return GetOutput{}, err
 	}
-	wi, _, err := client.GL().WorkItems.UpdateWorkItem(input.FullPath, input.IID, opts, gl.WithContext(ctx))
+	wi, _, err := client.GL().WorkItems.UpdateWorkItem(input.FullPath, input.IID, opts, gl.WithContext(ctx), removals)
 	if err != nil {
 		return GetOutput{}, toolutil.WrapErrWithStatusHint("update_work_item", err, http.StatusBadRequest,
 			"verify full_path + iid with issue.work_item_list; only widget-supported fields can be updated for the type; state_event values: close|reopen")
@@ -817,8 +744,18 @@ func Update(ctx context.Context, client *gitlabclient.Client, input UpdateInput)
 	return GetOutput{WorkItem: workItemToItem(wi)}, nil
 }
 
-func buildUpdateOptions(input UpdateInput) (*gl.UpdateWorkItemOptions, error) {
-	opts := &gl.UpdateWorkItemOptions{}
+// buildUpdateOptions translates the tool input into SDK update options and the
+// request option that sends the removals the input asks for, nil when it asks
+// for none.
+//
+// The milestone, parent, iteration, dates and health status follow the
+// clearing convention of [toolutil.WorkItemWidgetInputs]: 0 removes a
+// reference and "" removes a date or the health status, which client-go cannot
+// send by itself (register row 119). An empty description is sent as one,
+// since the description widget takes "" and client-go sends whatever pointer
+// it is handed.
+func buildUpdateOptions(input UpdateInput) (*gl.UpdateWorkItemOptions, gl.RequestOptionFunc, error) {
+	opts := &gl.UpdateWorkItemOptions{Description: input.Description}
 	if input.Title != "" {
 		opts.Title = &input.Title
 	}
@@ -826,37 +763,30 @@ func buildUpdateOptions(input UpdateInput) (*gl.UpdateWorkItemOptions, error) {
 		ev := gl.WorkItemStateEvent(input.StateEvent)
 		opts.StateEvent = &ev
 	}
-	if input.Description != "" {
-		opts.Description = &input.Description
-	}
 	if input.AssigneeIDs != nil {
 		opts.AssigneeIDs = input.AssigneeIDs
 	}
-	if input.MilestoneID != nil {
-		opts.MilestoneID = input.MilestoneID
-	}
 	if input.CRMContactIDs != nil {
 		opts.CRMContactIDs = input.CRMContactIDs
-	}
-	if input.ParentID != nil {
-		opts.ParentID = input.ParentID
 	}
 	// Both label lists go over as given: client-go builds the labels widget
 	// only when one of them has entries, so guarding them here was a copy of
 	// its decision.
 	opts.AddLabelIDs = input.AddLabelIDs
 	opts.RemoveLabelIDs = input.RemoveLabelIDs
-	if err := applyWorkItemDates(input.StartDate, input.DueDate, &opts.StartDate, &opts.DueDate); err != nil {
-		return nil, err
+	removals, err := toolutil.ApplyWorkItemWidgets(opts, toolutil.WorkItemWidgetInputs{
+		MilestoneID:  input.MilestoneID,
+		ParentID:     input.ParentID,
+		IterationID:  input.IterationID,
+		StartDate:    input.StartDate,
+		DueDate:      input.DueDate,
+		HealthStatus: input.HealthStatus,
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 	if input.Weight != nil {
 		opts.Weight = input.Weight
-	}
-	if input.HealthStatus != "" {
-		opts.HealthStatus = &input.HealthStatus
-	}
-	if input.IterationID != nil {
-		opts.IterationID = input.IterationID
 	}
 	if input.Color != "" {
 		opts.Color = &input.Color
@@ -865,7 +795,7 @@ func buildUpdateOptions(input UpdateInput) (*gl.UpdateWorkItemOptions, error) {
 		status := mapStatusToID(input.Status)
 		opts.Status = &status
 	}
-	return opts, nil
+	return opts, removals, nil
 }
 
 // Delete.

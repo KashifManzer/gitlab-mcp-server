@@ -99,10 +99,10 @@ func epicDeleteSpec(name string, route toolutil.ActionRoute, individualTool stri
 // The four new date filters take their format here rather than from
 // toolutil's canonical map, which carries the created, updated, last_used,
 // last_activity, started, finished, deployed and expires pairs and none of
-// these four. All eight parse through
-// toolutil.ParseOptionalTime, which accepts RFC 3339 and silently ignores
-// anything else, so the schema has to say date-time for all eight or the four
-// new ones read as free text beside four siblings that do not.
+// these four. All eight parse through toolutil.ParseTimeInputs, which takes
+// RFC 3339, a local date-time or a bare date and refuses anything else, so the
+// schema says date-time for all eight rather than let the four new ones read
+// as free text beside four siblings that do not.
 func epicListEnumOverrides() []toolutil.InputSchemaOverride {
 	return []toolutil.InputSchemaOverride{
 		toolutil.SchemaPropertyOverride("state", map[string]any{
@@ -135,9 +135,9 @@ func epicListEnumOverrides() []toolutil.InputSchemaOverride {
 // link_type values are the WorkItemRelatedLinkType enum.
 //
 // created_at declares its format for the reason the list filters do: the
-// handler parses it with toolutil.ParseOptionalTime, which takes RFC 3339 and
-// leaves anything else unset, so a caller sending a bare date would get an
-// epic stamped with now and no complaint.
+// handler parses it with toolutil.ParseTimeField and refuses a value it
+// cannot read. The parser before it left such a value unset, so a caller
+// sending a bare date got an epic stamped with now and no complaint.
 func epicCreateEnumOverrides() []toolutil.InputSchemaOverride {
 	return []toolutil.InputSchemaOverride{
 		toolutil.SchemaPropertyOverride("health_status", map[string]any{
@@ -152,7 +152,9 @@ func epicCreateEnumOverrides() []toolutil.InputSchemaOverride {
 
 // epicUpdateEnumOverrides constrains state_event and health_status on the epic
 // update action. state_event values come from WorkItemStateEvent SDK constants
-// (CLOSE/REOPEN). health_status from the GraphQL HealthStatus enum.
+// (CLOSE/REOPEN). health_status from the GraphQL HealthStatus enum, plus the
+// empty string that removes the health status (issue 1302), which a schema
+// validating the arguments would otherwise refuse before the handler saw it.
 //
 // There is no status override because there is no status input: an Epic work
 // item carries no STATUS widget and the mutation refuses the field. See
@@ -163,7 +165,7 @@ func epicUpdateEnumOverrides() []toolutil.InputSchemaOverride {
 			"enum": []any{"CLOSE", "REOPEN"},
 		}),
 		toolutil.SchemaPropertyOverride("health_status", map[string]any{
-			"enum": []any{"onTrack", "needsAttention", "atRisk"},
+			"enum": []any{"onTrack", "needsAttention", "atRisk", ""},
 		}),
 	}
 }
@@ -208,7 +210,7 @@ func decorateEpicMeta(opts *toolutil.ActionSpecOptions, individualTool string) {
 		opts.RelatedActions = []string{actionEpicGet, actionEpicList, actionEpicUpdate}
 		opts.IndividualTool.Description = "Create a new epic in a group, optionally under a parent epic and already linked to others. Returns: the created epic with IID, state, labels, assignees, dates, and web URL. See also: gitlab_epic_get, gitlab_epic_list, gitlab_epic_update."
 	case "gitlab_epic_update":
-		opts.Usage = "Update an existing epic by full_path plus epic_iid. Supports close/reopen via state_event, reparenting via parent_id, milestone assignment, label add/remove, dates, weight and health status."
+		opts.Usage = "Update an existing epic by full_path plus epic_iid. Supports close/reopen via state_event, reparenting via parent_id, milestone assignment, label add/remove, dates, weight and health status. To remove a value, send 0 for parent_id or milestone_id and an empty string for start_date, due_date, health_status or description."
 		opts.Aliases = []string{individualTool, "update epic", "edit epic", "close epic", "reopen epic"}
 		opts.RelatedActions = []string{actionEpicGet, actionEpicList, actionEpicDelete}
 		opts.IndividualTool.Description = "Update an existing epic. Supports close/reopen via state_event. Returns: the updated epic with its current state, labels, assignees, dates, and web URL. See also: gitlab_epic_get, gitlab_epic_list, gitlab_epic_delete."
