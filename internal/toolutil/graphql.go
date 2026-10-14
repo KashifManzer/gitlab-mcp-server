@@ -657,6 +657,65 @@ func GraphQLMutationError(operation string, payloadErrors []string) error {
 	return fmt.Errorf("%s mutation errors: %s", operation, strings.Join(messages, "; "))
 }
 
+// GraphQLPartialPage reads what GitLab said beside a page of a connection it
+// answered (issue 1298). GitLab nulls a node or a field it could not resolve
+// where it sits and explains the null in errors[], keeping the rest of the
+// answer, so errors[] beside a connection that resolved mean the page was
+// answered in part, and a node answered null with no error is one left out
+// all the same. kept is how many nodes the page still holds, and nulled how
+// many it answered null.
+//
+// It returns the account a page's card names, empty for a page answered
+// whole, and an error for a page with no node left: read as a page, that
+// answer would say the list is empty, which is what nobody knows. With
+// errors[] the error is [GraphQLTopLevelError]'s, so a refusal it carries is
+// read as one.
+func GraphQLPartialPage(operation string, responseErrors []GraphQLError, kept, nulled int) (string, error) {
+	if graphQLErr := GraphQLTopLevelError(operation, responseErrors); graphQLErr != nil {
+		if kept == 0 {
+			return "", graphQLErr
+		}
+		return graphQLErr.Error(), nil
+	}
+	if nulled == 0 {
+		return "", nil
+	}
+	account := fmt.Sprintf("%s: GitLab answered %d of the page's items null with no error", operation, nulled)
+	if kept == 0 {
+		return "", errors.New(account)
+	}
+	return account, nil
+}
+
+// NodesAnswered converts the nodes of a connection page in order, leaving out
+// each node GitLab answered null, and returns how many it left out for
+// [GraphQLPartialPage] to account for (issue 1298). A connection decodes its
+// nodes as pointers for this: decoded as values, a null node read as an item
+// of zero values. No node at all is an empty page, never a nil one.
+func NodesAnswered[N, I any](nodes []*N, convert func(N) I) (items []I, nulled int) {
+	items = make([]I, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil {
+			nulled++
+			continue
+		}
+		items = append(items, convert(*node))
+	}
+	return items, nulled
+}
+
+// PartialPageHint is the next step a list card adds when GitLab answered its
+// page in part, naming the account [GraphQLPartialPage] gave, and empty for a
+// page answered whole. The account carries GitLab's own messages, so it is
+// escaped as the single-line list value it becomes.
+func PartialPageHint(account string) string {
+	if account == "" {
+		return ""
+	}
+	return "GitLab answered this page in part (" + EscapeMdTableCell(account) +
+		"), so an item or a field it could not resolve may be missing from it; list again before reading the page as complete"
+}
+
 // FormatGraphQLPagination renders cursor-based pagination metadata as a
 // Markdown summary line, suitable for appending to list tool responses.
 func FormatGraphQLPagination(p GraphQLPaginationOutput, shown int) string {
@@ -714,6 +773,20 @@ func ParseGID(gid string) (typeName string, id int64, err error) {
 		return "", 0, fmt.Errorf("invalid GitLab GID: ID %q is not a valid integer in %q", rest[slash+1:], gid)
 	}
 	return typeName, id, nil
+}
+
+// NoteIDFromGID reads a note's numeric ID out of the global ID GitLab
+// answered it with, and reports whether the note is one GitLab synthesizes
+// from a resource event: a label, state, milestone, iteration or weight
+// change GitLab's NoteType answers with a global ID ending in the
+// hexadecimal discussion ID (gid://gitlab/WeightNote/0f3c...), which carries
+// no number. Such a note has ID 0 and no note action can address it; a value
+// that is not a GitLab global ID at all is neither a number nor an event.
+func NoteIDFromGID(gid string) (id int64, resourceEvent bool) {
+	if _, parsed, err := ParseGID(gid); err == nil {
+		return parsed, false
+	}
+	return 0, strings.HasPrefix(gid, "gid://gitlab/")
 }
 
 // MergeVariables merges multiple variable maps into a single map.

@@ -11,6 +11,7 @@ package ee
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/epicdiscussions"
@@ -332,6 +333,41 @@ func TestEpicDiscussions_Lifecycle_ThreadAndReply(t *testing.T) {
 	})
 }
 
+// TestEpicNotes_WritesNamingAnotherEpic_AreRefusedAndChangeNothing writes a
+// note on the fixture epic and opens a second epic per surface, then asks
+// each of the four note writes, through the second epic, to edit or delete
+// the first epic's note (issue 1301). GitLab addresses a note by its ID
+// alone, so each used to change the note whichever epic held it and report
+// the epic the caller named. Each must be refused naming where the note is,
+// and the note must still be on the first epic with its body.
+func TestEpicNotes_WritesNamingAnotherEpic_AreRefusedAndChangeNothing(t *testing.T) {
+	e := harness.New(t)
+
+	harness.SurfacesWith(e, buildEpicFixture("epicnoteown"), func(e *harness.Env, surface harness.Surface, f epicFixture) {
+		s := e.On(surface)
+		note := fixture.NewEpicNote(e, f.epic)
+		other := fixture.NewEpic(e, f.group, e.Name("other"))
+		elsewhere := withParams(epicParams(other), map[string]any{"note_id": note.ID})
+
+		for _, write := range []struct {
+			action harness.ActionID
+			params map[string]any
+		}{
+			{actionEpicNoteUpdate, withParams(elsewhere, map[string]any{"body": "moved"})},
+			{actionEpicNoteDelete, elsewhere},
+			{actionEpicDiscussionUpdateNote, withParams(elsewhere, map[string]any{"body": "moved"})},
+			{actionEpicDiscussionDeleteNote, elsewhere},
+		} {
+			harness.ExpectToolError(s, write.action, write.params, "is not a note of epic")
+		}
+
+		kept := harness.Do[epicnotes.Output](s, actionEpicNoteGet, withParams(epicParams(f.epic), map[string]any{"note_id": note.ID}))
+		if kept.Body != note.Body {
+			e.T.Errorf("the note on the first epic reads %q after writes that named another epic, want %q", kept.Body, note.Body)
+		}
+	})
+}
+
 // epicIssueFixture is a group with a project in it, so the issues an epic
 // collects have somewhere to live.
 type epicIssueFixture struct {
@@ -383,7 +419,7 @@ func TestEpicIssues_AssignRemoveAndReorder_ChildrenFollow(t *testing.T) {
 			e.T.Errorf("the epic's children do not hold issue #%d: %+v", first.IID, listed.Issues)
 		}
 
-		removed := harness.Do[epicissues.AssignOutput](s, actionEpicIssueRemove, child(first))
+		removed := harness.Do[epicissues.RemoveOutput](s, actionEpicIssueRemove, child(first))
 		if removed.EpicGID == "" {
 			e.T.Errorf("epic_issue_remove answered %+v, want the epic's global ID", removed)
 		}
@@ -405,6 +441,55 @@ func TestEpicIssues_AssignRemoveAndReorder_ChildrenFollow(t *testing.T) {
 		}))
 		if len(reordered.Issues) < 2 {
 			e.T.Errorf("epic_issue_update answered %d child issue(s), want both", len(reordered.Issues))
+		}
+	})
+}
+
+// TestEpicIssues_RemoveAndReorderNamingAnotherEpic_AreRefusedAndChangeNothing
+// puts one issue in epic A and another in epic B of their own per surface,
+// then asks epic B to remove A's issue, to reorder its own issue beside A's
+// and to reorder A's issue beside its own (issue 1301). Removal used to clear
+// the issue's parent whichever epic that was, and reordering moved A's issue
+// into B, both reported as done.
+// Each must be refused naming epic A, and A must still hold its issue.
+func TestEpicIssues_RemoveAndReorderNamingAnotherEpic_AreRefusedAndChangeNothing(t *testing.T) {
+	e := harness.New(t)
+
+	harness.SurfacesWith(e, buildEpicIssueFixture, func(e *harness.Env, surface harness.Surface, f epicIssueFixture) {
+		s := e.On(surface)
+		epicA := fixture.NewEpic(e, f.group, e.Name("epic-a"))
+		epicB := fixture.NewEpic(e, f.group, e.Name("epic-b"))
+		inA := fixture.NewIssue(e, f.project, e.Name("in-a"))
+		inB := fixture.NewIssue(e, f.project, e.Name("in-b"))
+		child := func(epic fixture.Epic, issue fixture.Issue) map[string]any {
+			return withParams(epicParams(epic), map[string]any{"child_project_path": f.project.Path, "child_iid": issue.IID})
+		}
+		harness.DoVoid(s, actionEpicIssueAssign, child(epicA, inA))
+		harness.DoVoid(s, actionEpicIssueAssign, child(epicB, inB))
+		inEpicA := harness.Do[epicissues.ListOutput](s, actionEpicIssueList, epicParams(epicA))
+		childA, found := childByIID(inEpicA.Issues, inA.IID)
+		if !found {
+			e.T.Fatalf("epic A does not hold issue #%d: %+v", inA.IID, inEpicA.Issues)
+		}
+		inEpicB := harness.Do[epicissues.ListOutput](s, actionEpicIssueList, epicParams(epicB))
+		childB, found := childByIID(inEpicB.Issues, inB.IID)
+		if !found {
+			e.T.Fatalf("epic B does not hold issue #%d: %+v", inB.IID, inEpicB.Issues)
+		}
+
+		harness.ExpectToolError(s, actionEpicIssueRemove, child(epicB, inA), "is a child of")
+		// Both directions of a reorder: B's own issue beside A's, and A's issue
+		// beside B's own, which is the call that used to move A's issue into B.
+		harness.ExpectToolError(s, actionEpicIssueUpdate, withParams(epicParams(epicB), map[string]any{
+			"child_id": childB.ID, "adjacent_id": childA.ID, "relative_position": "AFTER",
+		}), "is a child of")
+		harness.ExpectToolError(s, actionEpicIssueUpdate, withParams(epicParams(epicB), map[string]any{
+			"child_id": childA.ID, "adjacent_id": childB.ID, "relative_position": "AFTER",
+		}), "is a child of")
+
+		after := harness.Do[epicissues.ListOutput](s, actionEpicIssueList, epicParams(epicA))
+		if _, still := childByIID(after.Issues, inA.IID); !still {
+			e.T.Errorf("epic A lost issue #%d to a call that named epic B: %+v", inA.IID, after.Issues)
 		}
 	})
 }
@@ -435,6 +520,60 @@ type epicLabelFixture struct {
 func buildEpicLabelFixture(e *harness.Env) epicLabelFixture {
 	group := fixture.NewGroup(e, fixture.WithGroupNamePrefix("epiclabel"))
 	return epicLabelFixture{group: group, label: fixture.NewGroupLabel(e, group, "epic")}
+}
+
+// TestEpicNotes_LabelEvent_IsNamedByItsGlobalIDNotNoteZero puts the fixture
+// label on an epic of its own per surface and reads the epic's notes and
+// threads, where GitLab answers the label change as a note it synthesizes
+// from the event (issue 1304). That note has a global ID ending in the
+// hexadecimal discussion ID rather than a number, and both listings used to
+// publish it as note 0, an ID GitLab never assigned and every event shared.
+// Each listing must carry the event with its global ID and marked as one,
+// and no note anywhere with id 0 and nothing to name it by.
+func TestEpicNotes_LabelEvent_IsNamedByItsGlobalIDNotNoteZero(t *testing.T) {
+	e := harness.New(t)
+
+	harness.SurfacesWith(e, buildEpicLabelFixture, func(e *harness.Env, surface harness.Surface, f epicLabelFixture) {
+		s := e.On(surface)
+		epic := fixture.NewEpic(e, f.group, e.Name("epic"))
+		params := epicParams(epic)
+		harness.DoVoid(s, actionEpicUpdate, withParams(params, map[string]any{"add_label_ids": []int64{f.label.ID}}))
+
+		notes := harness.Eventually(s, actionEpicNoteList, params, resourceEventInterval, resourceEventWait,
+			func(out epicnotes.ListOutput) bool {
+				return slices.ContainsFunc(out.Notes, func(n epicnotes.Output) bool { return n.ResourceEvent })
+			})
+		for _, n := range notes.Notes {
+			assertNoteNamed(e, "epic_note_list", n.ID, n.GID, n.ResourceEvent)
+		}
+
+		threads := harness.Do[epicdiscussions.ListOutput](s, actionEpicDiscussionList, params)
+		events := 0
+		for _, thread := range threads.Discussions {
+			for _, n := range thread.Notes {
+				assertNoteNamed(e, "epic_discussion_list", n.ID, n.GID, n.ResourceEvent)
+				if n.ResourceEvent {
+					events++
+				}
+			}
+		}
+		if events == 0 {
+			e.T.Errorf("epic_discussion_list answered no resource event for the label put on the epic: %+v", threads.Discussions)
+		}
+	})
+}
+
+// assertNoteNamed checks that a listed epic note can be named: a note with
+// an ID is one, and a note without one is a resource event carrying the
+// global ID GitLab gave it.
+func assertNoteNamed(e *harness.Env, action string, id int64, gid string, resourceEvent bool) {
+	e.T.Helper()
+	if id == 0 && !resourceEvent {
+		e.T.Errorf("%s answered note 0 that is not marked as a resource event (gid %q)", action, gid)
+	}
+	if resourceEvent && !strings.HasPrefix(gid, "gid://gitlab/") {
+		e.T.Errorf("%s answered a resource event without the global ID GitLab gave it: %q", action, gid)
+	}
 }
 
 // TestEpicLabelEvents_LabelAddedAndRemoved_EventsOrTheDocumentedRefusal

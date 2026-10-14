@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	gl "gitlab.com/gitlab-org/api/client-go/v3"
 
@@ -24,9 +25,9 @@ type Item struct {
 // GraphQL queries and mutations.
 
 const queryListCustomEmoji = `
-query($groupPath: ID!, $first: Int, $after: String, $last: Int, $before: String) {
+query($groupPath: ID!, $includeAncestorGroups: Boolean, $first: Int, $after: String, $last: Int, $before: String) {
   group(fullPath: $groupPath) {
-    customEmoji(first: $first, after: $after, last: $last, before: $before) {
+    customEmoji(includeAncestorGroups: $includeAncestorGroups, first: $first, after: $after, last: $last, before: $before) {
       nodes {
         id
         name
@@ -98,14 +99,17 @@ func nodeToItem(n gqlCustomEmojiNode) Item {
 }
 
 // gqlCustomEmojiConnection holds the paginated list of custom emoji nodes.
+// The nodes are pointers because GitLab answers a node it could not resolve
+// null where it sits, which a value decoded as a row of zero values (issue
+// 1298).
 type gqlCustomEmojiConnection struct {
-	Nodes    []gqlCustomEmojiNode        `json:"nodes"`
+	Nodes    []*gqlCustomEmojiNode       `json:"nodes"`
 	PageInfo toolutil.GraphQLRawPageInfo `json:"pageInfo"`
 }
 
 // gqlGroupCustomEmoji wraps the custom emoji connection inside a group.
 type gqlGroupCustomEmoji struct {
-	CustomEmoji gqlCustomEmojiConnection `json:"customEmoji"`
+	CustomEmoji *gqlCustomEmojiConnection `json:"customEmoji"`
 }
 
 // gqlCreateCustomEmojiPayload is the response payload for creating a custom emoji.
@@ -144,7 +148,8 @@ func mutationRefusal(operation, payloadKey string, responseErrors []toolutil.Gra
 
 // ListInput is the input for listing custom emoji.
 type ListInput struct {
-	GroupPath string `json:"group_path" jsonschema:"required,Group full path (e.g. my-group)"`
+	GroupPath             string `json:"group_path" jsonschema:"Group full path (e.g. my-group),required"`
+	IncludeAncestorGroups bool   `json:"include_ancestor_groups,omitempty" jsonschema:"Also list the custom emoji of every ancestor group, which a subgroup can use as well. Default false, as GitLab defaults: a subgroup is then listed with its own emoji only"`
 	toolutil.GraphQLCursorPaginationInput
 }
 
@@ -153,6 +158,15 @@ type ListOutput struct {
 	toolutil.HintableOutput
 	Emoji      []Item                           `json:"emoji"`
 	Pagination toolutil.GraphQLPaginationOutput `json:"pagination"`
+
+	// ancestorsLeftOut is true when a subgroup was listed without its ancestor
+	// groups, so the list leaves out emoji the group can use. It is the
+	// formatter's to read and no part of the published answer.
+	ancestorsLeftOut bool
+
+	// partial is GitLab's account of a page it answered in part, empty for
+	// a page answered whole, and the formatter's to name in the same way.
+	partial string
 }
 
 // List retrieves custom emoji for a group via the GitLab GraphQL API.
@@ -166,6 +180,12 @@ func List(ctx context.Context, client *gitlabclient.Client, input ListInput) (Li
 		return ListOutput{}, fmt.Errorf("list_custom_emoji: %w", err)
 	}
 	vars["groupPath"] = input.GroupPath
+	// GitLab lists a group's own emoji unless asked for its ancestors' too, and
+	// the argument is left off rather than sent as false so that GitLab's own
+	// default decides, as it does for every other client (issue 1342).
+	if input.IncludeAncestorGroups {
+		vars["includeAncestorGroups"] = true
+	}
 
 	var resp struct {
 		Data struct {
@@ -192,14 +212,35 @@ func List(ctx context.Context, client *gitlabclient.Client, input ListInput) (Li
 		return ListOutput{}, fmt.Errorf("list_custom_emoji: group %q not found", input.GroupPath)
 	}
 
-	items := make([]Item, 0, len(resp.Data.Group.CustomEmoji.Nodes))
-	for _, n := range resp.Data.Group.CustomEmoji.Nodes {
-		items = append(items, nodeToItem(n))
+	// The connection is nullable too, and GitLab nulls it with the reason in
+	// errors[] under its path when the resolver raised. Read as a value it
+	// decoded as an empty page, which told the caller the group has no custom
+	// emoji and led a model to create a duplicate (issue 1298).
+	connection := resp.Data.Group.CustomEmoji
+	if connection == nil {
+		if graphQLErr := toolutil.GraphQLTopLevelError("list_custom_emoji", resp.Errors); graphQLErr != nil {
+			return ListOutput{}, graphQLErr
+		}
+		return ListOutput{}, errors.New("list_custom_emoji: GitLab answered the group's customEmoji as null with no error, so its emoji are unknown rather than none")
+	}
+
+	// GitLab nulls a node or a field it could not resolve where it sits and
+	// says why in errors[], so a page beside them was answered in part, and
+	// one with no node left is no page at all.
+	items, nulled := toolutil.NodesAnswered(connection.Nodes, nodeToItem)
+	partial, err := toolutil.GraphQLPartialPage("list_custom_emoji", resp.Errors, len(items), nulled)
+	if err != nil {
+		return ListOutput{}, err
 	}
 
 	return ListOutput{
 		Emoji:      items,
-		Pagination: toolutil.PageInfoToOutput(resp.Data.Group.CustomEmoji.PageInfo),
+		Pagination: toolutil.PageInfoToOutput(connection.PageInfo),
+		partial:    partial,
+		// A full path with a slash in it names a subgroup, which can use the
+		// emoji of every ancestor group as well; listed without them, the page
+		// leaves those out, and an empty one read as "this group has none".
+		ancestorsLeftOut: !input.IncludeAncestorGroups && strings.Contains(input.GroupPath, "/"),
 	}, nil
 }
 
@@ -207,9 +248,9 @@ func List(ctx context.Context, client *gitlabclient.Client, input ListInput) (Li
 
 // CreateInput is the input for creating a custom emoji.
 type CreateInput struct {
-	GroupPath string `json:"group_path" jsonschema:"required,Group full path (e.g. my-group)"`
-	Name      string `json:"name"       jsonschema:"required,Emoji name without colons (e.g. party_parrot)"`
-	URL       string `json:"url"        jsonschema:"required,URL to the emoji image (PNG or GIF recommended)"`
+	GroupPath string `json:"group_path" jsonschema:"Group full path (e.g. my-group),required"`
+	Name      string `json:"name"       jsonschema:"Emoji name without colons (e.g. party_parrot),required"`
+	URL       string `json:"url"        jsonschema:"URL to the emoji image (PNG or GIF recommended),required"`
 }
 
 // CreateOutput is the output for creating a custom emoji.
@@ -279,7 +320,7 @@ func Create(ctx context.Context, client *gitlabclient.Client, input CreateInput)
 
 // DeleteInput is the input for deleting a custom emoji.
 type DeleteInput struct {
-	ID string `json:"id" jsonschema:"required,Custom emoji GID (e.g. gid://gitlab/CustomEmoji/1)"`
+	ID string `json:"id" jsonschema:"Custom emoji GID (e.g. gid://gitlab/CustomEmoji/1),required"`
 }
 
 // Delete removes a custom emoji via the GitLab GraphQL API.

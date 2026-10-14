@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"reflect"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/finegrained"
+	gitlabclient "github.com/jmrplens/gitlab-mcp-server/v3/internal/gitlab"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
 )
@@ -197,9 +199,32 @@ func jsonText(t *testing.T, value any) string {
 }
 
 // graphqlMux creates an http.Handler that routes GraphQL requests by query content.
+//
+// The note update and delete guards read the note before they write it, so a
+// test routing a note mutation and not the note read is answered as a caller
+// naming the note's own epic is: the note is one on epic &5 of my-group, at
+// that epic's address. A test about something else passes the guard that
+// way, and a test routing the read itself keeps its own.
 func graphqlMux(handlers map[string]http.HandlerFunc) http.Handler {
-	return testutil.GraphQLHandler(handlers)
+	_, update := handlers["updateNote"]
+	_, destroy := handlers["destroyNote"]
+	if !update && !destroy {
+		return testutil.GraphQLHandler(handlers)
+	}
+	withGuard := map[string]http.HandlerFunc{
+		"note(id": func(w http.ResponseWriter, _ *http.Request) {
+			testutil.RespondGraphQL(w, http.StatusOK, gqlOwnedNoteData)
+		},
+	}
+	maps.Copy(withGuard, handlers)
+	return testutil.GraphQLHandler(withGuard)
 }
+
+// gqlOwnedNoteAddress is where GitLab serves note 100 of epic &5 of my-group.
+const gqlOwnedNoteAddress = "https://gitlab.example.com/groups/my-group/-/work_items/5#note_100"
+
+// gqlOwnedNoteData is the guard's read of a note on the epic's work item.
+const gqlOwnedNoteData = `{"note": {"noteableId": 1, "noteableType": "Issue", "url": "` + gqlOwnedNoteAddress + `"}}`
 
 // TestDiscussionIDHelpers verifies the DiscussionIDHelpers handler.
 // The test exercises the GET path of the underlying GitLab API call.
@@ -586,6 +611,10 @@ func TestList_NoteIDGitLabSpelledUnparseably_KeepsTheRestOfTheThread(t *testing.
 	if notes[0].ID != 0 {
 		t.Errorf("notes[0].ID = %d, want 0 for a GID that carries no integer", notes[0].ID)
 	}
+	if notes[0].GID != "gid://gitlab/Note/not-a-number" || !notes[0].ResourceEvent {
+		t.Errorf("notes[0] gid = %q, resource_event = %t, want the global ID GitLab sent and the note marked as no note action's to address",
+			notes[0].GID, notes[0].ResourceEvent)
+	}
 	if notes[0].Body != "first note" {
 		t.Errorf("notes[0].Body = %q, want the note published regardless of its id", notes[0].Body)
 	}
@@ -763,14 +792,14 @@ func TestList_EveryFieldGitLabSendsIsPublished(t *testing.T) {
 		Resolvable: true, Resolved: true, ResolvedAt: "2026-01-03T00:00:00Z", ResolvedBy: "erin",
 		Notes: []NoteOutput{
 			{
-				ID: 100, Body: "first note", Author: "alice", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-02T00:00:00Z",
+				ID: 100, GID: "gid://gitlab/Note/100", Body: "first note", Author: "alice", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-02T00:00:00Z",
 				Internal: true, Imported: true, ExternalAuthor: "reporter@example.com",
 				LastEditedAt: "2026-01-02T12:00:00Z", LastEditedBy: "carol",
 				NoteableID: 41, NoteableType: "Issue", Resolvable: true, Resolved: true, ResolvedAt: "2026-01-03T00:00:00Z",
 				ResolvedBy: "dave", URL: "https://gitlab.example.com/groups/my-group/-/epics/1#note_100",
 			},
 			{
-				ID: 101, Body: "reply", Author: "bob", CreatedAt: "2026-01-02T00:00:00Z",
+				ID: 101, GID: "gid://gitlab/Note/101", Body: "reply", Author: "bob", CreatedAt: "2026-01-02T00:00:00Z",
 				NoteableID: 41, NoteableType: "Issue", Resolvable: true,
 			},
 		},
@@ -1095,7 +1124,7 @@ func TestCreate(t *testing.T) {
 				t.Helper()
 				want := Output{
 					ID:                 "d2hex",
-					Notes:              []NoteOutput{{ID: 200, Body: "new thread", Author: "carol", CreatedAt: "2026-01-03T00:00:00Z"}},
+					Notes:              []NoteOutput{{ID: 200, GID: "gid://gitlab/Note/200", Body: "new thread", Author: "carol", CreatedAt: "2026-01-03T00:00:00Z"}},
 					QuickActionsStatus: &toolutil.QuickActionsStatusOutput{CommandNames: []string{"label"}, Messages: []string{"Added ~bug label."}},
 				}
 				if !reflect.DeepEqual(out, want) {
@@ -1299,7 +1328,7 @@ func TestAddNote(t *testing.T) {
 			check: func(t *testing.T, out NoteOutput) {
 				t.Helper()
 				assertNoteOutput(t, "AddNote()", out, NoteOutput{
-					ID: 201, Body: "reply body", Author: "dave", CreatedAt: "2026-01-04T00:00:00Z",
+					ID: 201, GID: "gid://gitlab/Note/201", Body: "reply body", Author: "dave", CreatedAt: "2026-01-04T00:00:00Z",
 					QuickActionsStatus: &toolutil.QuickActionsStatusOutput{CommandNames: []string{"label"}, ErrorMessages: []string{"Could not apply label command."}},
 				})
 			},
@@ -1550,7 +1579,7 @@ func TestUpdateNote(t *testing.T) {
 			check: func(t *testing.T, out NoteOutput) {
 				t.Helper()
 				assertNoteOutput(t, "UpdateNote()", out, NoteOutput{
-					ID: 100, Body: "updated body", Author: "alice", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-05T00:00:00Z",
+					ID: 100, GID: "gid://gitlab/Note/100", Body: "updated body", Author: "alice", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-05T00:00:00Z",
 					QuickActionsStatus: &toolutil.QuickActionsStatusOutput{CommandNames: []string{"close"}, Messages: []string{"Closed this epic."}},
 				})
 			},
@@ -1738,6 +1767,25 @@ func TestFormatListMarkdownString(t *testing.T) {
 				listHintsBlock,
 		},
 		{
+			name: "names a resource event by its global ID rather than as note 0",
+			input: ListOutput{
+				Discussions: []Output{
+					{
+						ID: "0f3c9a1e",
+						Notes: []NoteOutput{
+							{GID: "gid://gitlab/WeightNote/0f3c9a1e", ResourceEvent: true, Body: "set weight to 3", Author: "admin", CreatedAt: "2026-01-01T00:00:00Z", System: true},
+						},
+					},
+				},
+			},
+			want: "## Epic Discussions (1)\n\n" +
+				"### Discussion 0f3c9a1e\n" +
+				"- **@admin** (1 Jan 2026 00:00 UTC, resource event gid://gitlab/WeightNote/0f3c9a1e):\n" +
+				"  > set weight to 3\n\n" +
+				"Showing 1 items | no more pages\n" +
+				listHintsBlock,
+		},
+		{
 			name:  "renders empty state when no discussions",
 			input: ListOutput{},
 			want:  "No epic discussions found.\n",
@@ -1815,6 +1863,41 @@ func TestFormatMarkdownString(t *testing.T) {
 				"\n### Quick Actions\n\n" +
 				"- **Commands**: /label\n" +
 				"- **Applied**: Added ~bug label.\n" +
+				threadHintsBlock,
+		},
+		{
+			// GitLab synthesizes a thread of its own for each resource event,
+			// whose notes no note action can address, so the card offers no
+			// reply and points at the epic and its threads, as the event's
+			// note card does (issue 1304).
+			name: "offers no reply on a thread of resource events",
+			input: Output{
+				ID: "0f3c9a1e",
+				Notes: []NoteOutput{
+					{GID: "gid://gitlab/WeightNote/0f3c9a1e", ResourceEvent: true, Body: "set weight to 3", Author: "admin", CreatedAt: "2026-01-01T00:00:00Z", System: true},
+				},
+			},
+			want: "## Discussion 0f3c9a1e\n\n" +
+				"- **@admin** (1 Jan 2026 00:00 UTC, resource event gid://gitlab/WeightNote/0f3c9a1e):\n" +
+				"  > set weight to 3\n" +
+				"\n---\n\U0001F4A1 **Next steps:**\n" +
+				"- Use action 'group.epic_get' to read the epic the event changed\n" +
+				"- Use action 'group.epic_discussion_list' to read the epic's threads\n",
+		},
+		{
+			name: "keeps the reply on a thread whose notes are not all resource events",
+			input: Output{
+				ID: "d3hex",
+				Notes: []NoteOutput{
+					{GID: "gid://gitlab/WeightNote/d3hex", ResourceEvent: true, Body: "set weight to 3", Author: "admin", CreatedAt: "2026-01-01T00:00:00Z", System: true},
+					{ID: 7, GID: "gid://gitlab/Note/7", Body: "why 3?", Author: "bob", CreatedAt: "2026-01-02T00:00:00Z"},
+				},
+			},
+			want: "## Discussion d3hex\n\n" +
+				"- **@admin** (1 Jan 2026 00:00 UTC, resource event gid://gitlab/WeightNote/d3hex):\n" +
+				"  > set weight to 3\n" +
+				"- **@bob** (2 Jan 2026 00:00 UTC, note 7):\n" +
+				"  > why 3?\n" +
 				threadHintsBlock,
 		},
 		{
@@ -1900,6 +1983,21 @@ func TestFormatNoteMarkdownString_QuickActionsAndResolution(t *testing.T) {
 				noteHintsBlock,
 		},
 		{
+			name: "a resource event, named by its global ID with no note action offered",
+			input: NoteOutput{
+				GID: "gid://gitlab/LabelNote/9a8b7c6d", ResourceEvent: true,
+				Body: "added ~bug label", Author: "admin", CreatedAt: "2026-01-01T00:00:00Z", System: true,
+			},
+			want: "## Discussion Note gid://gitlab/LabelNote/9a8b7c6d\n\n" +
+				"- **Author**: @admin\n" +
+				"- **Created**: 1 Jan 2026 00:00 UTC\n" +
+				"- **System note**\n" +
+				"- **Body**: added ~bug label\n\n" +
+				"GitLab records this resource event as a note with no note ID, so no note action can read, edit or delete it.\n" +
+				"\n---\n💡 **Next steps:**\n" +
+				"- Use action 'group.epic_discussion_list' to read the epic's threads\n",
+		},
+		{
 			name: "a reply of quick actions alone",
 			input: NoteOutput{
 				QuickActionsStatus: &toolutil.QuickActionsStatusOutput{CommandNames: []string{"label"}, CommandsOnly: true, Messages: []string{"Added ~bug label."}},
@@ -1972,7 +2070,7 @@ func TestActionSpecs_CallAllRoutes(t *testing.T) {
 		{"create", "gitlab_create_epic_discussion", map[string]any{"full_path": testFullPath, "epic_iid": float64(5), "body": "new thread"}, ""},
 		{"add_note", "gitlab_add_epic_discussion_note", map[string]any{"full_path": testFullPath, "epic_iid": float64(5), "discussion_id": "d1hex", "body": "reply"}, ""},
 		{"update_note", "gitlab_update_epic_discussion_note", map[string]any{"full_path": testFullPath, "epic_iid": float64(5), "note_id": float64(100), "body": "updated"}, ""},
-		{"delete_note", "gitlab_delete_epic_discussion_note", map[string]any{"full_path": testFullPath, "epic_iid": float64(5), "note_id": float64(100)}, "Successfully deleted epic discussion note."},
+		{"delete_note", "gitlab_delete_epic_discussion_note", map[string]any{"full_path": testFullPath, "epic_iid": float64(5), "note_id": float64(100)}, "Successfully deleted note 100 from epic &5 in group my-group (it was at " + gqlOwnedNoteAddress + ")."},
 	}
 
 	for _, tt := range tools {
@@ -2053,5 +2151,76 @@ func TestQueryListDiscussions_Complexity_IsTheMeasuredFigureUnderGitLabsLimit(t 
 	if got > testutil.GitLabAuthenticatedMaxComplexity {
 		t.Errorf("queryListDiscussions costs %d at first=%d, over the %d GitLab refuses a query above",
 			got, toolutil.GraphQLMaxFirst, testutil.GitLabAuthenticatedMaxComplexity)
+	}
+}
+
+// discussionNoteOwners are answers GitLab gives to what a note is on and where
+// it serves the note, against epic &5 of my-group, the epic the writes name:
+// the two shapes a note of the epic takes on GitLab 19.4, and two notes of
+// other objects.
+var discussionNoteOwners = []struct {
+	name    string
+	note    string
+	wantErr string
+}{
+	{name: "a note on the epic's work item", note: `{"note": {"noteableId": 1, "noteableType": "Issue", "url": "https://gitlab.example.com/groups/my-group/-/work_items/5#note_100"}}`},
+	{name: "a note made through the legacy epic route", note: `{"note": {"noteableId": 7, "noteableType": "Epic", "url": "https://gitlab.example.com/groups/my-group/-/work_items/5#note_100"}}`},
+	{name: "a note on a project issue", note: `{"note": {"noteableId": 45, "noteableType": "Issue", "url": "https://gitlab.example.com/e2e-tester/probe1/-/work_items/1#note_100"}}`, wantErr: "e2e-tester/probe1/-/work_items/1#note_100"},
+	{name: "a note on another epic", note: `{"note": {"noteableId": 8, "noteableType": "Epic", "url": "https://gitlab.example.com/groups/other/-/work_items/3#note_100"}}`, wantErr: "groups/other/-/work_items/3#note_100"},
+}
+
+// TestUpdateAndDeleteNote_NoteOfAnotherObject_IsRefusedBeforeAnyWrite
+// verifies that the two discussion note writes act only on a note of the epic
+// the caller named (issue 1301): each sent the note's global ID alone, so a
+// note on a project issue or another epic was edited or deleted through an
+// epic action. Each now reads the note's noteable first, refuses unless it is
+// the epic, and never sends the mutation for a note it refused.
+func TestUpdateAndDeleteNote_NoteOfAnotherObject_IsRefusedBeforeAnyWrite(t *testing.T) {
+	for _, tt := range discussionNoteOwners {
+		for _, write := range []string{"updateNote", "destroyNote"} {
+			t.Run(write+"/"+tt.name, func(t *testing.T) {
+				var writes atomic.Int32
+				answer := map[string]string{"updateNote": gqlUpdateNoteData, "destroyNote": gqlDestroyNoteData}[write]
+				client := testutil.NewTestClient(t, graphqlMux(map[string]http.HandlerFunc{
+					"note(id": func(w http.ResponseWriter, _ *http.Request) {
+						testutil.RespondGraphQL(w, http.StatusOK, tt.note)
+					},
+					write: func(w http.ResponseWriter, _ *http.Request) {
+						writes.Add(1)
+						testutil.RespondGraphQL(w, http.StatusOK, answer)
+					},
+				}))
+				assertDiscussionNoteOwnerOutcome(t, write, tt.wantErr, writeDiscussionNote(client, write), writes.Load())
+			})
+		}
+	}
+}
+
+// writeDiscussionNote sends the discussion note write the mutation name
+// write stands for, on note 100 of epic &5.
+func writeDiscussionNote(client *gitlabclient.Client, write string) error {
+	if write == "updateNote" {
+		_, err := UpdateNote(context.Background(), client, UpdateNoteInput{FullPath: testFullPath, IID: 5, NoteID: 100, Body: "updated"})
+		return err
+	}
+	return DeleteNote(context.Background(), client, DeleteNoteInput{FullPath: testFullPath, IID: 5, NoteID: 100})
+}
+
+// assertDiscussionNoteOwnerOutcome holds one write to its case: with no
+// wantErr the note is the epic's and is written once, and otherwise the write
+// is refused naming wantErr and the mutation is never sent.
+func assertDiscussionNoteOwnerOutcome(t *testing.T, write, wantErr string, err error, writes int32) {
+	t.Helper()
+	if wantErr == "" {
+		if err != nil || writes != 1 {
+			t.Errorf("error = %v after %d write(s), want the note written once", err, writes)
+		}
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Errorf("error = %v, want a refusal naming %q", err, wantErr)
+	}
+	if writes != 0 {
+		t.Errorf("%s was sent %d time(s) for a note the epic does not own", write, writes)
 	}
 }

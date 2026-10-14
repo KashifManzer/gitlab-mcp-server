@@ -516,6 +516,129 @@ func TestList_ProjectNilMissingProjectErrors(t *testing.T) {
 	}
 }
 
+// TestList_ConnectionNulledByGitLab_IsAnErrorNotAnEmptyPage verifies that a
+// vulnerabilities connection GitLab answered null under a project that
+// resolved is reported as an error, never as a project with no
+// vulnerabilities (issue 1298).
+//
+// Project.vulnerabilities is nullable in the pinned schema, and GitLab nulls
+// it when its resolver raised or timed out, with the reason in errors[] under
+// that path. Decoded as a value, the null read as an empty page with
+// has_next_page false: a false all-clear on the tool used for triage.
+func TestList_ConnectionNulledByGitLab_IsAnErrorNotAnEmptyPage(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "with an error",
+			body: `{"data":{"project":{"vulnerabilities":null}},"errors":[{"message":"Timeout on Project.vulnerabilities","path":["project","vulnerabilities"]}]}`,
+			want: []string{"list_vulnerabilities", "Timeout on Project.vulnerabilities"},
+		},
+		{
+			name: "without an error",
+			body: `{"data":{"project":{"vulnerabilities":null}}}`,
+			want: []string{"list_vulnerabilities", "vulnerabilities", "null"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := graphqlMux(map[string]http.HandlerFunc{
+				"vulnerabilities": func(w http.ResponseWriter, _ *http.Request) {
+					testutil.RespondJSON(w, http.StatusOK, tc.body)
+				},
+			})
+			out, err := List(context.Background(), testutil.NewTestClient(t, handler), ListInput{ProjectPath: "my-group/my-project"})
+			if err == nil {
+				t.Fatalf("List() = %+v, want an error rather than an empty page", out)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("List() error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestList_PageAnsweredInPart_SaysSoAndLeavesNullItemsOut verifies that a
+// page GitLab answered beside errors[] is read as a page answered in part
+// (issue 1298). GitLab nulls a node or a field it could not resolve where it
+// sits and explains it in errors[], so a nulled node decoded as a row of zero
+// values and the page read as complete. The nulled node is left out, the card
+// says GitLab answered the page in part and names its errors, and a page left
+// with no node at all is reported as the error it is rather than as a project
+// with nothing to triage.
+func TestList_PageAnsweredInPart_SaysSoAndLeavesNullItemsOut(t *testing.T) {
+	const timeout = `[{"message":"Timeout on Vulnerability.identifiers","path":["project","vulnerabilities","nodes",1,"identifiers"]}]`
+	cases := []partialPageCase{
+		{name: "a node nulled with an error", nodes: sampleVulnNode + `, null`, errors: timeout, wantItems: 1, wantHint: "Timeout on Vulnerability.identifiers"},
+		{name: "a field nulled with an error", nodes: sampleVulnNode, errors: timeout, wantItems: 1, wantHint: "Timeout on Vulnerability.identifiers"},
+		{name: "a node nulled with no error", nodes: sampleVulnNode + `, null`, wantItems: 1, wantHint: "GitLab answered 1 of the page's items null with no error"},
+		{name: "every node nulled with an error", nodes: `null`, errors: timeout, wantErr: "list_vulnerabilities GraphQL errors: Timeout on Vulnerability.identifiers"},
+		{name: "every node nulled with no error", nodes: `null, null`, wantErr: "list_vulnerabilities: GitLab answered 2 of the page's items null with no error"},
+		{name: "a page answered whole", nodes: sampleVulnNode, wantItems: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"data":{"project":{"vulnerabilities":{"nodes":[` + tc.nodes + `],"pageInfo":{"hasNextPage":false,"hasPreviousPage":false,"endCursor":"","startCursor":""}}}}` + tc.errorsMember() + `}`
+			handler := graphqlMux(map[string]http.HandlerFunc{
+				"vulnerabilities": func(w http.ResponseWriter, _ *http.Request) {
+					testutil.RespondJSON(w, http.StatusOK, body)
+				},
+			})
+			out, err := List(context.Background(), testutil.NewTestClient(t, handler), ListInput{ProjectPath: "my-group/my-project"})
+			assertPartialPage(t, tc, len(out.Vulnerabilities), func() string { return FormatListMarkdown(out) }, err)
+		})
+	}
+}
+
+// partialPageCase is one way GitLab answers a page of a connection beside
+// errors[] or with nodes nulled: the nodes it sends, its errors member, and
+// either the error List must return or the items it keeps and the account
+// the card names (an empty one for a page answered whole).
+type partialPageCase struct {
+	name      string
+	nodes     string
+	errors    string
+	wantItems int
+	wantErr   string
+	wantHint  string
+}
+
+// errorsMember is the case's errors member of the response, empty for none.
+func (tc partialPageCase) errorsMember() string {
+	if tc.errors == "" {
+		return ""
+	}
+	return `,"errors":` + tc.errors
+}
+
+// assertPartialPage holds what List answered to tc: the error it wants, or
+// the items it keeps and a card that says it was answered in part, naming
+// tc.wantHint, exactly when tc wants a hint.
+func assertPartialPage(t *testing.T, tc partialPageCase, items int, card func() string, err error) {
+	t.Helper()
+	if tc.wantErr != "" {
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Fatalf("List() answered %d items and the error %v, want the error %q rather than a page", items, err, tc.wantErr)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if items != tc.wantItems {
+		t.Fatalf("List() answered %d items, want %d", items, tc.wantItems)
+	}
+	text := card()
+	partial := strings.Contains(text, "GitLab answered this page in part")
+	if partial != (tc.wantHint != "") || !strings.Contains(text, tc.wantHint) {
+		t.Errorf("the card says it was answered in part: %t, want %t naming %q:\n%s", partial, tc.wantHint != "", tc.wantHint, text)
+	}
+}
+
 // Get tests.
 
 // TestGet_Success verifies that retrieving a single vulnerability by ID returns
@@ -1046,6 +1169,71 @@ func TestConfirm_Success(t *testing.T) {
 	}
 	if out.Vulnerability.ConfirmedAt != "2026-02-01T14:00:00Z" {
 		t.Errorf("ConfirmedAt = %q, want %q", out.Vulnerability.ConfirmedAt, "2026-02-01T14:00:00Z")
+	}
+}
+
+// TestConfirm_AfterADismissal_CarriesNoDismissalReason verifies that a
+// vulnerability confirmed after a dismissal is published with no dismissal
+// reason, whatever GitLab still answers for it (issue 1310).
+//
+// GitLab 19.4 reads Vulnerability.dismissalReason from the vulnerability read
+// with no look at the state, and on a default self-managed instance nothing
+// clears that column on a later transition, so a confirmed or redetected
+// vulnerability keeps answering the reason it was dismissed with. Published
+// as it came, the card said "Dismissal Reason: FALSE_POSITIVE" beside "State:
+// CONFIRMED", and a model read a vulnerability it had just confirmed as a
+// false positive. The schema's own description says the field is null for
+// every state but dismissed, which is what is published now.
+func TestConfirm_AfterADismissal_CarriesNoDismissalReason(t *testing.T) {
+	handler := graphqlMux(map[string]http.HandlerFunc{
+		"vulnerabilityConfirm": func(w http.ResponseWriter, _ *http.Request) {
+			testutil.RespondGraphQL(w, http.StatusOK, `{
+				"vulnerabilityConfirm": {
+					"vulnerability": {
+						"id": "gid://gitlab/Vulnerability/42",
+						"title": "SQL Injection",
+						"state": "CONFIRMED",
+						"dismissedAt": null,
+						"dismissalReason": "FALSE_POSITIVE"
+					},
+					"errors": []
+				}
+			}`)
+		},
+	})
+
+	out, err := Confirm(context.Background(), testutil.NewTestClient(t, handler), ConfirmInput{ID: "gid://gitlab/Vulnerability/42"})
+	if err != nil {
+		t.Fatalf("Confirm() error = %v", err)
+	}
+	if out.Vulnerability.DismissalReason != "" {
+		t.Errorf("DismissalReason = %q on a %s vulnerability, want none", out.Vulnerability.DismissalReason, out.Vulnerability.State)
+	}
+	if card := FormatGetMarkdown(GetOutput{Vulnerability: out.Vulnerability}); strings.Contains(card, "Dismissal Reason") {
+		t.Errorf("the card of a confirmed vulnerability names a dismissal reason:\n%s", card)
+	}
+}
+
+// TestNodeToItem_DismissalReason_PublishedOnlyWhileDismissed holds the rule of
+// issue 1310 for every state GitLab answers: the reason is kept while the
+// vulnerability is dismissed and dropped in any other state.
+func TestNodeToItem_DismissalReason_PublishedOnlyWhileDismissed(t *testing.T) {
+	cases := []struct {
+		state string
+		want  string
+	}{
+		{state: "DISMISSED", want: "FALSE_POSITIVE"},
+		{state: "CONFIRMED"},
+		{state: "DETECTED"},
+		{state: "RESOLVED"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			got := nodeToItem(gqlVulnerabilityNode{State: tc.state, DismissalReason: "FALSE_POSITIVE"}).DismissalReason
+			if got != tc.want {
+				t.Errorf("DismissalReason = %q for state %s, want %q", got, tc.state, tc.want)
+			}
+		})
 	}
 }
 

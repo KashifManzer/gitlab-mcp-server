@@ -117,6 +117,56 @@ func TestList_EmptyGroup(t *testing.T) {
 	}
 }
 
+// TestList_IncludeAncestorGroups_SentOnlyWhenAskedFor verifies that
+// include_ancestor_groups reaches GitLab as includeAncestorGroups when the
+// caller sets it, and that the argument is left off otherwise, so GitLab's own
+// default, false, decides as it does for every other client (issue 1342).
+//
+// It also holds the note the formatter reads: a subgroup listed without its
+// ancestors is marked as such, and neither a top-level group nor a subgroup
+// listed with them is, since only the first leaves out emoji the group can
+// use.
+func TestList_IncludeAncestorGroups_SentOnlyWhenAskedFor(t *testing.T) {
+	cases := []struct {
+		name        string
+		input       ListInput
+		wantSent    bool
+		wantLeftOut bool
+	}{
+		{name: "subgroup, default", input: ListInput{GroupPath: "parent/sub"}, wantLeftOut: true},
+		{name: "subgroup, ancestors asked for", input: ListInput{GroupPath: "parent/sub", IncludeAncestorGroups: true}, wantSent: true},
+		{name: "top-level group, default", input: ListInput{GroupPath: "parent"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := graphqlMux(map[string]http.HandlerFunc{
+				"customEmoji": func(w http.ResponseWriter, r *http.Request) {
+					vars, err := testutil.ParseGraphQLVariables(r)
+					if err != nil {
+						t.Errorf("ParseGraphQLVariables error: %v", err)
+						return
+					}
+					value, sent := vars["includeAncestorGroups"]
+					if sent != tc.wantSent {
+						t.Errorf("includeAncestorGroups sent = %v (%v), want sent = %v", sent, value, tc.wantSent)
+					}
+					if sent && value != true {
+						t.Errorf("includeAncestorGroups = %v, want true", value)
+					}
+					testutil.RespondGraphQL(w, http.StatusOK, `{"group": {"customEmoji": {"nodes": [], "pageInfo": {"hasNextPage": false, "hasPreviousPage": false}}}}`)
+				},
+			})
+			out, err := List(context.Background(), testutil.NewTestClient(t, handler), tc.input)
+			if err != nil {
+				t.Fatalf("List() error = %v", err)
+			}
+			if out.ancestorsLeftOut != tc.wantLeftOut {
+				t.Errorf("ancestorsLeftOut = %v, want %v", out.ancestorsLeftOut, tc.wantLeftOut)
+			}
+		})
+	}
+}
+
 // TestList_GroupNotFound verifies that List_GroupNotFound returns a wrapped error when the GitLab API responds with an error status.
 // The test exercises the GET path of the underlying GitLab API call.
 // It asserts that the returned error is wrapped and contains a useful hint.
@@ -256,6 +306,129 @@ func TestList_GraphQLErrorsAreReported(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "not found") {
 		t.Errorf("List() error = %v, want it not to blame the group path", err)
+	}
+}
+
+// TestList_ConnectionNulledByGitLab_IsAnErrorNotAnEmptyPage verifies that a
+// customEmoji connection GitLab answered null under a group that resolved is
+// reported as an error, never as a group with no custom emoji (issue 1298).
+//
+// Group.customEmoji is nullable in the pinned schema, and GitLab nulls it with
+// the reason in errors[] under its path when the resolver raised. Decoded as a
+// value, the null read as an empty page and the card told the caller the
+// group has none, which is what leads a model to create a duplicate.
+func TestList_ConnectionNulledByGitLab_IsAnErrorNotAnEmptyPage(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "with an error",
+			body: `{"data":{"group":{"customEmoji":null}},"errors":[{"message":"Internal server error","path":["group","customEmoji"]}]}`,
+			want: []string{"list_custom_emoji", "Internal server error"},
+		},
+		{
+			name: "without an error",
+			body: `{"data":{"group":{"customEmoji":null}}}`,
+			want: []string{"list_custom_emoji", "customEmoji", "null"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := graphqlMux(map[string]http.HandlerFunc{
+				"customEmoji": func(w http.ResponseWriter, _ *http.Request) {
+					testutil.RespondJSON(w, http.StatusOK, tc.body)
+				},
+			})
+			out, err := List(context.Background(), testutil.NewTestClient(t, handler), ListInput{GroupPath: "my-group"})
+			if err == nil {
+				t.Fatalf("List() = %+v, want an error rather than an empty page", out)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("List() error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestList_PageAnsweredInPart_SaysSoAndLeavesNullItemsOut verifies that a
+// page GitLab answered beside errors[] is read as a page answered in part
+// (issue 1298). GitLab nulls a node or a field it could not resolve where it
+// sits and explains it in errors[], so a nulled emoji decoded as a row of
+// zero values and the page read as complete. The nulled node is left out,
+// the card says GitLab answered the page in part and names its errors, and a
+// page left with no node at all is reported as the error it is rather than
+// as a group with no custom emoji, which is what leads a model to create a
+// duplicate.
+func TestList_PageAnsweredInPart_SaysSoAndLeavesNullItemsOut(t *testing.T) {
+	const internal = `[{"message":"Internal server error","path":["group","customEmoji","nodes",1,"url"]}]`
+	cases := []partialPageCase{
+		{name: "a node nulled with an error", nodes: sampleEmojiNode + `, null`, errors: internal, wantItems: 1, wantHint: "Internal server error"},
+		{name: "a field nulled with an error", nodes: sampleEmojiNode, errors: internal, wantItems: 1, wantHint: "Internal server error"},
+		{name: "a node nulled with no error", nodes: sampleEmojiNode + `, null`, wantItems: 1, wantHint: "GitLab answered 1 of the page's items null with no error"},
+		{name: "every node nulled with an error", nodes: `null`, errors: internal, wantErr: "list_custom_emoji GraphQL errors: Internal server error"},
+		{name: "every node nulled with no error", nodes: `null, null`, wantErr: "list_custom_emoji: GitLab answered 2 of the page's items null with no error"},
+		{name: "a page answered whole", nodes: sampleEmojiNode, wantItems: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"data":{"group":{"customEmoji":{"nodes":[` + tc.nodes + `],"pageInfo":{"hasNextPage":false,"hasPreviousPage":false,"endCursor":"","startCursor":""}}}}` + tc.errorsMember() + `}`
+			handler := graphqlMux(map[string]http.HandlerFunc{
+				"customEmoji": func(w http.ResponseWriter, _ *http.Request) {
+					testutil.RespondJSON(w, http.StatusOK, body)
+				},
+			})
+			out, err := List(context.Background(), testutil.NewTestClient(t, handler), ListInput{GroupPath: "my-group"})
+			assertPartialPage(t, tc, len(out.Emoji), func() string { return FormatListMarkdown(out) }, err)
+		})
+	}
+}
+
+// partialPageCase is one way GitLab answers a page of a connection beside
+// errors[] or with nodes nulled: the nodes it sends, its errors member, and
+// either the error List must return or the items it keeps and the account
+// the card names (an empty one for a page answered whole).
+type partialPageCase struct {
+	name      string
+	nodes     string
+	errors    string
+	wantItems int
+	wantErr   string
+	wantHint  string
+}
+
+// errorsMember is the case's errors member of the response, empty for none.
+func (tc partialPageCase) errorsMember() string {
+	if tc.errors == "" {
+		return ""
+	}
+	return `,"errors":` + tc.errors
+}
+
+// assertPartialPage holds what List answered to tc: the error it wants, or
+// the items it keeps and a card that says it was answered in part, naming
+// tc.wantHint, exactly when tc wants a hint.
+func assertPartialPage(t *testing.T, tc partialPageCase, items int, card func() string, err error) {
+	t.Helper()
+	if tc.wantErr != "" {
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Fatalf("List() answered %d items and the error %v, want the error %q rather than a page", items, err, tc.wantErr)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if items != tc.wantItems {
+		t.Fatalf("List() answered %d items, want %d", items, tc.wantItems)
+	}
+	text := card()
+	partial := strings.Contains(text, "GitLab answered this page in part")
+	if partial != (tc.wantHint != "") || !strings.Contains(text, tc.wantHint) {
+		t.Errorf("the card says it was answered in part: %t, want %t naming %q:\n%s", partial, tc.wantHint != "", tc.wantHint, text)
 	}
 }
 
