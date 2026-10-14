@@ -83,6 +83,8 @@ for the fork, branch, fix, test and MR workflow.
   - [The saved view documents leave out who made a view, when it changed and how to share it](#the-saved-view-documents-leave-out-who-made-a-view-when-it-changed-and-how-to-share-it)
   - [DependencyListExport carries four of the eight fields GitLab sends](#dependencylistexport-carries-four-of-the-eight-fields-gitlab-sends)
   - [The model package file path segment cannot be omitted](#the-model-package-file-path-segment-cannot-be-omitted)
+  - [A measure GitLab sends as null decodes as 0](#a-measure-gitlab-sends-as-null-decodes-as-0)
+  - [Block, unblock and deactivate drop the answer that says whether anything changed](#block-unblock-and-deactivate-drop-the-answer-that-says-whether-anything-changed)
 - [MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)](#mcp-go-sdk-githubcommodelcontextprotocolgo-sdk)
   - [No keep-alive interval for SSE streams on StreamableHTTPOptions](#no-keep-alive-interval-for-sse-streams-on-streamablehttpoptions)
   - [A malformed message ends the session instead of answering -32700](#a-malformed-message-ends-the-session-instead-of-answering--32700)
@@ -141,6 +143,7 @@ for the fork, branch, fix, test and MR workflow.
   - [The contributed projects route writes a keyset link its finder never reads](#the-contributed-projects-route-writes-a-keyset-link-its-finder-never-reads)
   - [The ML model package route accepts neither PRIVATE-TOKEN nor a GitLab OAuth access token](#the-ml-model-package-route-accepts-neither-private-token-nor-a-gitlab-oauth-access-token)
   - [SubmoduleHelper compares submodule URLs as text](#submodulehelper-compares-submodule-urls-as-text)
+  - [The REST delete of a locked Terraform state answers 200 and deletes nothing](#the-rest-delete-of-a-locked-terraform-state-answers-200-and-deletes-nothing)
 - [GitLab Orbit (`gitlab-org/orbit/knowledge-graph`)](#gitlab-orbit-gitlab-orgorbitknowledge-graph)
   - [The DSL schema says a path query may omit `rel_types`](#the-dsl-schema-says-a-path-query-may-omit-rel_types)
   - [The DSL schema says the default neighbors direction is `both`](#the-dsl-schema-says-the-default-neighbors-direction-is-both)
@@ -329,7 +332,7 @@ readable without opening the tracker:
 | 101 | client-go | [The board structs miss keys GitLab sends on a board and its lists](#the-board-structs-miss-keys-gitlab-sends-on-a-board-and-its-lists) | Yes | Yes, [gitlab-org/api/client-go!3085](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3085), open, commit 6, beside rows 96 and 98 | No | No; the keys are read around the SDK | Yes; four requests of our own on the group board routes, and the captured response everywhere else; [issue 1283](https://github.com/jmrplens/gitlab-mcp-server/issues/1283) moves three of the four to client-go |
 | 102 | gitlab-org/orbit/knowledge-graph | [The pinned version check stops with "no merge base" on forks and long branches](#the-pinned-version-check-stops-with-no-merge-base-on-forks-and-long-branches) | Yes, by the merge request | Yes, [gitlab-org/orbit/knowledge-graph!2746](https://gitlab.com/gitlab-org/orbit/knowledge-graph/-/merge_requests/2746), merged | **Yes**, on `main` on 2026-10-09; CI only, so no release carries it | No | Not needed |
 | 103 | client-go | [The target branch rule methods discard GraphQL errors](#the-target-branch-rule-methods-discard-graphql-errors) | No | No | No | No | Yes, the three handlers read the refusal from the captured answer |
-| 104 | client-go | [The Terraform state documents select neither a state's versions nor when it will be deleted](#the-terraform-state-documents-select-neither-a-states-versions-nor-when-it-will-be-deleted) | Yes | Yes, [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063), open | No | No | None possible |
+| 104 | client-go | [The Terraform state documents select neither a state's versions nor when it will be deleted](#the-terraform-state-documents-select-neither-a-states-versions-nor-when-it-will-be-deleted) | Yes | Yes, [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063), open | No | No | The list's paging: a document of this server's own; none for the fields |
 | 105 | client-go | [The scan profile status document selects the profile's id, name and type and nothing else](#the-scan-profile-status-document-selects-the-profiles-id-name-and-type-and-nothing-else) | Yes | Yes, [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063), open | No | No | None possible |
 | 106 | client-go | [The work item documents select neither the decision log nor the development widget](#the-work-item-documents-select-neither-the-decision-log-nor-the-development-widget) | Yes | Yes, [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063), open | No | No | None possible |
 | 107 | client-go | [The work item documents leave out fields GitLab sends on a work item](#the-work-item-documents-leave-out-fields-gitlab-sends-on-a-work-item) | No; not yet decided | No | No | No | None possible |
@@ -341,6 +344,9 @@ readable without opening the tracker:
 | 113 | client-go | [`DependencyListExport` carries four of the eight fields GitLab sends](#dependencylistexport-carries-four-of-the-eight-fields-gitlab-sends) | No; for the joint merge request | No | No | No | Yes, the export create and status read take the four from the captured response |
 | 114 | gitlab-org/gitlab | [The ML model package route accepts neither PRIVATE-TOKEN nor a GitLab OAuth access token](#the-ml-model-package-route-accepts-neither-private-token-nor-a-gitlab-oauth-access-token) | No | No | No | Yes, for an oauth HTTP mode session holding a GitLab OAuth access token, which cannot download a model file at all | Yes, in part: `model_registry.download` sends the token as Bearer, and a Bearer session's 401 names the limit |
 | 115 | client-go | [The model package file path segment cannot be omitted](#the-model-package-file-path-segment-cannot-be-omitted) | No; for the joint merge request | No | No | No | Yes, `model_registry.download` sends its own request for a file at the package root |
+| 116 | client-go | [A measure GitLab sends as null decodes as 0](#a-measure-gitlab-sends-as-null-decodes-as-0) | No; for the joint merge request | No | No | No | Yes, for every measure but a deployable's, which is still left out at 0 |
+| 117 | client-go | [Block, unblock and deactivate drop the answer that says whether anything changed](#block-unblock-and-deactivate-drop-the-answer-that-says-whether-anything-changed) | No; for the joint merge request | No | No | No | Yes, the three handlers read the answer from the captured response |
+| 118 | gitlab-org/gitlab | [The REST delete of a locked Terraform state answers 200 and deletes nothing](#the-rest-delete-of-a-locked-terraform-state-answers-200-and-deletes-nothing) | No | No | No | No | Yes, `admin.terraform_state_delete` reads the state first and refuses a locked one |
 | 127 | gitlab-org/gitlab | [SubmoduleHelper compares submodule URLs as text](#submodulehelper-compares-submodule-urls-as-text) | No | No | No | No; GitLab's pages leave such a submodule unlinked | Yes, `repository.list_submodules` and `repository.read_submodule_file` resolve a sibling namespace and the other spellings of the instance's clone URLs |
 
 States verified against the upstream trackers on 2026-09-12, and rows 8 to 23
@@ -5856,8 +5862,10 @@ without its object from one it refused, for each of the 20 writes of row 88.
 - **Merged**: no. v3.17.0 and the merge request's branch before the push
   (`cc6c70bf`) send the same two documents as v3.15.0.
 - **Blocking**: no.
-- **Workaround**: none possible. Both documents are format strings inside
-  `terraform_states.go`, and a caller cannot add a field to either.
+- **Workaround**: for the fields, none possible. Both documents are format
+  strings inside `terraform_states.go`, and a caller cannot add a field to
+  either. For the list's paging (below), `admin.terraform_state_list` sends
+  a document of its own since issue 1341.
 
 **Where**: `terraform_states.go`, `List` and `Get`.
 
@@ -5893,6 +5901,23 @@ resolving it. A null with no errors is still `ErrNotFound`. `lockedByUser` and t
 are not in the commit: whether they join the default documents is not yet
 decided.
 
+**The list does not page either** (issue 1341). `List` asks for
+`project.terraformStates { nodes }` with no `first`, no `after`, no `count`
+and no `pageInfo`, and GitLab caps every connection at 100 nodes (the
+`default_max_page_size` of `GitlabSchema`), so a project holding more than
+100 states is answered with the first 100 as the whole list, and a caller
+has neither the number of states nor a cursor to ask for the rest. The
+change client-go owes is a paged `List`, taking `first` and `after` and
+answering with the connection's `count` and `pageInfo`, which is a commit
+still to be added to !3063. Until it lands, `admin.terraform_state_list`
+sends a document of this server's own
+(`internal/tools/terraformstates.listStatesQuery`): it takes `first` and
+`after`, publishes `count` and the forward half of `pageInfo`, and selects
+of each state exactly what `List` and `Get` select, so a state reads the
+same through the list as through the get, which still sends client-go's
+document. The list's own document goes back to client-go's on the bump that
+brings the paged `List`.
+
 The latest version's own `createdAt` and `updatedAt`, which the issue lists
 beside these, are not a client-go gap: both documents select them and
 `TerraformStateVersion` decodes them. That gap was this server's, whose state
@@ -5907,8 +5932,8 @@ declarations for these fields name this row and go stale on the client-go
 bump that brings the commit.
 
 **Effort**: small. A paged method and an options pair, with their tests
-and the regenerated mock; three more fields on two documents if they are
-decided.
+and the regenerated mock; the paged `List`, the same shape over the states
+connection; three more fields on two documents if they are decided.
 
 ### The scan profile status document selects the profile's id, name and type and nothing else
 
@@ -6131,6 +6156,94 @@ in every spelling.
 
 **Effort**: small: an option that drops the segment, or a path argument the
 method leaves out when it is empty, and a routing test.
+
+### A measure GitLab sends as null decodes as 0
+
+- **Reported**: no. It goes into the joint merge request,
+  [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063),
+  with the other struct gaps of this register.
+- **In review**: no.
+- **Merged**: no. v3.15.0 decodes every one of them as a number.
+- **Blocking**: no.
+- **Workaround**: yes, for every one of these but a deployable's. Each
+  handler that presents one of them calls the SDK under
+  `gitlabclient.WithResponseCapture` (ADR-0021) and reads the value from the
+  captured answer as a pointer: `toolutil.PipelineMeasures` (through
+  `toolutil.PipelineExtra` for a pipeline read or triggered),
+  `toolutil.JobMeasures` and `toolutil.CapturedJob`/`CapturedJobs` for the
+  pipeline, trigger, job and bridge handlers and the job resources, the
+  measures of a merge request's head pipeline through
+  `toolutil.MergeRequestExtra`, a project board's weight scope through
+  `toolutil.BoardExtra`, and a reader of its own in `dorametrics`,
+  `mergetrains`, `resourceevents` and `groupboards`. A deployable's coverage
+  and duration, on a deployment and on an environment's last deployment, are
+  still read from client-go and left out at 0, so they show no false 0 and
+  drop a measured one. It retires when the structs carry pointers. A
+  milestone's burndown events need none of this: client-go already decodes
+  their weight as a pointer.
+
+**Where**: at v3.15.0, `DORAMetric.Value` (`float64`, `dora_metrics.go`),
+`Pipeline.Duration` and `Pipeline.QueuedDuration` (`int64`, `pipelines.go`),
+`Job` and `Bridge` `Duration`, `QueuedDuration` and `Coverage` (`float64`,
+`jobs.go`), `DeploymentDeployable.Duration` and `Coverage` (`float64`,
+`deployments.go`), `MergeTrain.Duration` (`int64`, `merge_trains.go`),
+`IssueBoard.Weight` (`int64`, `boards.go`) and `WeightEvent.Weight` (`int64`,
+`resource_weight_events.go`).
+
+**What**: GitLab sends each of these as `null` when there is nothing to
+measure: a DORA period with no deployments to take a median over (the lead
+time and time to restore are a `PERCENTILE_CONT` over no rows), a pipeline or
+job that never ran (created, skipped, or a manual job nobody played), a job
+that reported no coverage, a merge train car whose train has not run, a
+weight event that took the weight away, and a board with no weight scope.
+The structs decode that `null` as the
+type's zero, so a project with no measurable incidents reads as restoring
+service in zero seconds, the best value there is, and a manual job reads as
+one that ran for no time at all. A real 0 is also sent (a deployment
+frequency of 0, a job measured at 0% coverage, a weight set to 0), so neither
+the zero nor `omitempty` can tell the two apart; only a pointer can.
+
+**How we found it**: issue 1309, reproduced against GitLab EE with a skipped
+pipeline, a manual job and the DORA endpoints of a project with no
+deployments.
+
+**Effort**: small: pointer fields and their decoding tests, a breaking type
+change that a major release of client-go carries.
+
+### Block, unblock and deactivate drop the answer that says whether anything changed
+
+- **Reported**: no. It goes into the joint merge request,
+  [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063),
+  with the other gaps of this register.
+- **In review**: no.
+- **Merged**: no. v3.15.0 decodes none of the three answers.
+- **Blocking**: no.
+- **Workaround**: yes. `user.block`, `user.unblock` and `user.deactivate`
+  call the SDK under `gitlabclient.WithResponseCapture` (ADR-0021) and read
+  the answer as a `*bool` (`stateChangeOutput` in
+  `internal/tools/users/user_admin.go`): `true` is a change, and `false` or
+  `null` is reported as one that did not happen, with the state the user was
+  probably in. It retires when the methods return the answer.
+
+**Where**: at v3.15.0, `UsersService.BlockUser`, `UnblockUser` and
+`DeactivateUser` (`users.go`), each of which decodes into `none` and returns
+only the `*Response` and an error chosen from the status code.
+
+**What**: GitLab answers `POST /users/:id/block`, `/unblock` and
+`/deactivate` with 201 whether or not it changed the user's state, and says
+which in the body: `true` when it did, `false` or `null` when it did not. An
+unblock of a user who is not blocked answers `false`, and a block of a user
+already blocked and a second deactivate answer `null`. The methods return no
+value, so a caller is told 201 and nothing else, and a state change that did
+not happen reads as one that did. The other state changes (`activate`, `ban`,
+`unban`, `approve`, `reject`) refuse a no-op with a 4xx or answer an object,
+so the status already tells their outcome.
+
+**How we found it**: issue 1327, reproduced against GitLab EE in the
+`test/e2e` Docker stack with an administrator token.
+
+**Effort**: small: return the decoded bool, a signature change that a major
+release of client-go carries, with a test per answer.
 
 ## MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)
 
@@ -12156,6 +12269,40 @@ only, and says so where it resolves.
 helper and found that a sibling namespace and the ssh:// spelling of the
 instance's own SCP remotes, which the resolver before it read, were no longer
 resolved; read from the source on master, not measured.
+
+### The REST delete of a locked Terraform state answers 200 and deletes nothing
+
+- **Reported**: no.
+- **In review**: no.
+- **Merged**: no. Read in 19.4.1.
+- **Blocking**: no.
+- **Workaround**: yes. `admin.terraform_state_delete` reads the state over
+  GraphQL before it sends the delete, looking a numeric `project_id` up first
+  since GitLab's GraphQL `project` field takes a path, and refuses a state
+  whose `lockedAt` is set, naming `admin.terraform_state_unlock`
+  (`Delete` in `internal/tools/terraformstates/terraform_states.go`). It costs
+  one or two reads per delete, and a lock taken between the read and the
+  delete is still answered 200; a fix upstream retires both.
+
+**Where**: `lib/api/terraform/state.rb`, `DELETE
+/projects/:id/terraform/state/:name`, which calls
+`Terraform::States::TriggerDestroyService` inside
+`remote_state_handler.find_with_lock` and then answers `body false` and
+`status :ok` whatever the service returned.
+
+**What**: a delete of a locked state answers 200 with an empty body (Grape's
+`body false` empties the body, and `status :ok` replaces the 204 it would
+set) and deletes nothing: the state is still there, and still locked, a
+minute later. The route discards
+the service's answer, so a caller cannot tell the refusal from the
+asynchronous delete of an unlocked state, which answers the same 200 and
+does complete.
+
+**What it costs this server**: before the read-first delete, a delete of a
+locked state was reported as done.
+
+**How we found it**: issue 1327, reproduced against GitLab EE in the
+`test/e2e` Docker stack: the state was still listed and locked after the 200.
 
 ## GitLab Orbit (`gitlab-org/orbit/knowledge-graph`)
 

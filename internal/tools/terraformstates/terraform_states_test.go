@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/vektah/gqlparser/v2/ast"
@@ -37,8 +38,8 @@ const (
 	wantGetNotFoundHint     = "verify state name with admin.terraform_state_list; the state may not exist for this project"
 	wantDeleteForbiddenHint = "deleting Terraform states requires Maintainer role; deletion is irreversible. " +
 		"All versions are removed"
-	wantDeleteVersionNotFoundHint = "verify serial with admin.terraform_state_list; cannot delete the latest version. " +
-		"Use admin.terraform_state_delete to remove the entire state"
+	wantDeleteVersionNotFoundHint = "the project has no state by that name, or the state no version with that serial; " +
+		"verify the state name with admin.terraform_state_list, which shows each state's latest serial"
 )
 
 // TestList verifies List.
@@ -139,12 +140,12 @@ var stateItemSchemaFields = map[string][2]string{
 	"deleted_at":                {"TerraformState", "deletedAt"},
 }
 
-// stateSelection is what one client-go document selects of a Terraform
+// stateSelection is what one document selects of a Terraform
 // state: the fields it asks for on the state itself and on its latest
 // version, by the schema object each belongs to.
 type stateSelection map[string][]string
 
-// selectedFields reads a client-go document and returns the fields it selects
+// selectedFields reads a GraphQL document and returns the fields it selects
 // directly on the state found by following path from the operation's root,
 // and directly on that state's latestVersion. Only direct selections count,
 // so a createdAt asked of the latest version is not taken for the state's,
@@ -153,16 +154,16 @@ func selectedFields(t *testing.T, document string, path ...string) stateSelectio
 	t.Helper()
 	parsed, err := parser.ParseQuery(&ast.Source{Input: document})
 	if err != nil {
-		t.Fatalf("parse client-go's document: %v\n%s", err, document)
+		t.Fatalf("parse the document: %v\n%s", err, document)
 	}
 	if len(parsed.Operations) != 1 {
-		t.Fatalf("client-go's document holds %d operations, want one:\n%s", len(parsed.Operations), document)
+		t.Fatalf("the document holds %d operations, want one:\n%s", len(parsed.Operations), document)
 	}
 	selections := parsed.Operations[0].SelectionSet
 	for _, name := range path {
 		field := childField(selections, name)
 		if field == nil {
-			t.Fatalf("client-go's document selects no %s along %v:\n%s", name, path, document)
+			t.Fatalf("the document selects no %s along %v:\n%s", name, path, document)
 		}
 		selections = field.SelectionSet
 	}
@@ -200,13 +201,13 @@ func fieldNames(selections ast.SelectionSet) []string {
 // schema has the field, a field GitLab always sends is always written and one
 // it can send null is left out when it did (a field of the latest version
 // counts as nullable when the schema lets latestVersion itself be null, which
-// it does for a state nothing has written yet), and both of
-// client-go's documents, the list's and the get's, select it on the object it
-// belongs to. The documents are written inside client-go, and a field one of
-// them stops selecting would arrive empty on that path with every other test
-// green, since a mock answers with whatever its fixture holds. The map above
-// must name every published field, so a field added to StateItem without a
-// row fails here too.
+// it does for a state nothing has written yet), and both documents, the
+// list's own and client-go's get, select it on the object it belongs to. The
+// get's document is written inside client-go and the list's beside the
+// handler, and a field one of them stops selecting would arrive empty on that
+// path with every other test green, since a mock answers with whatever its
+// fixture holds. The map above must name every published field, so a field
+// added to StateItem without a row fails here too.
 func TestStateItem_FieldsHeldToThePinnedSchema(t *testing.T) {
 	schema, err := graphqlschema.Schema()
 	if err != nil {
@@ -250,7 +251,7 @@ func TestStateItem_FieldsHeldToThePinnedSchema(t *testing.T) {
 			for document, selected := range documents {
 				t.Run(document, func(t *testing.T) {
 					if !slices.Contains(selected[object], name) {
-						t.Errorf("client-go's %s document selects no %s on %s (it selects %v), so %s would arrive empty", document, name, object, selected[object], jsonName)
+						t.Errorf("the %s document selects no %s on %s (it selects %v), so %s would arrive empty", document, name, object, selected[object], jsonName)
 					}
 				})
 			}
@@ -358,17 +359,185 @@ func TestGet_QueryNamesTheProjectAndTheState(t *testing.T) {
 }
 
 // TestList_QueryNamesTheProject verifies the list call asks GitLab about the
-// project the caller named rather than one written into the handler.
+// project the caller named rather than one written into the handler, and asks
+// for GitLab's default page when the caller named no page: the list's own
+// document carries the project as a variable, so the variable is what is
+// read, and a document written with the project spelled into it would send
+// none.
 func TestList_QueryNamesTheProject(t *testing.T) {
-	var seen string
-	client := testutil.NewTestClient(t, recordGraphQL(t, &seen,
+	var seen graphQLRequest
+	client := testutil.NewTestClient(t, recordGraphQLRequest(t, &seen,
 		`{"data":{"project":{"terraformStates":{"nodes":[]}}}}`))
 	if _, err := List(t.Context(), client, ListInput{ProjectPath: "group/project"}); err != nil {
 		t.Fatalf(fmtUnexpErr, err)
 	}
-	if !strings.Contains(seen, `fullPath: "group/project"`) {
-		t.Errorf("query = %q, want it to select the caller's project", seen)
+	want := map[string]any{"fullPath": "group/project", "first": float64(toolutil.GraphQLDefaultFirst)}
+	if !reflect.DeepEqual(seen.Variables, want) {
+		t.Errorf("variables = %v, want %v", seen.Variables, want)
 	}
+}
+
+// pagedStatesBody is one page of a project's states: GitLab counts two and
+// hands back the first, with the cursor of the second.
+const pagedStatesBody = `{"data":{"project":{"terraformStates":{"count":2,"nodes":[` +
+	`{"name":"production","createdAt":"2026-01-02T03:04:05Z","updatedAt":"2026-02-03T04:05:06Z","lockedAt":null,"deletedAt":null,"latestVersion":null}` +
+	`],"pageInfo":{"hasNextPage":true,"endCursor":"c2"}}}}}`
+
+// TestList_PagesThroughTheStates verifies the list asks GitLab for the page
+// the caller named, first and after, and hands back the cursor of the next
+// page and the count GitLab gives. client-go's document took neither and
+// selected neither, so a project with more states than GitLab's 100 per page
+// read as having 100 and no more, with no way to ask for the rest. The input
+// is decoded the way a tool call is, so the test reads only what the caller
+// can send.
+func TestList_PagesThroughTheStates(t *testing.T) {
+	var seen graphQLRequest
+	client := testutil.NewTestClient(t, recordGraphQLRequest(t, &seen, pagedStatesBody))
+	var input ListInput
+	if err := json.Unmarshal([]byte(`{"project_path":"group/project","first":1,"after":"c1"}`), &input); err != nil {
+		t.Fatalf("decoding the input: %v", err)
+	}
+
+	out, err := List(t.Context(), client, input)
+	if err != nil {
+		t.Fatalf(fmtUnexpErr, err)
+	}
+
+	if seen.Variables["first"] != float64(1) || seen.Variables["after"] != "c1" || seen.Variables["fullPath"] != "group/project" {
+		t.Errorf("variables = %v, want first 1, after c1 and the caller's project", seen.Variables)
+	}
+	published, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var keys map[string]any
+	if err = json.Unmarshal(published, &keys); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if keys["count"] != float64(2) {
+		t.Errorf("count = %v, want the 2 GitLab counted", keys["count"])
+	}
+	wantPage := map[string]any{"has_next_page": true, "end_cursor": "c2"}
+	if !reflect.DeepEqual(keys["pagination"], wantPage) {
+		t.Errorf("pagination = %v, want %v", keys["pagination"], wantPage)
+	}
+	if md := FormatListMarkdown(out); !strings.Contains(md, "## Terraform States (2)") || !strings.Contains(md, "next page cursor: `c2`") {
+		t.Errorf("the list does not say how many states there are and where the next page starts:\n%s", md)
+	}
+}
+
+// TestList_RefusedDocument_ReportsGitLabsErrors verifies a document GitLab
+// refused is reported with GitLab's own words. GitLab answers it with HTTP 200,
+// a null project and a top-level errors array, which client-go does not turn
+// into an error, so read as a missing project it would send the caller to
+// check a path that was right.
+func TestList_RefusedDocument_ReportsGitLabsErrors(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK,
+			`{"data":{"project":null},"errors":[{"message":"Field 'count' doesn't exist on type 'TerraformStateConnection'"}]}`)
+	}))
+	_, err := List(t.Context(), client, ListInput{ProjectPath: "group/project"})
+	if err == nil {
+		t.Fatal(errExpectedErr)
+	}
+	if !strings.Contains(err.Error(), "Field 'count' doesn't exist") || !strings.Contains(err.Error(), "gitlab_list_terraform_states") {
+		t.Errorf("error = %q, want GitLab's refusal under the list's operation", err)
+	}
+	if strings.Contains(err.Error(), wantListNotFoundHint) {
+		t.Errorf("error = %q, want no hint about the project path for a document GitLab refused", err)
+	}
+}
+
+// TestList_NoProject_IsNotFoundWithTheHint verifies a project GitLab does not
+// find, or does not show the caller, which it answers with a null project and
+// no error, is reported as not found and carries the hint that says what to
+// check, as client-go's list reported it.
+func TestList_NoProject_IsNotFoundWithTheHint(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `{"data":{"project":null}}`)
+	}))
+	_, err := List(t.Context(), client, ListInput{ProjectPath: "group/missing"})
+	if err == nil {
+		t.Fatal(errExpectedErr)
+	}
+	if !strings.Contains(err.Error(), wantListNotFoundHint) {
+		t.Errorf("error = %q, want it to carry %q", err, wantListNotFoundHint)
+	}
+	if !toolutil.IsHTTPStatus(err, http.StatusNotFound) {
+		t.Errorf("error = %v, want it read as a 404", err)
+	}
+}
+
+// TestListPage_DocumentWithoutPageVariables_IsRefusedBeforeSending verifies
+// the one way the page variables can be refused: a document that does not
+// declare them, which GitLab would answer with somebody else's page. Nothing
+// is sent.
+func TestListPage_DocumentWithoutPageVariables_IsRefusedBeforeSending(t *testing.T) {
+	var sent atomic.Bool
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sent.Store(true)
+		testutil.RespondJSON(w, http.StatusOK, `{"data":{"project":null}}`)
+	}))
+	_, err := listPage(t.Context(), client, `query($fullPath: ID!) { project(fullPath: $fullPath) { id } }`,
+		ListInput{ProjectPath: "group/project"})
+	if err == nil || !strings.Contains(err.Error(), "gitlab_list_terraform_states") {
+		t.Errorf("listPage() error = %v, want a refusal under the list's operation", err)
+	}
+	if sent.Load() {
+		t.Error("listPage() sent a document that declares no page variables")
+	}
+}
+
+// listStatesComplexity is what listStatesQuery costs at a page of a hundred.
+// It is the estimate's figure: GitLab.com answered the anonymous measurement
+// with an internal error, so no instance has confirmed it yet, and the figure
+// is to be replaced by a measured one (a queryComplexity { score } selection
+// answers below 200, its own cost being 2) the first time a GitLab is at hand.
+const listStatesComplexity = 17
+
+// TestListStatesQuery_Complexity_IsTheRecordedFigureUnderGitLabsLimit
+// verifies the list's own document still costs the figure recorded above, and
+// that the figure is under the limit GitLab refuses a query above, at the
+// largest page a caller can ask for. Holding the figure rather than only the
+// limit is what sends whoever changes the selection to measure again: the
+// connection is new to this document, and nothing else here can see its cost,
+// since the mock judges a document by the schema alone.
+func TestListStatesQuery_Complexity_IsTheRecordedFigureUnderGitLabsLimit(t *testing.T) {
+	got, err := testutil.GitLabQueryComplexity(listStatesQuery, map[string]any{
+		"fullPath": "group/project", "first": toolutil.GraphQLMaxFirst,
+	})
+	if err != nil {
+		t.Fatalf("GitLabQueryComplexity() error = %v", err)
+	}
+	if got != listStatesComplexity {
+		t.Errorf("listStatesQuery costs %d at first=%d by the estimate, and %d is recorded: measure it and record the figure",
+			got, toolutil.GraphQLMaxFirst, listStatesComplexity)
+	}
+	if got > testutil.GitLabAuthenticatedMaxComplexity {
+		t.Errorf("listStatesQuery costs %d at first=%d, over the %d GitLab refuses a query above",
+			got, toolutil.GraphQLMaxFirst, testutil.GitLabAuthenticatedMaxComplexity)
+	}
+}
+
+// graphQLRequest is what a recorded GraphQL POST carried.
+type graphQLRequest struct {
+	Query     string         `json:"query"`
+	Variables map[string]any `json:"variables"`
+}
+
+// recordGraphQLRequest answers every GraphQL POST with body and writes the
+// request it was sent into seen, for the test goroutine to assert on after
+// the call.
+func recordGraphQLRequest(t *testing.T, seen *graphQLRequest, body string) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(seen); err != nil {
+			t.Errorf("decoding the GraphQL envelope: %v", err)
+			testutil.RespondJSON(w, http.StatusInternalServerError, `{"errors":[{"message":"undecodable envelope"}]}`)
+			return
+		}
+		testutil.RespondJSON(w, http.StatusOK, body)
+	})
 }
 
 // recordGraphQL answers every GraphQL POST with body and writes the document
@@ -432,16 +601,139 @@ func TestGet_Error(t *testing.T) {
 
 // TestDelete verifies Delete.
 func TestDelete(t *testing.T) {
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			http.NotFound(w, r)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
+	var deleted atomic.Bool
+	client := testutil.NewTestClient(t, deleteHandler(t, "null", &deleted))
 	err := Delete(t.Context(), client, DeleteInput{ProjectID: "1", Name: "state1"})
 	if err != nil {
 		t.Fatalf(fmtUnexpErr, err)
+	}
+	if !deleted.Load() {
+		t.Error("Delete() did not send the delete of an unlocked state")
+	}
+}
+
+// deleteHandler answers what Delete asks of an unlocked or a locked state:
+// project 1 is group/project, the state read answers with lockedAt (a JSON
+// value, null for an unlocked state), and the delete records that it arrived.
+func deleteHandler(t *testing.T, lockedAt string, deleted *atomic.Bool) http.Handler {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/1", func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `{"id":1,"path_with_namespace":"group/project"}`)
+	})
+	mux.HandleFunc("POST /api/graphql", func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil || !strings.Contains(string(raw), `fullPath: \"group/project\"`) || !strings.Contains(string(raw), `name: \"state1\"`) {
+			t.Errorf("the state read asked %s (err %v), want state1 of group/project", raw, err)
+		}
+		testutil.RespondJSON(w, http.StatusOK,
+			`{"data":{"project":{"terraformState":{"name":"state1","createdAt":"2026-01-02T03:04:05Z","updatedAt":"2026-01-02T03:04:05Z","lockedAt":`+lockedAt+`}}}}`)
+	})
+	mux.HandleFunc("DELETE /api/v4/projects/1/terraform/state/state1", func(w http.ResponseWriter, _ *http.Request) {
+		deleted.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	return mux
+}
+
+// TestDelete_LockedState_IsRefusedWithTheUnlockHint verifies a locked state
+// is refused before the delete is sent. GitLab answers the REST delete of a
+// locked state with 200 and deletes nothing, so sending it reported a delete
+// that never happened (upstream-bugs row 118); the state is read first and a
+// lock is reported with the action that releases it.
+func TestDelete_LockedState_IsRefusedWithTheUnlockHint(t *testing.T) {
+	var deleted atomic.Bool
+	client := testutil.NewTestClient(t, deleteHandler(t, `"2026-03-04T05:06:07Z"`, &deleted))
+	err := Delete(t.Context(), client, DeleteInput{ProjectID: "1", Name: "state1"})
+	if err == nil {
+		t.Fatal("Delete() of a locked state = nil, want the refusal")
+	}
+	for _, want := range []string{"gitlab_delete_terraform_state: ", "locked", "2026-03-04T05:06:07Z", "admin.terraform_state_unlock"} {
+		t.Run(want, func(t *testing.T) {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want it to carry %q", err, want)
+			}
+		})
+	}
+	if deleted.Load() {
+		t.Error("Delete() sent the delete of a locked state, which GitLab answers as done without doing it")
+	}
+}
+
+// TestDelete_ProjectPath_IsReadWithoutAProjectLookup verifies a project_id
+// that is already a path, URL-encoded or not, is the state read's fullPath as
+// it stands: only a numeric ID needs the project's path looked up, since
+// GitLab's GraphQL project field takes no ID.
+func TestDelete_ProjectPath_IsReadWithoutAProjectLookup(t *testing.T) {
+	for _, projectID := range []string{"group/project", "group%2Fproject"} {
+		t.Run(projectID, func(t *testing.T) {
+			var deleted atomic.Bool
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/v4/projects/", func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("Delete() looked the project up at %s, want the path used as it stands", r.URL.Path)
+				http.NotFound(w, r)
+			})
+			mux.HandleFunc("POST /api/graphql", func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				if !strings.Contains(string(raw), `fullPath: \"group/project\"`) {
+					t.Errorf("the state read asked %s, want group/project", raw)
+				}
+				testutil.RespondJSON(w, http.StatusOK, `{"data":{"project":{"terraformState":{"name":"state1","lockedAt":null}}}}`)
+			})
+			mux.HandleFunc("DELETE /api/v4/projects/", func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/terraform/state/state1") {
+					t.Errorf("Delete() sent DELETE %s, want the state's route", r.URL.Path)
+				}
+				deleted.Store(true)
+				w.WriteHeader(http.StatusNoContent)
+			})
+			client := testutil.NewTestClient(t, mux)
+			if err := Delete(t.Context(), client, DeleteInput{ProjectID: toolutil.StringOrInt(projectID), Name: "state1"}); err != nil {
+				t.Fatalf(fmtUnexpErr, err)
+			}
+			if !deleted.Load() {
+				t.Error("Delete() did not send the delete")
+			}
+		})
+	}
+}
+
+// TestDelete_MalformedProjectPath_SendsNothing verifies a project_id that is
+// neither an ID nor a path that unescapes is refused before any request.
+func TestDelete_MalformedProjectPath_SendsNothing(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("Delete() sent %s %s for a project_id it cannot read", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	err := Delete(t.Context(), client, DeleteInput{ProjectID: "group%zzproject", Name: "state1"})
+	if err == nil || !strings.Contains(err.Error(), "gitlab_delete_terraform_state: ") || !strings.Contains(err.Error(), "group%zzproject") {
+		t.Errorf("Delete() error = %v, want the refusal naming the project_id", err)
+	}
+}
+
+// TestDelete_StateNotFound_SendsNoDelete verifies a state the read does not
+// find is reported with the hint that names how to find it, and no delete is
+// sent for it.
+func TestDelete_StateNotFound_SendsNoDelete(t *testing.T) {
+	var deleted atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/1", func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `{"id":1,"path_with_namespace":"group/project"}`)
+	})
+	mux.HandleFunc("POST /api/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `{"data":{"project":{"terraformState":null}}}`)
+	})
+	mux.HandleFunc("DELETE /api/v4/projects/1/terraform/state/gone", func(w http.ResponseWriter, _ *http.Request) {
+		deleted.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	client := testutil.NewTestClient(t, mux)
+	err := Delete(t.Context(), client, DeleteInput{ProjectID: "1", Name: "gone"})
+	if err == nil || !strings.Contains(err.Error(), "admin.terraform_state_list") {
+		t.Errorf("Delete() of a missing state error = %v, want the hint naming admin.terraform_state_list", err)
+	}
+	if deleted.Load() {
+		t.Error("Delete() sent a delete for a state it could not read")
 	}
 }
 
@@ -467,9 +759,17 @@ func TestDelete_Error(t *testing.T) {
 // returns was held by nothing: a hint that traded places with a sibling's
 // would have shipped.
 func TestDelete_Forbidden_HintsMaintainerRoleAndIrreversibility(t *testing.T) {
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/1", func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `{"id":1,"path_with_namespace":"group/project"}`)
+	})
+	mux.HandleFunc("POST /api/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `{"data":{"project":{"terraformState":{"name":"x","lockedAt":null}}}}`)
+	})
+	mux.HandleFunc("DELETE /api/v4/projects/1/terraform/state/x", func(w http.ResponseWriter, _ *http.Request) {
 		testutil.RespondJSON(w, http.StatusForbidden, `{"message":"403 Forbidden"}`)
-	}))
+	})
+	client := testutil.NewTestClient(t, mux)
 	err := Delete(t.Context(), client, DeleteInput{ProjectID: "1", Name: "x"})
 	if err == nil {
 		t.Fatal(errExpectedErr)
@@ -620,20 +920,47 @@ const listHints = "\n---\n💡 **Next steps:**\n" +
 // yet saying so rather than showing a serial of zero, a state no lock is held
 // on saying "unlocked" rather than leaving the lock column blank, and a state
 // GitLab has deleted but not yet removed saying when, where a live one says
-// "no", so a deleted state in the list does not read as live.
+// "no", so a deleted state in the list does not read as live. The page is the
+// whole list, so the cursor line says there are no more pages.
 func TestFormatListMarkdown(t *testing.T) {
 	got := FormatListMarkdown(ListOutput{States: []StateItem{
 		{Name: "state1", LatestSerial: 3, UpdatedAt: "2026-02-03T04:05:06Z", LockedAt: "2026-03-04T05:06:07Z", DeletedAt: "2026-04-05T06:07:08Z"},
 		{Name: "fresh", UpdatedAt: "2026-01-02T03:04:05Z"},
-	}})
+	}, Count: 2})
 	want := "## Terraform States (2)\n\n" +
 		"| Name | Latest Serial | Updated | Locked Since | Deleted |\n" +
 		"| --- | --- | --- | --- | --- |\n" +
 		"| state1 | 3 | 3 Feb 2026 04:05 UTC | 4 Mar 2026 05:06 UTC | 5 Apr 2026 06:07 UTC |\n" +
 		"| fresh | no versions | 2 Jan 2026 03:04 UTC | unlocked | no |\n" +
+		"\nShowing 2 items | no more pages\n" +
 		listHints
 	if got != want {
 		t.Errorf("FormatListMarkdown() =\n%q\nwant:\n%q", got, want)
+	}
+}
+
+// TestFormatListMarkdown_FirstOfSeveralPages verifies a page that is not the
+// whole list says so twice over: the heading counts the states GitLab says
+// the project holds rather than the rows shown, and the cursor line names the
+// cursor that asks for the next page. A page with a next page and no count,
+// which GitLab does not send but a decoder can be handed, says more are
+// available instead of a total.
+func TestFormatListMarkdown_FirstOfSeveralPages(t *testing.T) {
+	page := ListOutput{
+		States:     []StateItem{{Name: "production", UpdatedAt: "2026-02-03T04:05:06Z"}},
+		Count:      3,
+		Pagination: toolutil.GraphQLForwardPaginationOutput{HasNextPage: true, EndCursor: "c1"},
+	}
+	got := FormatListMarkdown(page)
+	if !strings.HasPrefix(got, "## Terraform States (3)\n") {
+		t.Errorf("heading of %q, want the 3 GitLab counted", got)
+	}
+	if !strings.Contains(got, "\nShowing 1 items | next page cursor: `c1`\n") {
+		t.Errorf("FormatListMarkdown() = %q, want the cursor of the next page", got)
+	}
+	page.Count = 0
+	if got = FormatListMarkdown(page); !strings.HasPrefix(got, "## Terraform States (1 shown, more available)\n") {
+		t.Errorf("heading of %q, want the page counted with more available", got)
 	}
 }
 
@@ -659,11 +986,13 @@ func TestDeleteVersion_Error(t *testing.T) {
 	}
 }
 
-// TestDeleteVersion_NotFound_HintsTheSerialAndTheWholeStateAlternative
-// verifies the status DeleteVersion's hint was written for. The package used
-// to drive this handler only through a 400, so the branch that names the
-// serial and points at deleting the whole state never ran.
-func TestDeleteVersion_NotFound_HintsTheSerialAndTheWholeStateAlternative(t *testing.T) {
+// TestDeleteVersion_NotFound_SaysTheStateOrTheSerialWasNotFound verifies the
+// status DeleteVersion's hint is written for, and that the hint says only what
+// a 404 means here: no state by that name, or no version with that serial.
+// It used to add that the latest version cannot be deleted, which GitLab
+// 19.4.2 does not enforce: it answers a delete of the latest version 204 and
+// deletes it, locked state or not.
+func TestDeleteVersion_NotFound_SaysTheStateOrTheSerialWasNotFound(t *testing.T) {
 	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		testutil.RespondJSON(w, http.StatusNotFound, `{"message":"404 Not Found"}`)
 	}))
@@ -673,6 +1002,9 @@ func TestDeleteVersion_NotFound_HintsTheSerialAndTheWholeStateAlternative(t *tes
 	}
 	if !strings.Contains(err.Error(), wantDeleteVersionNotFoundHint) {
 		t.Errorf("error = %q, want it to carry %q", err.Error(), wantDeleteVersionNotFoundHint)
+	}
+	if strings.Contains(err.Error(), "cannot delete") {
+		t.Errorf("error = %q, want no claim about a version GitLab would refuse to delete", err.Error())
 	}
 }
 
@@ -921,6 +1253,12 @@ func terraformHandler() http.Handler {
 		} else {
 			testutil.RespondJSON(w, http.StatusOK, graphQLGetResp)
 		}
+	})
+
+	// The project lookup the delete makes for a numeric project_id, before
+	// it reads the state, which the GraphQL route above answers unlocked.
+	mux.HandleFunc("GET /api/v4/projects/1", func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `{"id":1,"path_with_namespace":"group/project"}`)
 	})
 
 	// Delete state

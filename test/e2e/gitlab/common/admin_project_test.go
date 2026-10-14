@@ -206,6 +206,38 @@ func TestAdmin_TerraformStates(t *testing.T) {
 	}
 }
 
+// TestAdmin_TerraformStateList_PagesThroughTheStates seeds two states and
+// asks for them one at a time: the first page holds one state, counts the two
+// the project holds and hands back a cursor, and the cursor's page holds the
+// other one and says no page follows. client-go's document took no page and
+// answered every state up to GitLab's 100 as the whole list (issue 1341).
+func TestAdmin_TerraformStateList_PagesThroughTheStates(t *testing.T) {
+	e := harness.New(t, harness.Needs(harness.NeedAdmin))
+	harness.SurfacesWith(e, func(e *harness.Env) fixture.Project {
+		project := fixture.NewProject(e, fixture.WithNamePrefix("adm-tfpage"))
+		fixture.PushTerraformState(e, project, e.Name("tfstate-a"), 1)
+		fixture.PushTerraformState(e, project, e.Name("tfstate-b"), 1)
+		return project
+	}, func(e *harness.Env, surface harness.Surface, project fixture.Project) {
+		s := e.On(surface)
+		first := harness.Do[terraformstates.ListOutput](s, actionAdminTerraformStateList,
+			map[string]any{"project_path": project.Path, "first": 1})
+		if len(first.States) != 1 || first.Count != 2 || !first.Pagination.HasNextPage || first.Pagination.EndCursor == "" {
+			e.T.Fatalf("terraform_state_list with first=1 answered %d state(s), count %d, pagination %+v; want one state of two and a cursor",
+				len(first.States), first.Count, first.Pagination)
+		}
+		second := harness.Do[terraformstates.ListOutput](s, actionAdminTerraformStateList,
+			map[string]any{"project_path": project.Path, "first": 1, "after": first.Pagination.EndCursor})
+		if len(second.States) != 1 || second.Count != 2 || second.Pagination.HasNextPage {
+			e.T.Fatalf("terraform_state_list after the cursor answered %d state(s), count %d, pagination %+v; want the other state and no next page",
+				len(second.States), second.Count, second.Pagination)
+		}
+		if second.States[0].Name == first.States[0].Name {
+			e.T.Errorf("both pages answered the state %q, want each page to hold a different one", first.States[0].Name)
+		}
+	})
+}
+
 // TestAdmin_UsageData reads the usage-data endpoints: metric definitions, the
 // service ping, the two track-event writes, the SQL queries endpoint behind a
 // feature flag this test flips and restores, and the non-SQL metrics endpoint
@@ -239,6 +271,21 @@ func TestAdmin_UsageData(t *testing.T) {
 	} else {
 		e.T.Logf("usage_data_non_sql_metrics served recorded_at=%q", nonSQL.RecordedAt)
 	}
+}
+
+// TestAdmin_UsageDataServicePing_AnswersOnEverySurface reads the service ping
+// on every surface. A Docker CE instance answers it with {}, which left the
+// maps of the output nil, and the individual surface, the one that validates
+// a structured result against its output schema, answered the call with a
+// protocol error and no result, while the dispatchers rendered an empty card
+// (issue 1292). harness.Do fails the test on the error.
+func TestAdmin_UsageDataServicePing_AnswersOnEverySurface(t *testing.T) {
+	e := harness.New(t, harness.Needs(harness.NeedAdmin))
+
+	harness.EachSurface(e, func(e *harness.Env, surface harness.Surface) {
+		ping := harness.Do[usagedata.GetServicePingOutput](e.On(surface), actionAdminUsageDataServicePing, nil)
+		e.T.Logf("service ping on %s: recorded_at=%q license=%d counts=%d", surface, ping.RecordedAt, len(ping.License), len(ping.Counts))
+	})
 }
 
 // assertUsageDataQueries reads the usage-data queries endpoint, which GitLab
