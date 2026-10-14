@@ -2978,6 +2978,57 @@ func TestClassifyError_CredentialRejected_NamesTheTokenAlone(t *testing.T) {
 	}
 }
 
+// The same two sentences as a process serving HTTP writes them: the credential
+// is the one the request carried, never the stdio setting GITLAB_TOKEN.
+const (
+	httpUnauthorizedSemantic = "unauthorized: either the token this request presented (its PRIVATE-TOKEN or Authorization header) " +
+		"is invalid or expired, or it is valid and lacks a permission this action needs, since some GitLab endpoints answer " +
+		"a missing permission with 401 rather than 403. If the token works for other calls, treat this as a permission refusal"
+	httpRejectedTokenSemantic = "authentication failed: GitLab rejected the token this request presented (its PRIVATE-TOKEN " +
+		"or Authorization header) itself as invalid, expired, revoked or without the api or read_api scope, so renew or replace it"
+)
+
+// TestClassifyError_UnauthorizedOverHTTP_NamesTheTokenTheRequestPresented
+// verifies that a 401 described by a process serving HTTP names the token the
+// request carried, in its PRIVATE-TOKEN header or as an Authorization bearer
+// token, and never GITLAB_TOKEN (issue 1333).
+//
+// GITLAB_TOKEN is how a stdio process is given its credential. Over HTTP every
+// request brings its own, the OAuth access token in oauth mode among them, and
+// the caller has no access to the server's environment, so a revoked token
+// answered "GitLab rejected the token (GITLAB_TOKEN)" sent a model to fix a
+// variable it cannot see. Both of a 401's sentences are held, the one true of
+// every 401 and the verdict that GitLab refused the credential itself, and the
+// stdio rows hold that the switch is the transport and nothing else.
+func TestClassifyError_UnauthorizedOverHTTP_NamesTheTokenTheRequestPresented(t *testing.T) {
+	original := LocalFilesystemAccessAllowed()
+	t.Cleanup(func() { SetLocalFilesystemAccess(original) })
+
+	tests := []struct {
+		name     string
+		stdio    bool
+		rejected bool
+		want     string
+	}{
+		{name: "HTTP, the status alone", want: httpUnauthorizedSemantic},
+		{name: "HTTP, a credential GitLab rejected", rejected: true, want: httpRejectedTokenSemantic},
+		{name: "stdio, the status alone", stdio: true, want: unauthorizedSemantic},
+		{name: "stdio, a credential GitLab rejected", stdio: true, rejected: true, want: rejectedTokenSemantic},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetLocalFilesystemAccess(tt.stdio)
+			got := ClassifyHTTPStatus(http.StatusUnauthorized)
+			if tt.rejected {
+				got = ClassifyError(gitLabAnswer{status: http.StatusUnauthorized, body: expiredTokenBody}.err(t))
+			}
+			if got != tt.want {
+				t.Errorf("description = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestClassifyError_CredentialSignalOnAnotherStatus_KeepsThatStatus verifies
 // that the credential signals refine a 401 only: an invalid_token body or the
 // GraphQL endpoint on any other status is described by that status. The
@@ -3763,24 +3814,42 @@ func TestClassifyError_FineGrainedRefusalOverREST_DescribesEachOfGitLabsTexts(t 
 		unwanted []string
 	}{
 		{
+			// GitLab answers this one sentence for three causes it does not
+			// tell apart: a grant without the permission, a grant holding it
+			// only for other projects or groups, and a user who is not a
+			// member of the project the call targets. The description names
+			// all three rather than only the first.
 			name:     "one missing permission",
 			sentence: approveRefusalSentence,
 			want: []string{
-				"access denied: this call needs the fine-grained project permission [Merge Request: Approve], which the token was not granted",
-				"create a fine-grained personal access token that grants it, or use a classic token with the api scope",
+				"access denied: this call needs the fine-grained project permission [Merge Request: Approve], which GitLab did not find in the token's grant for the project this call targets",
+				"Either the grant does not hold it, or it holds it only for other projects or groups, or the token's user is not a member of this project",
+				"create a fine-grained personal access token whose grant names this project, or a group above it, with it, for a user who is a member there, or use a classic token with the api scope",
 				"where only a fine-grained token that grants it will do",
 			},
-			unwanted: []string{"insufficient project role", "missing API scope"},
+			unwanted: []string{"insufficient project role", "missing API scope", "which the token was not granted"},
 		},
 		{
 			name:     "two missing permissions",
 			sentence: twoPermissionsSentence,
-			want:     []string{"the fine-grained project permissions [Issue: Create, Merge Request: Approve]", "that grants them, or", "that grants them will do"},
+			want:     []string{"the fine-grained project permissions [Issue: Create, Merge Request: Approve]", "it holds them only for other projects or groups", "with them, for a user", "that grants them will do"},
 		},
 		{
+			name:     "a missing permission at a group",
+			sentence: "Access denied: This operation requires a fine-grained personal access token with the following group permissions: [Epic: Read].",
+			want:     []string{"for the group this call targets", "the token's user is not a member of this group", "whose grant names this group, or a group above it, with it"},
+		},
+		{
+			// An instance permission is not held per project or group, so the
+			// grant either holds it or it does not, and membership is not
+			// among the causes.
 			name:     "a deprecated first match",
 			sentence: bulkImportRefusalSentence,
-			want:     []string{"the fine-grained instance permission [Bulk Import: Read]"},
+			want: []string{
+				"the fine-grained instance permission [Bulk Import: Read], which GitLab did not find in the token's grant for the instance this call targets. The grant does not hold it.",
+				"create a fine-grained personal access token whose grant holds it, or use a classic token",
+			},
+			unwanted: []string{"not a member", "other projects or groups"},
 		},
 		{
 			name:     "no fine-grained permission reaches the operation",

@@ -181,6 +181,18 @@ La [referencia de permisos de grano fino](/gitlab-mcp-server/es/reference/fine-g
 enumera lo que necesita cada acción, y `gitlab://tools/{id}` sirve lo mismo para una
 acción en su bloque `fine_grained`.
 
+:::caution[Lo que una concesión no acota]
+Una concesión limitada a proyectos concretos no limita dónde escribe cada acción.
+GitLab autoriza mover una issue (`issue.move`) solo en el proyecto del que sale, así que
+el proyecto al que llega se juzga por el rol propio del usuario del token allí y no por
+la concesión, y transferir un proyecto o un grupo (`project.transfer`,
+`group.transfer`) se juzga en el origen de la misma forma. Trata un token de grano fino
+como capaz de escribir dondequiera que estas acciones lleguen para su usuario, y
+quítalas con `--exclude-tools` donde importe. El hueco es de GitLab y está recogido en
+el
+[registro de upstream](https://github.com/jmrplens/gitlab-mcp-server/blob/main/docs/development/upstream-bugs.md#issue-move-and-clone-and-transfer-are-authorized-at-the-source-boundary-only-for-a-fine-grained-token).
+:::
+
 ## Lo que se muestra a una sesión
 
 ### La concesión decide
@@ -360,7 +372,13 @@ Dónde mirar después:
 ## Lo que puede significar una respuesta vacía
 
 Por REST, una llamada fuera de la concesión recibe el `403` del propio GitLab, que
-nombra el permiso que falta. Por GraphQL no: una posición que la concesión no alcanza
+nombra el permiso que falta. Lo nombra con las mismas palabras tanto si la concesión
+no lo tiene, como si lo tiene solo para otros proyectos o grupos, como si el usuario
+del token no es miembro del proyecto o grupo que toca la llamada, así que la
+descripción que da este servidor nombra las tres causas; cuando la propia concesión de
+la sesión sí tiene el permiso para otros proyectos o grupos, la respuesta añade una
+frase que lo dice, y lo que falta es el proyecto o grupo en la concesión, o la
+pertenencia del usuario allí. Por GraphQL no: una posición que la concesión no alcanza
 vuelve como `null`, y una conexión quita los elementos que no alcanza, sin ningún error
 en ninguno de los dos casos. Por eso una sesión de grano fino recibe un siguiente paso
 junto a tres tipos de respuesta:
@@ -436,7 +454,8 @@ recogidos en
 [Solución de problemas](/gitlab-mcp-server/es/operations/troubleshooting/#tokens-de-grano-fino);
 el que más verás es "Access denied: This operation requires a fine-grained personal
 access token with the following project permissions: [...]", cuya respuesta es un
-token nuevo que conceda lo que enumera.
+token nuevo cuya concesión nombre ese proyecto, o un grupo por encima, con lo que
+enumera, para un usuario que sea miembro allí.
 
 ## Cuando una organización exige tokens de grano fino
 

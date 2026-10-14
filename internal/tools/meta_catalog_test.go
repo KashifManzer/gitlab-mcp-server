@@ -2,11 +2,13 @@ package tools
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/jmrplens/gitlab-mcp-server/v3/internal/edition"
 	gitlabclient "github.com/jmrplens/gitlab-mcp-server/v3/internal/gitlab"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/actioncatalog"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
@@ -114,4 +116,169 @@ func TestRegisterMetaCatalog_GroupFormatterRendersTheResult(t *testing.T) {
 	if !strings.Contains(text.Text, sentinel) {
 		t.Errorf("content = %q, want the group's declared formatter to have rendered it", text.Text)
 	}
+}
+
+// hintProbeCatalog builds a catalog of one group, gitlab_test_hints, whose
+// list action's formatter writes two next steps through HintAction: one to the
+// group's own get action and one to an ID no catalog holds. The individual
+// tools are gitlab_test_hints_list and gitlab_test_hints_get.
+func hintProbeCatalog(t *testing.T) *actioncatalog.Catalog {
+	t.Helper()
+	var getID string
+	route := toolutil.RouteAction(nil, func(_ context.Context, _ *gitlabclient.Client, _ struct{}) (struct{}, error) {
+		return struct{}{}, nil
+	})
+	spec := func(name string) toolutil.ActionSpec {
+		return toolutil.NewActionSpec(name, route, toolutil.ActionSpecOptions{
+			ReadOnly:       true,
+			OwnerPackage:   "tools",
+			IndividualTool: toolutil.IndividualToolSpec{Name: "gitlab_test_hints_" + name, Title: "Hints " + name, Description: "Hint probe."},
+		})
+	}
+	group, err := actioncatalog.GroupFromSpecs(actioncatalog.GroupOptions{
+		ToolName:     "gitlab_test_hints",
+		Title:        "Hint probe",
+		Description:  "Hint probe group.",
+		OwnerPackage: "tools",
+		SurfaceKind:  actioncatalog.SurfaceKindMetaGroup,
+		ReadOnly:     true,
+		FormatResult: func(any) *mcp.CallToolResult {
+			var b strings.Builder
+			b.WriteString("## Probe\n")
+			toolutil.WriteHints(&b, toolutil.HintAction(getID, "read one"), toolutil.HintAction("other.missing", "do something else"))
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}
+		},
+	}, []toolutil.ActionSpec{spec("list"), spec("get")})
+	if err != nil {
+		t.Fatalf("GroupFromSpecs() error = %v", err)
+	}
+	catalog := actioncatalog.NewCatalog()
+	if addErr := catalog.AddGroup(group); addErr != nil {
+		t.Fatalf("AddGroup() error = %v", addErr)
+	}
+	for _, action := range catalog.Actions() {
+		if action.Name == "get" {
+			getID = string(action.ID)
+		}
+	}
+	if getID == "" {
+		t.Fatal("the probe catalog holds no get action")
+	}
+	return catalog
+}
+
+// callForText calls tool on server with arguments and returns the text of the
+// first content block.
+func callForText(t *testing.T, server *mcp.Server, tool string, arguments map[string]any) string {
+	t.Helper()
+	result, err := connectServerForTools(t, server).CallTool(context.Background(), &mcp.CallToolParams{Name: tool, Arguments: arguments})
+	if err != nil {
+		t.Fatalf("CallTool(%s) error = %v", tool, err)
+	}
+	if result.IsError || len(result.Content) == 0 {
+		t.Fatalf("CallTool(%s) = %#v, want a result", tool, result)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content[0] = %T, want TextContent", result.Content[0])
+	}
+	return text.Text
+}
+
+// TestRegisterMetaCatalog_NextSteps_NameTheMetaCall verifies that a next step
+// a meta tool serves names the action the way the meta surface calls it, the
+// group's tool with the action's name within it, and that a step naming an
+// action the catalog does not hold is left as it was written (issue 1325).
+//
+// A meta tool's action argument refuses a canonical ID, so the hint the
+// formatter wrote, "Use action '<id>'", was a call the model could not make.
+func TestRegisterMetaCatalog_NextSteps_NameTheMetaCall(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.1"}, &mcp.ServerOptions{SchemaCache: testSchemaCache})
+	RegisterMetaCatalog(server, hintProbeCatalog(t))
+
+	text := callForText(t, server, "gitlab_test_hints", map[string]any{"action": "list"})
+	for _, want := range []string{
+		"- Use gitlab_test_hints with action 'get' to read one",
+		"- Use action 'other.missing' to do something else",
+	} {
+		t.Run(want, func(t *testing.T) {
+			if !strings.Contains(text, want) {
+				t.Errorf("text = %q, want it to contain %q", text, want)
+			}
+		})
+	}
+}
+
+// guidanceIDExample reads the example ID out of the sentence a meta tool's
+// header carries about the IDs its guidance names, "so issue.list is ...".
+var guidanceIDExample = regexp.MustCompile(`so ([a-z0-9_]+\.[a-z0-9_]+) is \{"action":`)
+
+// TestMetaToolDescriptions_GuidanceIDs_AreCalledAsTheHeaderSays holds the
+// sentence [toolutil.MetaToolDescriptionPrefix] puts on a meta tool with
+// guidance to the catalog it describes (issue 1325). The guidance names other
+// actions by canonical ID, which the meta tool's action argument refuses, and
+// the sentence says how to call one: the action after the dot on the
+// gitlab_<domain> meta tool, or that tool itself where it takes no action.
+// Every ID any meta tool's guidance names has to be called that way, a catalog
+// ID through its meta tool and a standalone ID through its own tool, and each
+// sentence's example has to be an action of the tool that carries it. The
+// sentence is one rule for every ID rather than a translation of each, so an
+// action registered under another tool or another name would be called wrong
+// by every model that read it, and this is what would notice.
+func TestMetaToolDescriptions_GuidanceIDs_AreCalledAsTheHeaderSays(t *testing.T) {
+	catalog := mustBuildActionCatalog(t, nil, ActionCatalogOptions{Tier: edition.Ultimate, IncludeMCP: true})
+	actions := make(map[string]actioncatalog.Action)
+	for _, action := range catalog.Actions() {
+		actions[string(action.ID)] = action
+	}
+	standalone := make(map[string]string)
+	for _, spec := range StandaloneSurfaceToolSpecs(nil) {
+		standalone[spec.BaseDomain+"."+spec.ActionName] = spec.Name
+	}
+
+	var catalogIDs, standaloneIDs int
+	for _, group := range catalog.Groups() {
+		prefix := toolutil.MetaToolDescriptionPrefix(group.ToolName, group.ActionMap())
+		if example := guidanceIDExample.FindStringSubmatch(prefix); example != nil {
+			if action, ok := actions[example[1]]; !ok || action.ToolName != group.ToolName {
+				t.Errorf("%s gives %s as its example, which is no action of that tool", group.ToolName, example[1])
+			}
+		}
+		named, namedStandalone := checkGuidanceIDCalls(t, group.ToolName, prefix, actions, standalone)
+		catalogIDs += named
+		standaloneIDs += namedStandalone
+	}
+	if catalogIDs == 0 || standaloneIDs == 0 {
+		t.Errorf("the meta descriptions name %d catalog and %d standalone IDs, want some of each for this test to hold anything",
+			catalogIDs, standaloneIDs)
+	}
+}
+
+// guidanceDottedWord is a dotted word of a meta description's header, which
+// may be a canonical ID, an action and parameter pair, or neither.
+var guidanceDottedWord = regexp.MustCompile(`[a-z0-9_]+\.[a-z0-9_]+`)
+
+// checkGuidanceIDCalls fails the test for each canonical ID the header of the
+// meta tool toolName names that is not called the way the header says, and
+// returns how many catalog and standalone IDs it named.
+func checkGuidanceIDCalls(t *testing.T, toolName, prefix string, actions map[string]actioncatalog.Action, standalone map[string]string) (catalogIDs, standaloneIDs int) {
+	t.Helper()
+	for _, id := range guidanceDottedWord.FindAllString(prefix, -1) {
+		domain, name, _ := strings.Cut(id, ".")
+		if action, ok := actions[id]; ok {
+			catalogIDs++
+			if action.ToolName != "gitlab_"+domain || action.Name != name {
+				t.Errorf("%s names %s, which the meta surface calls as %s with action %q, not as gitlab_%s with action %q",
+					toolName, id, action.ToolName, action.Name, domain, name)
+			}
+			continue
+		}
+		if tool, ok := standalone[id]; ok {
+			standaloneIDs++
+			if tool != "gitlab_"+domain {
+				t.Errorf("%s names the standalone %s, whose tool is %s, not gitlab_%s", toolName, id, tool, domain)
+			}
+		}
+	}
+	return catalogIDs, standaloneIDs
 }

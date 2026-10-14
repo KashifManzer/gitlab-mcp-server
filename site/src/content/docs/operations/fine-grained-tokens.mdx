@@ -175,6 +175,17 @@ The [fine-grained permissions reference](/gitlab-mcp-server/reference/fine-grain
 lists what every action needs, and `gitlab://tools/{id}` serves the same for one action
 in its `fine_grained` block.
 
+:::caution[What a grant does not bound]
+A grant scoped to selected projects does not limit where every action writes. GitLab
+authorizes moving an issue (`issue.move`) only at the project the issue leaves, so the
+project it arrives in is judged by the token's user's own role there and not by the
+grant, and transferring a project or a group (`project.transfer`, `group.transfer`) is
+judged at the source the same way. Treat a fine-grained token as able to write wherever
+these actions can reach for its user, and remove them with `--exclude-tools` where that
+matters. The gap is GitLab's, recorded in the
+[upstream register](https://github.com/jmrplens/gitlab-mcp-server/blob/main/docs/development/upstream-bugs.md#issue-move-and-clone-and-transfer-are-authorized-at-the-source-boundary-only-for-a-fine-grained-token).
+:::
+
 ## What a session is shown
 
 ### The grant decides
@@ -348,7 +359,12 @@ Where to look next:
 ## What an empty answer can mean
 
 Over REST, a call outside the grant is GitLab's own `403`, which names the missing
-permission. Over GraphQL it is not: a position the grant does not reach comes back
+permission. It names it in the same words whether the grant lacks the permission,
+holds it only for other projects or groups, or the token's user is not a member of the
+project or group the call targets, so the description this server gives names all
+three; when the session's own grant does hold the permission for other projects or
+groups, the answer adds a sentence saying so, and what is missing is the project or
+group in the grant, or the user's membership there. Over GraphQL it is not: a position the grant does not reach comes back
 `null`, and a connection drops the items it does not reach, with no error either way.
 So a fine-grained session is given a next step beside three kinds of answer:
 
@@ -417,7 +433,8 @@ on what GitLab said with what to do. GitLab has four such refusals, listed in
 [Troubleshooting](/gitlab-mcp-server/operations/troubleshooting/#fine-grained-tokens);
 the one you will meet most is "Access denied: This operation requires a fine-grained
 personal access token with the following project permissions: [...]", whose answer is
-a new token that grants what it lists.
+a new token whose grant names that project, or a group above it, with what it lists,
+for a user who is a member there.
 
 ## When an organization enforces fine-grained tokens
 

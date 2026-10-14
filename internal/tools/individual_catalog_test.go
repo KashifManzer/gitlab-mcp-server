@@ -234,6 +234,91 @@ func TestRegisterIndividualCatalogTools_ReadOnlyAndSafeModePolicies(t *testing.T
 	}
 }
 
+// TestRegisterIndividualCatalogTools_NextSteps_NameTheIndividualTool verifies
+// that a next step an individual tool serves names the action by the
+// individual tool it is registered as, and that a step naming an action this
+// registration left out, or one no catalog holds, is left as it was written
+// (issue 1325).
+//
+// No individual tool is named by a canonical ID and no rule derives the name
+// from one, so the hint the formatter wrote, "Use action '<id>'", named
+// nothing the model could call. Excluding the target tool is what proves the
+// rewrite asks what was registered rather than what the catalog declares.
+func TestRegisterIndividualCatalogTools_NextSteps_NameTheIndividualTool(t *testing.T) {
+	tests := []struct {
+		name    string
+		exclude []string
+		want    string
+	}{
+		{name: "a registered target", want: "- Use gitlab_test_hints_get to read one"},
+		{name: "an excluded target", exclude: []string{"gitlab_test_hints_get"}, want: "- Use action 'test_hints.get' to read one"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			catalog := hintProbeCatalog(t)
+			server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.0.1"}, &mcp.ServerOptions{SchemaCache: testSchemaCache})
+			RegisterIndividualCatalogTools(server, catalog, IndividualCatalogRegisterOptions{ExcludeToolNames: tt.exclude})
+
+			text := callForText(t, server, "gitlab_test_hints_list", map[string]any{})
+			want := strings.ReplaceAll(tt.want, "test_hints.get", metaProbeGetID(t, catalog))
+			for _, fragment := range []string{want, "- Use action 'other.missing' to do something else"} {
+				t.Run(fragment, func(t *testing.T) {
+					if !strings.Contains(text, fragment) {
+						t.Errorf("text = %q, want it to contain %q", text, fragment)
+					}
+				})
+			}
+		})
+	}
+}
+
+// metaProbeGetID returns the canonical ID of the get action of
+// [hintProbeCatalog].
+func metaProbeGetID(t *testing.T, catalog *actioncatalog.Catalog) string {
+	t.Helper()
+	for _, action := range catalog.Actions() {
+		if action.Name == "get" {
+			return string(action.ID)
+		}
+	}
+	t.Fatal("the probe catalog holds no get action")
+	return ""
+}
+
+// TestIndividualActionCalls_FirstActionOwnsASharedName verifies that a tool
+// name two actions declare resolves for the first of them in registration
+// order, which is the one registration binds it to, and for no other, and that
+// an action declaring no name is not answered (issue 1325). Resolving the
+// second would send a model to a tool that runs a different action.
+func TestIndividualActionCalls_FirstActionOwnsASharedName(t *testing.T) {
+	route := toolutil.RouteAction(nil, func(_ context.Context, _ *gitlabclient.Client, _ struct{}) (struct{}, error) {
+		return struct{}{}, nil
+	})
+	spec := func(action, tool string) toolutil.ActionSpec {
+		return toolutil.NewActionSpec(action, route, toolutil.ActionSpecOptions{
+			ReadOnly: true, OwnerPackage: "tools",
+			IndividualTool: toolutil.IndividualToolSpec{Name: tool, Title: "T", Description: "Probe."},
+		})
+	}
+	catalog := testIndividualCatalog(t, spec("first", "gitlab_test_shared"), spec("second", "gitlab_test_shared"), spec("nameless", ""))
+	ids := map[string]string{}
+	for _, action := range catalog.Actions() {
+		ids[action.Name] = string(action.ID)
+	}
+
+	calls := IndividualActionCalls(catalog)
+	if name, ok := calls(ids["first"]); !ok || name != "gitlab_test_shared" {
+		t.Errorf("calls(first) = %q, %t, want gitlab_test_shared, true", name, ok)
+	}
+	for _, action := range []string{"second", "nameless"} {
+		t.Run(action, func(t *testing.T) {
+			if name, ok := calls(ids[action]); ok {
+				t.Errorf("calls(%s) = %q, true, want it unanswered", action, name)
+			}
+		})
+	}
+}
+
 // TestRegisterIndividualCatalogTools_EditionFilters covers RegisterIndividualCatalogTools with table-driven subtests for edition filters.
 func TestRegisterIndividualCatalogTools_EditionFilters(t *testing.T) {
 	newSpec := func(name string, opts toolutil.ActionSpecOptions) toolutil.ActionSpec {
@@ -1133,61 +1218,87 @@ func TestIndividualToolAnnotations_AgreeWithCatalogClassification(t *testing.T) 
 	catalog := mustBuildActionCatalog(t, nil, ActionCatalogOptions{Tier: edition.Ultimate, IncludeMCP: true})
 	opts := IndividualCatalogRegisterOptions{IncludeStandaloneUtilities: true}
 
-	type violation struct {
-		tool    string
-		action  string
-		hint    string
-		catalog bool
-	}
-	var readOnlyViolations, idempotentViolations, disagreements []violation
+	found := map[string][]annotationViolation{}
 	for _, group := range catalog.Groups() {
 		for _, action := range group.ActionsInOrder() {
 			if strings.TrimSpace(action.IndividualTool.Name) == "" {
 				continue
 			}
 			tool := mustIndividualToolFromCatalogAction(action, group.Icons, opts)
-			if tool.Annotations == nil {
-				continue
-			}
-			if tool.Annotations.ReadOnlyHint && !action.ReadOnly {
-				readOnlyViolations = append(readOnlyViolations, violation{tool.Name, string(action.ID), "readOnlyHint", action.ReadOnly})
-			}
-			if tool.Annotations.IdempotentHint && !action.Idempotent {
-				idempotentViolations = append(idempotentViolations, violation{tool.Name, string(action.ID), "idempotentHint", action.Idempotent})
-			}
-			if individualCatalogActionReadOnly(action) != tool.Annotations.ReadOnlyHint {
-				disagreements = append(disagreements, violation{tool.Name, string(action.ID), "readOnlyHint", action.ReadOnly})
+			if tool.Annotations != nil {
+				recordAnnotationViolations(found, tool, action)
 			}
 		}
 	}
 
 	checks := []struct {
-		name       string
-		violations []violation
-		detail     string
+		name   string
+		detail string
 	}{
 		{
-			name:       "no tool claims readOnlyHint for a mutating action",
-			violations: readOnlyViolations,
-			detail:     "an operator's --read-only keeps these on the individual surface and removes them everywhere else",
+			name:   checkReadOnlyClaim,
+			detail: "an operator's --read-only keeps these on the individual surface and removes them everywhere else",
 		},
 		{
-			name:       "no tool claims idempotentHint for a non-repeatable action",
-			violations: idempotentViolations,
-			detail:     "idempotentHint invites a model to retry a call whose side effect repeats",
+			name:   checkIdempotentClaim,
+			detail: "idempotentHint invites a model to retry a call whose side effect repeats",
 		},
 		{
-			name:       "the read-only bit registration uses is the bit the client is served",
-			violations: disagreements,
-			detail:     "safe mode reads one and the gateway trusts the other",
+			name:   checkReadOnlyBit,
+			detail: "safe mode reads one and the gateway trusts the other",
+		},
+		{
+			name:   checkDestructiveHint,
+			detail: "the handler asks for confirm exactly when Route.Destructive is true, and a client deciding from destructiveHint whether to ask its user has to be told the same",
 		},
 	}
 	for _, check := range checks {
 		t.Run(check.name, func(t *testing.T) {
-			for _, v := range check.violations {
-				t.Errorf("tool %s (action %s) served %s=true while the catalog says %t: %s", v.tool, v.action, v.hint, v.catalog, check.detail)
+			for _, v := range found[check.name] {
+				t.Errorf("tool %s (action %s) served %s that disagrees with the catalog's %t: %s", v.tool, v.action, v.hint, v.catalog, check.detail)
 			}
 		})
+	}
+}
+
+// The invariants [TestIndividualToolAnnotations_AgreeWithCatalogClassification]
+// holds, each the name of its subtest and the key its violations are filed
+// under.
+const (
+	checkReadOnlyClaim   = "no tool claims readOnlyHint for a mutating action"
+	checkIdempotentClaim = "no tool claims idempotentHint for a non-repeatable action"
+	checkReadOnlyBit     = "the read-only bit registration uses is the bit the client is served"
+	checkDestructiveHint = "destructiveHint is the confirmation the handler demands"
+)
+
+// annotationViolation is one annotation an individual tool is served that
+// disagrees with the catalog classification of its action.
+type annotationViolation struct {
+	tool    string
+	action  string
+	hint    string
+	catalog bool
+}
+
+// recordAnnotationViolations files each annotation tool is served that
+// disagrees with the catalog classification of action under the invariant it
+// breaks.
+func recordAnnotationViolations(found map[string][]annotationViolation, tool *mcp.Tool, action actioncatalog.Action) {
+	record := func(check, hint string, catalog bool) {
+		found[check] = append(found[check], annotationViolation{tool.Name, string(action.ID), hint, catalog})
+	}
+	if tool.Annotations.ReadOnlyHint && !action.ReadOnly {
+		record(checkReadOnlyClaim, "readOnlyHint", action.ReadOnly)
+	}
+	if tool.Annotations.IdempotentHint && !action.Idempotent {
+		record(checkIdempotentClaim, "idempotentHint", action.Idempotent)
+	}
+	if individualCatalogActionReadOnly(action) != tool.Annotations.ReadOnlyHint {
+		record(checkReadOnlyBit, "readOnlyHint", action.ReadOnly)
+	}
+	served := tool.Annotations.DestructiveHint != nil && *tool.Annotations.DestructiveHint
+	if served != action.Route.Destructive {
+		record(checkDestructiveHint, "destructiveHint", action.Route.Destructive)
 	}
 }
 

@@ -1946,6 +1946,44 @@ func coerceSchemaArrayValue(value, property any) (any, bool) {
 	return out, changed
 }
 
+// SchemaPropertyTakes reports whether a parameter whose schema is property
+// takes value sent under name: the property declares no type, which leaves
+// nothing to judge it by; or it declares the value's JSON type; or the
+// dispatchers coerce the value into a type it declares, as they do a number
+// written as text into an integer or a number and a whole number into the
+// string of an ID parameter.
+//
+// The dynamic surface asks it before offering an unknown parameter's nearest
+// valid name, so that following the advice never moves a value to where the
+// schema refuses it: job_id is three edits from job, and job takes a job's
+// name where job_id carried its number (issue 1333).
+func SchemaPropertyTakes(name string, value, property any) bool {
+	prop, isObject := property.(map[string]any)
+	if !isObject || prop["type"] == nil {
+		return true
+	}
+	if valueMatchesDeclaredType(value, property) || compositeMatchesDeclaredType(value, property) {
+		return true
+	}
+	_, coerced := coerceSchemaParamValue(name, value, property)
+	return coerced
+}
+
+// compositeMatchesDeclaredType is [valueMatchesDeclaredType] for the three
+// JSON kinds that one leaves out, as encoding/json decodes them into an any:
+// null, an array and an object.
+func compositeMatchesDeclaredType(value, property any) bool {
+	switch value.(type) {
+	case nil:
+		return schemaPropertyHasType(property, "null")
+	case []any:
+		return schemaPropertyHasType(property, "array")
+	case map[string]any:
+		return schemaPropertyHasType(property, "object")
+	}
+	return false
+}
+
 // valueMatchesDeclaredType reports whether the value is already one of the
 // types the property declares.
 //
@@ -2396,10 +2434,12 @@ func metaSchemaCompileKey(name string, routes ActionMap) string {
 var metaEnvelopes OnceMap[string, map[string]any]
 
 // metaEnvelopeKey names a compact or full envelope by what it embeds: the
-// mode, and every action with the identity of its params schema. A schema
-// shared by a catalog cached per configuration has an address that is stable
-// for the process, which is identity enough; a routes map carrying any schema
-// nobody shared has no durable key, and reports false.
+// mode, and every action with the identity of its params schema, whether it
+// is destructive and the identity of its parameter guidance, the two things
+// [MetaActionSchema] adds to that schema. A schema shared by a catalog cached
+// per configuration has an address that is stable for the process, which is
+// identity enough; a routes map carrying any schema nobody shared has no
+// durable key, and reports false.
 func metaEnvelopeKey(routes ActionMap, mode string) (string, bool) {
 	actions := make([]string, 0, len(routes))
 	for actionName := range routes {
@@ -2409,16 +2449,16 @@ func metaEnvelopeKey(routes ActionMap, mode string) (string, bool) {
 	var key strings.Builder
 	key.WriteString("meta|" + mode)
 	for _, actionName := range actions {
-		schema := routes[actionName].InputSchema
-		if schema == nil {
-			key.WriteString("|" + actionName + "=nil")
-			continue
+		route := routes[actionName]
+		identity := "nil"
+		if route.InputSchema != nil {
+			schemaIdentity, shared := SharedSchemaIdentity(route.InputSchema)
+			if !shared {
+				return "", false
+			}
+			identity = schemaIdentity
 		}
-		identity, shared := SharedSchemaIdentity(schema)
-		if !shared {
-			return "", false
-		}
-		key.WriteString("|" + actionName + "=" + identity)
+		key.WriteString("|" + actionName + "=" + identity + "|destructive=" + strconv.FormatBool(route.Destructive) + "|guidance=" + ParameterGuidanceIdentity(route.ParameterGuidance))
 	}
 	return key.String(), true
 }
@@ -2779,8 +2819,9 @@ const (
 // that callers cannot break the tools/list payload by passing a typo.
 //
 //   - opaque:  legacy {action, params:any} envelope (default).
-//   - full:    discriminated oneOf with full per-action params schemas.
-//   - compact: discriminated oneOf with descriptions and $defs stripped.
+//   - full:    one if/then per action under allOf, with the full params
+//     schema [MetaActionSchema] serves.
+//   - compact: the same conditionals, with descriptions and $defs stripped.
 func BuildMetaToolSchema(routes ActionMap, mode string) map[string]any {
 	actions := make([]string, 0, len(routes))
 	for name := range routes {
@@ -2808,9 +2849,9 @@ func BuildMetaToolSchema(routes ActionMap, mode string) map[string]any {
 
 	switch mode {
 	case MetaParamSchemaFull:
-		base["oneOf"] = buildMetaOneOf(routes, actions, false)
+		base["allOf"] = buildMetaActionConditionals(routes, actions, false)
 	case MetaParamSchemaCompact:
-		base["oneOf"] = buildMetaOneOf(routes, actions, true)
+		base["allOf"] = buildMetaActionConditionals(routes, actions, true)
 	default:
 		// MetaParamSchemaOpaque or unknown — return the envelope unchanged.
 	}
@@ -2834,11 +2875,31 @@ func MetaToolDescriptionPrefix(toolName string, routes ActionMap) string {
 	sort.Strings(actions)
 	exampleAction := metaToolExampleAction(actions)
 	guidance := metaToolActionGuidanceSummary(routes, actions) + metaToolParameterGuidanceSummary(routes, actions)
+	idRule := ""
+	if guidance != "" {
+		idRule = metaToolGuidanceIDRule(toolName, exampleAction)
+	}
 	return fmt.Sprintf(
-		"Use {\"action\":%q,\"params\":{...}}. The only top-level keys are action and params.\nAction params schema: gitlab://tools/%s.<action>.%s\n\n",
-		exampleAction, toolName,
-		guidance,
+		"Use {\"action\":%q,\"params\":{...}}. The only top-level keys are action and params.\nAction params schema: gitlab://tools/%s.<action>.%s%s\n\n",
+		exampleAction, toolName, idRule, guidance,
 	)
+}
+
+// metaToolGuidanceIDRule says how the canonical IDs the guidance names are
+// called on the meta surface (issue 1325). The guidance is each action's Usage
+// line and parameter guidance, written once for every surface, and it names
+// other actions by canonical ID, "Use issue.get for one of them", which the
+// meta tool's action argument refuses. A catalog action is the action after
+// the dot on the gitlab_<domain> meta tool, and the one standalone action any
+// guidance names, discover_project.resolve in project.get's, is
+// gitlab_discover_project itself, a tool that takes no action, so one sentence
+// on the header resolves all of them, with an example drawn from this tool's
+// own actions, and leaves the guidance as the one text every surface serves.
+// A test in internal/tools holds that claim to the catalog.
+func metaToolGuidanceIDRule(toolName, exampleAction string) string {
+	return fmt.Sprintf(" A domain.action ID below is the action after the dot on the gitlab_<domain> tool, "+
+		"or that tool itself where it takes no action, so %s.%s is {\"action\":%q} on this one.",
+		strings.TrimPrefix(toolName, "gitlab_"), exampleAction, exampleAction)
 }
 
 func metaToolExampleAction(sortedActions []string) string {
@@ -2949,37 +3010,45 @@ func StripMetaToolDescriptionPrefix(description string) string {
 	return strings.Join(lines[start:], "\n")
 }
 
-// buildMetaOneOf constructs the oneOf branch list for full/compact modes.
-// Each branch pins `action` to a const and replaces `params` with the captured
-// per-action InputSchema (optionally compacted).
-func buildMetaOneOf(routes ActionMap, sortedActions []string, compact bool) []any {
-	branches := make([]any, 0, len(sortedActions))
+// buildMetaActionConditionals constructs the allOf list for full/compact
+// modes: one conditional per action whose if pins `action` to that action and
+// whose then holds `params` to the action's schema, the one
+// [MetaActionSchema] serves (optionally compacted).
+//
+// The params schema is MetaActionSchema's rather than the route's own because
+// the route's is closed and carries no confirm property, and a destructive
+// meta action is confirmed through params.confirm by a client that cannot
+// answer an elicitation. Inlining the route's schema refused that call on
+// every destructive action in full mode, which left such a client no way to
+// run one (issue 1324).
+//
+// It is a conditional per action rather than a oneOf branch per action
+// because jsonschema-go reports a failed oneOf as "did not validate against
+// any of [<anonymous schema> ...]", naming neither the action nor the field,
+// while a failed then is reported as it is. The if requires `action`: without
+// it every if would hold for a call that omits the action and every then
+// would apply at once. The then requires `params`, so the per-action schema
+// is checked even when a caller leaves params out; an action that needs no
+// arguments still accepts `{}`.
+func buildMetaActionConditionals(routes ActionMap, sortedActions []string, compact bool) []any {
+	conditionals := make([]any, 0, len(sortedActions))
 	for _, action := range sortedActions {
-		route := routes[action]
-		params := route.InputSchema
-		if compact && params != nil {
+		params := MetaActionSchema(routes[action])
+		if compact {
 			params = compactParamsSchema(params)
 		}
-		if params == nil {
-			params = map[string]any{
-				"type":                 "object",
-				"additionalProperties": true,
-			}
-		}
-		branches = append(branches, map[string]any{
-			"properties": map[string]any{
-				"action": map[string]any{"const": action},
-				"params": params,
+		conditionals = append(conditionals, map[string]any{
+			"if": map[string]any{
+				"properties": map[string]any{"action": map[string]any{"const": action}},
+				"required":   []any{"action"},
 			},
-			// Require both `action` and `params`. Without `params` in the
-			// required list, the per-action params schema is only checked
-			// when callers happen to include it, which silently bypasses
-			// per-action required-field validation. Actions that need no
-			// arguments still accept `{}` as a valid params value.
-			"required": []any{"action", "params"},
+			"then": map[string]any{
+				"properties": map[string]any{"params": params},
+				"required":   []any{"params"},
+			},
 		})
 	}
-	return branches
+	return conditionals
 }
 
 // compactParamsSchema returns a reduced copy of a per-action params schema
