@@ -4,17 +4,20 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	gl "gitlab.com/gitlab-org/api/client-go/v3"
 
@@ -48,28 +51,190 @@ func TestRawHelpers_UnescapablePath_FailBeforeTheRequest(t *testing.T) {
 	})
 }
 
-// TestJobTrace_ReadFailure_IsReported verifies a trace body that fails
-// mid-read with something other than an end of file is reported as an error
-// rather than returned as a shorter log. client-go hands Trace an in-memory
-// reader that cannot fail that way, so the failure comes through the seam.
-func TestJobTrace_ReadFailure_IsReported(t *testing.T) {
-	original := readFull
-	t.Cleanup(func() { readFull = original })
-	readFull = func(io.Reader, []byte) (int, error) { return 3, errors.New("stream reset") }
-
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != pathJobTrace {
+// serveTrace answers the trace route with log and refuses anything else.
+func serveTrace(t *testing.T, log string) *gitlabclient.Client {
+	t.Helper()
+	return testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != pathJobTrace {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set(testHeaderContentType, "text/plain")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("partial log"))
+		_, _ = w.Write([]byte(log))
 	}))
+}
 
+// failingLog is a log over the trace limit whose last line is the failure,
+// as the issue's reproduction was: thousands of install lines, then FATAL.
+func failingLog(lines int) string {
+	var b strings.Builder
+	for i := 1; i <= lines; i++ {
+		fmt.Fprintf(&b, "installing dependency number %d of the build ......\n", i)
+	}
+	b.WriteString("FATAL unit test TestCheckout failed expected 200 got 500\n")
+	return b.String()
+}
+
+// TestJobTrace_LongLog_KeepsItsEnd verifies that a log over the limit keeps
+// its last 100 KiB, from the start of a line, and says how much of its
+// beginning was left out. It used to keep the first 100 KiB, so the failure,
+// which is almost always at the end of a log, was exactly what was dropped.
+func TestJobTrace_LongLog_KeepsItsEnd(t *testing.T) {
+	log := failingLog(3000)
+	out, err := Trace(t.Context(), serveTrace(t, log), TraceInput{ProjectID: "42", JobID: 100})
+	if err != nil {
+		t.Fatalf("Trace() error: %v", err)
+	}
+	if !out.Truncated || len(out.Trace) > hundredKiB || out.OmittedBytes != len(log)-len(out.Trace) {
+		t.Errorf("Truncated/len/OmittedBytes = %v/%d/%d, want true, at most %d, and %d", out.Truncated, len(out.Trace), out.OmittedBytes, hundredKiB, len(log)-len(out.Trace))
+	}
+	if !strings.HasSuffix(out.Trace, "FATAL unit test TestCheckout failed expected 200 got 500\n") {
+		t.Errorf("the kept log ends %q, want the FATAL line", out.Trace[max(0, len(out.Trace)-80):])
+	}
+	if !strings.HasPrefix(out.Trace, "installing dependency number ") {
+		t.Errorf("the kept log starts %q, want the start of a line", out.Trace[:min(40, len(out.Trace))])
+	}
+}
+
+// TestJobTrace_OneLongLine_IsCutOnACharacter verifies that a log with no
+// line break in its last 100 KiB is cut at a character boundary, so what is
+// kept is still valid UTF-8.
+func TestJobTrace_OneLongLine_IsCutOnACharacter(t *testing.T) {
+	log := strings.Repeat("é", hundredKiB) // two bytes each, so the byte cut lands mid-character half the time
+	out, err := Trace(t.Context(), serveTrace(t, log+"x"), TraceInput{ProjectID: "42", JobID: 100})
+	if err != nil {
+		t.Fatalf("Trace() error: %v", err)
+	}
+	if !utf8.ValidString(out.Trace) || !strings.HasSuffix(out.Trace, "éx") || len(out.Trace) > hundredKiB {
+		t.Errorf("kept %d bytes, valid UTF-8 %v, ending %q; want at most %d valid bytes ending in éx", len(out.Trace), utf8.ValidString(out.Trace), out.Trace[max(0, len(out.Trace)-4):], hundredKiB)
+	}
+}
+
+// TestJobTrace_TailLines_ReturnsTheLastLines verifies the tail_lines input:
+// the last N lines, the whole log when it has fewer, and a refusal for a
+// count outside 1 to 10000, where 0 means the input was not given.
+func TestJobTrace_TailLines_ReturnsTheLastLines(t *testing.T) {
+	const log = "one\ntwo\nthree\nfour\n"
+	for _, tc := range []struct {
+		name  string
+		lines int
+		want  string
+	}{
+		{"not given", 0, log},
+		{"the last two", 2, "three\nfour\n"},
+		{"the last one", 1, "four\n"},
+		{"more than the log has", 9, log},
+		{"the ceiling", 10000, log},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Trace(t.Context(), serveTrace(t, log), TraceInput{ProjectID: "42", JobID: 100, TailLines: tc.lines})
+			if err != nil {
+				t.Fatalf("Trace() error: %v", err)
+			}
+			if out.Trace != tc.want || out.Truncated != (tc.want != log) {
+				t.Errorf("Trace = %q, truncated %v; want %q", out.Trace, out.Truncated, tc.want)
+			}
+		})
+	}
+	t.Run("a log with no final newline", func(t *testing.T) {
+		out, err := Trace(t.Context(), serveTrace(t, "one\ntwo"), TraceInput{ProjectID: "42", JobID: 100, TailLines: 1})
+		if err != nil || out.Trace != "two" {
+			t.Errorf("Trace = %q, %v; want the last line", out.Trace, err)
+		}
+	})
+	for _, bad := range []int{-1, 10001} {
+		t.Run(fmt.Sprint("refuses ", bad), func(t *testing.T) {
+			_, err := Trace(t.Context(), testutil.NewTestClient(t, testutil.ForbiddenHandler(t)), TraceInput{ProjectID: "42", JobID: 100, TailLines: bad})
+			if err == nil || !strings.Contains(err.Error(), "tail_lines") {
+				t.Errorf("Trace(tail_lines %d) error = %v, want a refusal naming tail_lines", bad, err)
+			}
+		})
+	}
+}
+
+// TestJobTrace_Markup_IsStrippedFromTheLog verifies that the structured log
+// carries the text without the runner's ANSI sequences and section markers,
+// which used to reach the structured channel raw and the text channel as
+// "[36;1m" and "section_start:" once the escape byte was dropped.
+func TestJobTrace_Markup_IsStrippedFromTheLog(t *testing.T) {
+	log := "section_start:1791747389:prepare_executor\r\x1b[0K\x1b[0K\x1b[36;1mPreparing the executor\x1b[0;m\nsection_end:1791747390:prepare_executor\r\x1b[0K\n"
+	out, err := Trace(t.Context(), serveTrace(t, log), TraceInput{ProjectID: "42", JobID: 100})
+	if err != nil {
+		t.Fatalf("Trace() error: %v", err)
+	}
+	if out.Trace != "Preparing the executor\n\n" {
+		t.Errorf("Trace = %q, want the text alone", out.Trace)
+	}
+}
+
+// TestJobTrace_ResponseOverTheClientCeiling_NamesTheWayOut verifies that a
+// log the client-wide response ceiling stops is answered with the route to
+// read it from GitLab directly, rather than a bare "unexpected error".
+func TestJobTrace_ResponseOverTheClientCeiling_NamesTheWayOut(t *testing.T) {
+	client := serveTrace(t, strings.Repeat("x", 4096))
+	client.SetMaxResponseBytes(1024)
 	_, err := Trace(t.Context(), client, TraceInput{ProjectID: "42", JobID: 100})
-	if err == nil || !strings.Contains(err.Error(), "stream reset") {
-		t.Fatalf("Trace() error = %v, want the read failure", err)
+	if err == nil || !strings.Contains(err.Error(), "GET /projects/:id/jobs/:job_id/trace") {
+		t.Fatalf("Trace() error = %v, want the way out", err)
+	}
+}
+
+// markupLog is a runner log of at least size bytes, as a runner writes one:
+// every line colored, a collapsible section every hundred lines, and the
+// failure on the last line.
+func markupLog(size int) string {
+	var b strings.Builder
+	b.Grow(size + 128)
+	for i := 1; b.Len() < size; i++ {
+		if i%100 == 1 {
+			fmt.Fprintf(&b, "section_start:1791747389:step_%d\r\x1b[0K\x1b[36;1mStep %d\x1b[0;m\n", i, i)
+		}
+		fmt.Fprintf(&b, "\x1b[0;32m[ok]\x1b[0m installing dependency number %d of the build\n", i)
+	}
+	b.WriteString("\x1b[31;1mFATAL unit test TestCheckout failed expected 200 got 500\x1b[0;m\n")
+	return b.String()
+}
+
+// allocatedBy returns how many bytes f allocated on the heap.
+func allocatedBy(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestJobTrace_LongLog_ReadsOnlyItsEnd verifies what Trace costs on top of
+// the read client-go makes of the body anyway, for a 64 MiB log, the size of
+// the client's response ceiling: a bounded number of the windows it reads
+// from the end of the log, whatever the log's size, since only that end is
+// copied and stripped of markup. Trace used to copy the whole log and strip
+// all of it before keeping 100 KB: more than 1 GiB allocated for this log,
+// with several copies of it held at once, for every call of the 192 the
+// process holds open at most.
+func TestJobTrace_LongLog_ReadsOnlyItsEnd(t *testing.T) {
+	log := markupLog(64 << 20)
+	client := serveTrace(t, log)
+	client.SetMaxResponseBytes(int64(len(log)) + 1)
+	read := allocatedBy(func() {
+		if _, _, err := client.GL().Jobs.GetTraceFile("42", 100, gl.WithContext(t.Context())); err != nil {
+			t.Fatalf("GetTraceFile() error: %v", err)
+		}
+	})
+	var out TraceOutput
+	traced := allocatedBy(func() {
+		var err error
+		if out, err = Trace(t.Context(), client, TraceInput{ProjectID: "42", JobID: 100}); err != nil {
+			t.Fatalf("Trace() error: %v", err)
+		}
+	})
+	t.Logf("Trace allocated %d bytes, client-go's read alone %d", traced, read)
+	if traced > read+20*traceWindowBytes {
+		t.Errorf("Trace allocated %d bytes and client-go's read alone %d, want at most twenty windows of %d between them", traced, read, traceWindowBytes)
+	}
+	if !strings.HasSuffix(out.Trace, "FATAL unit test TestCheckout failed expected 200 got 500\n") || !out.Truncated {
+		t.Errorf("Trace ends %q, truncated %v; want the failure line, truncated", out.Trace[max(0, len(out.Trace)-80):], out.Truncated)
 	}
 }
 
@@ -615,36 +780,6 @@ func TestJobTrace_Success(t *testing.T) {
 	}
 }
 
-// TestJobTrace_Truncated verifies Trace caps large job logs at maxTraceBytes and
-// marks the output as truncated.
-//
-// The mock returns a trace slightly larger than the configured limit. The test
-// expects the trace length to equal maxTraceBytes and Truncated to be true,
-// protecting clients from unbounded job-log responses.
-func TestJobTrace_Truncated(t *testing.T) {
-	traceContent := strings.Repeat("x", maxTraceBytes+10)
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == pathJobTrace {
-			w.Header().Set(testHeaderContentType, "text/plain")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(traceContent))
-			return
-		}
-		http.NotFound(w, r)
-	}))
-
-	out, err := Trace(context.Background(), client, TraceInput{ProjectID: "42", JobID: 100})
-	if err != nil {
-		t.Fatalf("Trace() unexpected error: %v", err)
-	}
-	if !out.Truncated {
-		t.Fatal("out.Truncated = false, want true")
-	}
-	if len(out.Trace) != maxTraceBytes {
-		t.Fatalf("len(out.Trace) = %d, want %d", len(out.Trace), maxTraceBytes)
-	}
-}
-
 // hundredKiB is the limit the trace card's note promises a reader, written as
 // its own number so no test here can follow maxTraceBytes wherever it goes.
 const hundredKiB = 102400
@@ -652,9 +787,9 @@ const hundredKiB = 102400
 // TestJobTrace_LimitIsTheHundredKiBTheNotePromises holds the trace limit to
 // the figure the truncation note states, from both sides of the boundary: a
 // log of exactly that size is returned whole and unmarked, and one byte more
-// is cut to it and marked. The truncation tests before this one measured the
-// limit against the constant that set it, so a constant that shrank to a
-// kilobyte passed them all.
+// is cut to it, from the end, and marked. The truncation tests before this
+// one measured the limit against the constant that set it, so a constant
+// that shrank to a kilobyte passed them all.
 func TestJobTrace_LimitIsTheHundredKiBTheNotePromises(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -663,7 +798,7 @@ func TestJobTrace_LimitIsTheHundredKiBTheNotePromises(t *testing.T) {
 		wantTruncated bool
 	}{
 		{"exactly the limit is kept whole", hundredKiB, hundredKiB, false},
-		{"one byte over is cut to the limit", hundredKiB + 1, hundredKiB, true},
+		{"one byte over keeps the last limit of it", hundredKiB + 1, hundredKiB, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -685,8 +820,8 @@ func TestJobTrace_LimitIsTheHundredKiBTheNotePromises(t *testing.T) {
 			if out.Truncated != tt.wantTruncated {
 				t.Errorf("Truncated = %v, want %v for a %d-byte log", out.Truncated, tt.wantTruncated, tt.size)
 			}
-			if out.Trace != body[:tt.wantLen] {
-				t.Errorf("Trace is %d bytes and ends %q, want the first %d bytes of the log", len(out.Trace), out.Trace[max(0, len(out.Trace)-3):], tt.wantLen)
+			if out.Trace != body[len(body)-tt.wantLen:] {
+				t.Errorf("Trace is %d bytes and ends %q, want the last %d bytes of the log", len(out.Trace), out.Trace[max(0, len(out.Trace)-3):], tt.wantLen)
 			}
 		})
 	}
@@ -1028,87 +1163,179 @@ func TestGetArtifacts_NotFound_HintNamesTheFileType(t *testing.T) {
 	}
 }
 
-// oneMiB is the limit the artifact cards' warning names, written as its own
-// number so no test here can follow maxArtifactBytes wherever it goes.
+// oneMiB is the limit the artifact cards name, written as its own number so
+// no test here can follow maxArtifactBytes wherever it goes.
 const oneMiB = 1048576
 
-// artifactLimitCases are the two sides of the artifact limit: exactly the
-// limit is kept whole and unmarked, one byte more is cut to it and marked.
-func artifactLimitCases() []struct {
-	name          string
-	size          int
-	wantTruncated bool
-} {
-	return []struct {
-		name          string
-		size          int
-		wantTruncated bool
-	}{
-		{"exactly the limit is kept whole", oneMiB, false},
-		{"one byte over is cut to the limit", oneMiB + 1, true},
-	}
+// serveArtifact answers path with body and refuses anything else.
+func serveArtifact(t *testing.T, path, body string) *gitlabclient.Client {
+	t.Helper()
+	return testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == path {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		http.NotFound(w, r)
+	}))
 }
 
-// TestGetArtifacts_LimitIsTheMebibyteTheCardPromises holds the archive limit
-// to the figure the card's warning states, from both sides of the boundary.
-// The truncation tests before it measured the limit against the constant that
-// set it, so a constant that shrank passed them.
-func TestGetArtifacts_LimitIsTheMebibyteTheCardPromises(t *testing.T) {
-	for _, tt := range artifactLimitCases() {
-		t.Run(tt.name, func(t *testing.T) {
-			body := strings.Repeat("x", tt.size-1) + "$"
-			client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodGet && r.URL.Path == pathJobArtifacts {
-					w.Header().Set(testHeaderContentType, "application/zip")
-					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write([]byte(body))
-					return
-				}
-				http.NotFound(w, r)
-			}))
-
-			out, err := GetArtifacts(context.Background(), client, ArtifactsInput{ProjectID: "42", JobID: 100})
+// TestGetArtifacts_ArchiveOverTheLimit_ReturnsItsSizeAndNoContent holds
+// the archive limit to the mebibyte the card names, from both sides: an
+// archive that fits comes back whole, and one byte more comes back with its
+// real size, truncated set and no content at all. It used to come back cut
+// to its first MiB, base64-encoded: a zip keeps its central directory at the
+// end, so the prefix could not be opened, and it cost a model some 350k
+// tokens of nothing it could use.
+func TestGetArtifacts_ArchiveOverTheLimit_ReturnsItsSizeAndNoContent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		size int
+	}{{"exactly the limit is returned whole", oneMiB}, {"one byte over is withheld", oneMiB + 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Repeat("x", tc.size-1) + "$"
+			out, err := GetArtifacts(t.Context(), serveArtifact(t, pathJobArtifacts, body), ArtifactsInput{ProjectID: "42", JobID: 100})
 			if err != nil {
 				t.Fatalf("GetArtifacts() unexpected error: %v", err)
 			}
-			if out.Truncated != tt.wantTruncated || out.Size != oneMiB {
-				t.Errorf("Truncated/Size = %v/%d, want %v/%d for a %d-byte archive", out.Truncated, out.Size, tt.wantTruncated, oneMiB, tt.size)
+			over := tc.size > oneMiB
+			if out.Truncated != over || out.Size != tc.size {
+				t.Errorf("Truncated/Size = %v/%d, want %v/%d", out.Truncated, out.Size, over, tc.size)
 			}
-			decoded, decodeErr := base64.StdEncoding.DecodeString(out.Content)
-			if decodeErr != nil || string(decoded) != body[:oneMiB] {
-				t.Errorf("Content decodes to %d bytes (err %v), want the first %d bytes of the archive", len(decoded), decodeErr, oneMiB)
+			want := base64.StdEncoding.EncodeToString([]byte(body))
+			if over {
+				want = ""
+			}
+			if out.Content != want {
+				t.Errorf("Content holds %d characters, want %d", len(out.Content), len(want))
 			}
 		})
 	}
 }
 
-// TestDownloadSingleArtifact_LimitIsTheMebibyteTheCardPromises is the same
-// boundary on the single-file path, which reads through its own copy of the
-// truncation.
-func TestDownloadSingleArtifact_LimitIsTheMebibyteTheCardPromises(t *testing.T) {
-	for _, tt := range artifactLimitCases() {
-		t.Run(tt.name, func(t *testing.T) {
-			body := strings.Repeat("x", tt.size-1) + "$"
-			client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodGet && r.URL.Path == "/api/v4/projects/42/jobs/100/artifacts/big.bin" {
-					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write([]byte(body))
-					return
-				}
-				http.NotFound(w, r)
-			}))
+// TestDownloadArtifacts_ArchiveOverTheLimit_ReturnsItsSizeAndNoContent is
+// the same rule on the by-ref download, which returns through the same read.
+func TestDownloadArtifacts_ArchiveOverTheLimit_ReturnsItsSizeAndNoContent(t *testing.T) {
+	body := strings.Repeat("x", oneMiB+1)
+	client := serveArtifact(t, "/api/v4/projects/42/jobs/artifacts/main/download", body)
+	out, err := DownloadArtifacts(t.Context(), client, DownloadArtifactsInput{ProjectID: "42", RefName: "main", JobName: "build"})
+	if err != nil {
+		t.Fatalf("DownloadArtifacts() unexpected error: %v", err)
+	}
+	if !out.Truncated || out.Size != oneMiB+1 || out.Content != "" {
+		t.Errorf("Truncated/Size/Content = %v/%d/%d characters, want true/%d/none", out.Truncated, out.Size, len(out.Content), oneMiB+1)
+	}
+}
 
-			out, err := DownloadSingleArtifact(context.Background(), client, SingleArtifactInput{ProjectID: "42", JobID: 100, ArtifactPath: "big.bin"})
+// TestArtifacts_ResponseOverTheClientCeiling_NamesTheSingleFileRead verifies
+// that an archive the client-wide response ceiling stops is answered with
+// the way out, a read of one file of it, rather than a bare error, and that
+// the way out takes what the caller has: the read by job ID after the
+// download by job ID, and the read by ref after the download by ref, whose
+// caller holds a ref and a job name and no job ID.
+func TestArtifacts_ResponseOverTheClientCeiling_NamesTheSingleFileRead(t *testing.T) {
+	client := serveArtifact(t, pathJobArtifacts, strings.Repeat("x", 4096))
+	client.SetMaxResponseBytes(1024)
+	_, err := GetArtifacts(t.Context(), client, ArtifactsInput{ProjectID: "42", JobID: 100})
+	if err == nil || !strings.Contains(err.Error(), "job.download_single_artifact") || strings.Contains(err.Error(), "_by_ref") {
+		t.Fatalf("GetArtifacts() error = %v, want it to name job.download_single_artifact", err)
+	}
+	client = serveArtifact(t, "/api/v4/projects/42/jobs/artifacts/main/download", strings.Repeat("x", 4096))
+	client.SetMaxResponseBytes(1024)
+	_, err = DownloadArtifacts(t.Context(), client, DownloadArtifactsInput{ProjectID: "42", RefName: "main", JobName: "build"})
+	if err == nil || !strings.Contains(err.Error(), "job.download_single_artifact_by_ref") {
+		t.Fatalf("DownloadArtifacts() error = %v, want it to name job.download_single_artifact_by_ref", err)
+	}
+}
+
+// TestSingleArtifact_ResponseOverTheClientCeiling_NamesTheWayOut verifies
+// that a file the client-wide response ceiling stops is answered with the
+// route to download it from GitLab directly, by job and by ref.
+func TestSingleArtifact_ResponseOverTheClientCeiling_NamesTheWayOut(t *testing.T) {
+	client := serveArtifact(t, "/api/v4/projects/42/jobs/100/artifacts/out.bin", strings.Repeat("x", 4096))
+	client.SetMaxResponseBytes(1024)
+	_, err := DownloadSingleArtifact(t.Context(), client, SingleArtifactInput{ProjectID: "42", JobID: 100, ArtifactPath: "out.bin"})
+	if err == nil || !strings.Contains(err.Error(), "download it from GitLab directly") {
+		t.Fatalf("DownloadSingleArtifact() error = %v, want the way out", err)
+	}
+	client = serveArtifact(t, "/api/v4/projects/42/jobs/artifacts/main/raw/out.bin", strings.Repeat("x", 4096))
+	client.SetMaxResponseBytes(1024)
+	_, err = DownloadSingleArtifactByRef(t.Context(), client, SingleArtifactRefInput{ProjectID: "42", RefName: "main", ArtifactPath: "out.bin", JobName: "build"})
+	if err == nil || !strings.Contains(err.Error(), "download it from GitLab directly") {
+		t.Fatalf("DownloadSingleArtifactByRef() error = %v, want the way out", err)
+	}
+}
+
+// TestDownloadSingleArtifact_Content_KeepsEveryByte verifies that a single
+// artifact comes back as text when its bytes are valid UTF-8 and base64
+// otherwise, the encoding field saying which, so a binary file survives the
+// JSON result byte for byte. Its bytes used to be put into a JSON string as
+// they were, and every invalid UTF-8 byte of a PNG came back as U+FFFD.
+func TestDownloadSingleArtifact_Content_KeepsEveryByte(t *testing.T) {
+	binary := string([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00, 0x80})
+	for _, tc := range []struct {
+		name, body, wantEncoding, wantContent string
+	}{
+		{"text", "ok: 3 passed\nñ done\n", "text", "ok: 3 passed\nñ done\n"},
+		{"binary", binary, "base64", base64.StdEncoding.EncodeToString([]byte(binary))},
+		{"empty", "", "text", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := serveArtifact(t, "/api/v4/projects/42/jobs/100/artifacts/out.bin", tc.body)
+			out, err := DownloadSingleArtifact(t.Context(), client, SingleArtifactInput{ProjectID: "42", JobID: 100, ArtifactPath: "out.bin"})
 			if err != nil {
-				t.Fatalf("DownloadSingleArtifact() unexpected error: %v", err)
+				t.Fatalf("DownloadSingleArtifact() error: %v", err)
 			}
-			if out.Truncated != tt.wantTruncated || out.Size != oneMiB {
-				t.Errorf("Truncated/Size = %v/%d, want %v/%d for a %d-byte file", out.Truncated, out.Size, tt.wantTruncated, oneMiB, tt.size)
-			}
-			if out.Content != body[:oneMiB] {
-				t.Errorf("Content is %d bytes, want the first %d bytes of the file", len(out.Content), oneMiB)
+			if out.Encoding != tc.wantEncoding || out.Content != tc.wantContent || out.Size != len(tc.body) || out.Truncated {
+				t.Errorf("got encoding %q, %d characters, size %d, truncated %v; want %q, %d, %d, false",
+					out.Encoding, len(out.Content), out.Size, out.Truncated, tc.wantEncoding, len(tc.wantContent), len(tc.body))
 			}
 		})
+	}
+}
+
+// TestDownloadSingleArtifact_OverTheLimit_KeepsAReadableTextPrefix verifies
+// the single file over the mebibyte: text keeps its first mebibyte, cut back
+// to the last whole character so the prefix is still valid UTF-8, with the
+// real size and truncated set; a binary over the limit is withheld, since a
+// prefix of it is no more readable than one of an archive.
+func TestDownloadSingleArtifact_OverTheLimit_KeepsAReadableTextPrefix(t *testing.T) {
+	// The two-byte "é" straddles the limit, so a byte cut leaves half of it.
+	text := strings.Repeat("x", oneMiB-1) + "é" + "tail"
+	binary := strings.Repeat("\xff", oneMiB+1)
+	for _, tc := range []struct {
+		name, body, wantEncoding, wantContent string
+	}{
+		{"text", text, "text", strings.Repeat("x", oneMiB-1)},
+		{"binary", binary, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := serveArtifact(t, "/api/v4/projects/42/jobs/artifacts/main/raw/big.out", tc.body)
+			out, err := DownloadSingleArtifactByRef(t.Context(), client, SingleArtifactRefInput{ProjectID: "42", RefName: "main", ArtifactPath: "big.out", JobName: "build"})
+			if err != nil {
+				t.Fatalf("DownloadSingleArtifactByRef() error: %v", err)
+			}
+			if out.Encoding != tc.wantEncoding || out.Content != tc.wantContent || out.Size != len(tc.body) || !out.Truncated {
+				t.Errorf("got encoding %q, %d characters, size %d, truncated %v; want %q, %d, %d, true",
+					out.Encoding, len(out.Content), out.Size, out.Truncated, tc.wantEncoding, len(tc.wantContent), len(tc.body))
+			}
+		})
+	}
+}
+
+// TestDownloadSingleArtifact_ExactlyTheLimit_IsWhole verifies that a single
+// file exactly a mebibyte long comes back whole and is not marked truncated:
+// only a file over the limit loses anything, and a binary one loses all of it.
+func TestDownloadSingleArtifact_ExactlyTheLimit_IsWhole(t *testing.T) {
+	body := strings.Repeat("\xff", oneMiB)
+	client := serveArtifact(t, "/api/v4/projects/42/jobs/100/artifacts/out.bin", body)
+	out, err := DownloadSingleArtifact(t.Context(), client, SingleArtifactInput{ProjectID: "42", JobID: 100, ArtifactPath: "out.bin"})
+	if err != nil {
+		t.Fatalf("DownloadSingleArtifact() error: %v", err)
+	}
+	if out.Truncated || out.Encoding != "base64" || out.Content != base64.StdEncoding.EncodeToString([]byte(body)) || out.Size != oneMiB {
+		t.Errorf("got encoding %q, %d characters, size %d, truncated %v; want the whole mebibyte base64-encoded",
+			out.Encoding, len(out.Content), out.Size, out.Truncated)
 	}
 }
 
@@ -1528,7 +1755,7 @@ func TestReadHandlers_NotFoundHint_GatedOnTheStatus(t *testing.T) {
 			_, e := DownloadArtifacts(ctx, c, DownloadArtifactsInput{ProjectID: "42", RefName: "main", JobName: "build"})
 			return e
 		}},
-		{"DownloadSingleArtifact", "job.artifacts to list", func(c *gitlabclient.Client) error {
+		{"DownloadSingleArtifact", "artifacts:paths in .gitlab-ci.yml", func(c *gitlabclient.Client) error {
 			_, e := DownloadSingleArtifact(ctx, c, SingleArtifactInput{ProjectID: "42", JobID: 100, ArtifactPath: "a.txt"})
 			return e
 		}},
@@ -2660,22 +2887,197 @@ func TestFormatTraceMarkdown_WithData(t *testing.T) {
 	}
 }
 
-// TestFormatTraceMarkdown_Truncated checks that the note names the end that is
-// missing. The log is cut at the first 100 KB and a failure is almost always
-// at the end of it, so a reader told only "truncated" would look for the error
-// in what is shown.
+// TestFormatTraceMarkdown_Truncated checks that the note says the end of the
+// log is what is shown and how much of its beginning is not, and that the
+// next steps offer tail_lines. The note used to say the first 100 KB were
+// shown and the end, where the failure is, was not, which is what the read
+// did and no longer does.
 func TestFormatTraceMarkdown_Truncated(t *testing.T) {
 	md := FormatTraceMarkdown(TraceOutput{
-		JobID:     100,
-		Trace:     "partial log...",
-		Truncated: true,
+		JobID:        100,
+		Trace:        "...end of log",
+		Truncated:    true,
+		OmittedBytes: 58550,
 	})
 	want := "## Job #100 Trace\n\n" +
-		"⚠️ Showing the first 100 KB of the log. The end, where a failure usually appears, is not included.\n" +
-		"\n```\npartial log...\n```\n" +
-		traceHints
+		"⚠️ Showing the end of the log, at most its last 100 KB. The first 58550 bytes are left out.\n" +
+		"\n```\n...end of log\n```\n" +
+		"\n---\n💡 **Next steps:**\n" +
+		"- Use action 'job.trace' to read only the last lines of the log with tail_lines\n" +
+		"- Use action 'job.get' to see this job's details\n" +
+		"- Use action 'job.retry' to re-run it\n"
 	if md != want {
 		t.Errorf("FormatTraceMarkdown(truncated)\n got %q\nwant %q", md, want)
+	}
+}
+
+// TestLogTail_InvalidUTF8_KeepsTheLastByte verifies that a log whose last
+// bytes are not UTF-8 still keeps at least its last byte, rather than walking
+// past the end looking for a character to start at.
+func TestLogTail_InvalidUTF8_KeepsTheLastByte(t *testing.T) {
+	if got := logTail(strings.Repeat("\x80", 10), 4); got != "\x80" {
+		t.Errorf("logTail(continuation bytes) = %q, want the last byte", got)
+	}
+	if got := logTail("ab\ncd\x80\x80", 4); got != "cd\x80\x80" {
+		t.Errorf("logTail(line then invalid bytes) = %q, want the last line", got)
+	}
+}
+
+// TestLogTail_AtTheEdges verifies logTail where its comparisons turn: a log
+// exactly the limit long comes back whole, its first line included; a line
+// break on the first of the last limit bytes is dropped, so the kept part
+// starts at the line after it rather than with an empty line; and a line that
+// begins exactly where the last limit bytes do is kept whole, since it fits.
+// That last one used to be dropped too, the search for a line start running
+// on past a line that already began there.
+func TestLogTail_AtTheEdges(t *testing.T) {
+	cases := []struct {
+		name, log string
+		limit     int
+		want      string
+	}{
+		{name: "exactly the limit", log: "a\nb", limit: 3, want: "a\nb"},
+		{name: "line break on the first kept byte", log: "abc\ndef", limit: 4, want: "def"},
+		{name: "line break just before the kept bytes", log: "abc\ndef\nghi", limit: 7, want: "def\nghi"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := logTail(tc.log, tc.limit); got != tc.want {
+				t.Errorf("logTail(%q, %d) = %q, want %q", tc.log, tc.limit, got, tc.want)
+			}
+		})
+	}
+}
+
+// traceTailOf runs traceTail over log with the window given, as Trace runs it
+// over the body client-go read.
+func traceTailOf(log string, tailLines, window int) (string, int) {
+	return traceTail(bytes.NewReader([]byte(log)), tailLines, window)
+}
+
+// assertTailOfLog holds what traceTail returned for log to what it promises:
+// the log from omitted on, as GitLab stores it, strips to exactly the text
+// returned, and that text starts a line whenever the stripped log has a line
+// break before it.
+func assertTailOfLog(t *testing.T, log, kept string, omitted int) {
+	t.Helper()
+	if omitted < 0 || omitted > len(log) {
+		t.Fatalf("omitted = %d, outside a log of %d bytes", omitted, len(log))
+	}
+	if got := toolutil.StripLogMarkup(log[omitted:]); got != kept {
+		t.Errorf("the log from byte %d strips to %d bytes, not the %d returned", omitted, len(got), len(kept))
+	}
+	if omitted > 0 && strings.Contains(toolutil.StripLogMarkup(log[:omitted]), "\n") && log[omitted-1] != '\n' {
+		t.Errorf("the text returned starts inside a line, at byte %d", omitted)
+	}
+}
+
+// TestTraceTail_EndOfALongLog_IsWhatTheWholeLogGives verifies that reading
+// only the end of a log returns what stripping and cutting the whole log
+// returns, with and without tail_lines, when the end read holds more text
+// than one response carries: the part read starts at a line, where the
+// markup strips as it does in the whole log.
+func TestTraceTail_EndOfALongLog_IsWhatTheWholeLogGives(t *testing.T) {
+	log := markupLog(600 << 10)
+	text := toolutil.StripLogMarkup(log)
+	for _, tc := range []struct {
+		name      string
+		tailLines int
+		window    int
+	}{
+		{"the end of the log", 0, 300 << 10},
+		{"the last five lines", 5, 300 << 10},
+		{"more lines than the part read holds", 10000, 300 << 10},
+		{"a window over the whole log", 0, 1 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := text
+			if tc.tailLines > 0 {
+				want = lastLines(want, tc.tailLines)
+			}
+			want = logTail(want, maxTraceBytes)
+			kept, omitted := traceTailOf(log, tc.tailLines, tc.window)
+			if kept != want {
+				t.Errorf("kept %d bytes ending %q, want the %d the whole log gives", len(kept), kept[max(0, len(kept)-40):], len(want))
+			}
+			assertTailOfLog(t, log, kept, omitted)
+		})
+	}
+}
+
+// TestTraceTail_TheEdgesOfThePartRead verifies the part read where it has no
+// line to start at: a long line cut on a character rather than inside one, a
+// line break only as the last byte, which leaves the part read whole rather
+// than empty, a part holding no character start at all, which keeps the last
+// byte, and a part that is nearly all markup, returned whole with what comes
+// before it counted as left out.
+func TestTraceTail_TheEdgesOfThePartRead(t *testing.T) {
+	t.Run("one long line", func(t *testing.T) {
+		log := strings.Repeat("é", 200<<10) + "x" // an odd length, so the part read starts on the second byte of a character
+		kept, omitted := traceTailOf(log, 0, 150<<10)
+		if !utf8.ValidString(kept) || !strings.HasSuffix(kept, "éx") || len(kept) > maxTraceBytes {
+			t.Errorf("kept %d bytes, valid UTF-8 %v; want at most %d valid bytes ending in éx", len(kept), utf8.ValidString(kept), maxTraceBytes)
+		}
+		assertTailOfLog(t, log, kept, omitted)
+	})
+	t.Run("a short part starting inside a character", func(t *testing.T) {
+		log := strings.Repeat("é", 10) // the last 5 bytes start on the second byte of a character
+		kept, omitted := traceTailOf(log, 0, 5)
+		if kept != "éé" || omitted != 16 {
+			t.Errorf("kept %q, %d omitted; want the two whole characters read and the 16 bytes before them omitted", kept, omitted)
+		}
+		assertTailOfLog(t, log, kept, omitted)
+	})
+	t.Run("a line break only as the last byte", func(t *testing.T) {
+		log := strings.Repeat("a", 300<<10) + "\n"
+		kept, omitted := traceTailOf(log, 0, 200<<10)
+		if len(kept) != maxTraceBytes || omitted != len(log)-maxTraceBytes {
+			t.Errorf("kept %d bytes, %d omitted; want the last %d and the rest omitted", len(kept), omitted, maxTraceBytes)
+		}
+	})
+	t.Run("no character start", func(t *testing.T) {
+		log := strings.Repeat("\x80", 300<<10)
+		kept, omitted := traceTailOf(log, 0, 200<<10)
+		if kept != "\x80" || omitted != len(log)-1 {
+			t.Errorf("kept %q, %d omitted; want the last byte and the rest omitted", kept, omitted)
+		}
+	})
+	t.Run("a part that is nearly all markup", func(t *testing.T) {
+		line := strings.Repeat("\x1b[0K", 1000) + "x\n"
+		log := strings.Repeat(line, 100)
+		kept, omitted := traceTailOf(log, 0, 200<<10)
+		if kept == "" || strings.Trim(kept, "x\n") != "" || len(kept) >= 100*2 || omitted == 0 {
+			t.Errorf("kept %q, %d omitted; want the text of the lines read and the rest omitted", kept, omitted)
+		}
+		assertTailOfLog(t, log, kept, omitted)
+	})
+}
+
+// TestRawOffset_FindsWhereTheStrippedTextBegins verifies rawOffset at a line
+// start, which it reaches by counting line breaks, inside a line, which it
+// maps through the markup of that line alone, and at the end of the text.
+func TestRawOffset_FindsWhereTheStrippedTextBegins(t *testing.T) {
+	const raw = "a\x1b[0Kb\nc\x1b[31md\x1b[0me\n"
+	text := toolutil.StripLogMarkup(raw)
+	for _, tc := range []struct {
+		n, want int
+	}{
+		{0, 0}, {1, 5}, {3, 7}, {4, 13}, {5, 18}, {7, len(raw)},
+	} {
+		t.Run(strconv.Itoa(tc.n), func(t *testing.T) {
+			if got := rawOffset(raw, text, tc.n); got != tc.want {
+				t.Errorf("rawOffset(%q, %q, %d) = %d, want %d", raw, text, tc.n, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLastLines_ALeadingLineBreak_StaysOutOfTheLastLines verifies that a log
+// starting with a line break has an empty first line, so asking for every
+// line after it returns them without the break rather than the log whole.
+func TestLastLines_ALeadingLineBreak_StaysOutOfTheLastLines(t *testing.T) {
+	if got := lastLines("\na\nb\n", 2); got != "a\nb\n" {
+		t.Errorf("lastLines(leading line break, 2) = %q, want %q", got, "a\nb\n")
 	}
 }
 
@@ -2766,41 +3168,67 @@ func TestFormatArtifactsMarkdown_WithJobID(t *testing.T) {
 	}
 }
 
-// artifactsHints is the guidance section an artifacts download closes with.
+// artifactsHints is the guidance section an artifacts download by job ID
+// closes with.
 const artifactsHints = "\n---\n💡 **Next steps:**\n" +
 	"- Use action 'job.download_single_artifact' to fetch one file out of the archive instead\n"
 
+// artifactsByRefHints is the guidance section the by-ref download closes
+// with: the one-file read that takes the same ref and job name, since its
+// caller has no job ID to give the read by job ID.
+const artifactsByRefHints = "\n---\n💡 **Next steps:**\n" +
+	"- Use action 'job.download_single_artifact_by_ref' to fetch one file out of the archive instead, for the same ref and job\n"
+
 // TestFormatArtifactsMarkdown_WithoutJobID checks the card of the by-ref
 // download, which answers for a ref rather than for a job ID and must not
-// print "Job #0", and whose note names no file_type: that route declares
-// none, so the content is always the zip archive.
+// print "Job #0", whose note names no file_type: that route declares none,
+// so the content is always the zip archive, and whose next step is the
+// one-file read by ref.
 func TestFormatArtifactsMarkdown_WithoutJobID(t *testing.T) {
 	md := FormatArtifactsMarkdown(ArtifactsOutput{Size: 512})
 	want := "## Artifacts\n\n" +
 		"- **Size (bytes)**: 512\n" +
 		"\nThe zip archive is base64-encoded. Decode it to extract the files.\n" +
-		artifactsHints
+		artifactsByRefHints
 	if md != want {
 		t.Errorf("FormatArtifactsMarkdown(no job)\n got %q\nwant %q", md, want)
 	}
 }
 
-// TestFormatArtifactsMarkdown_Truncated checks that a cut archive is marked
-// with the warning sign rather than a tick, which on "Truncated" reads as
-// success.
-func TestFormatArtifactsMarkdown_Truncated(t *testing.T) {
+// TestFormatArtifactsMarkdown_ByRefOverTheLimit_NamesTheReadByRef checks the
+// card of a by-ref archive withheld for its size: the note sends the caller
+// to the one-file read by ref, for the same ref and job, rather than to the
+// read by job ID, which wants a job ID this caller does not have.
+func TestFormatArtifactsMarkdown_ByRefOverTheLimit_NamesTheReadByRef(t *testing.T) {
+	md := FormatArtifactsMarkdown(ArtifactsOutput{Size: 3000288, Truncated: true})
+	want := "## Artifacts\n\n" +
+		"- **Size (bytes)**: 3000288\n" +
+		"- ⚠️ **Over the 1 MB one response carries, so no content is returned**\n" +
+		"\nA prefix of an archive cannot be opened, so none is returned. Read one file of it with job.download_single_artifact_by_ref, for the same ref and job: its path is one of the job's artifacts:paths in .gitlab-ci.yml.\n" +
+		artifactsByRefHints
+	if md != want {
+		t.Errorf("FormatArtifactsMarkdown(by ref, over the limit)\n got %q\nwant %q", md, want)
+	}
+}
+
+// TestFormatArtifactsMarkdown_OverTheLimit_SaysWhereToReadInstead checks
+// the card of an archive withheld for its size: a warning, not a tick, that
+// no content came back, and a note naming the one-file read and where its
+// path comes from, instead of telling a model to decode content that is not
+// there.
+func TestFormatArtifactsMarkdown_OverTheLimit_SaysWhereToReadInstead(t *testing.T) {
 	md := FormatArtifactsMarkdown(ArtifactsOutput{
 		JobID:     100,
-		Size:      1048576,
+		Size:      3000288,
 		Truncated: true,
 	})
 	want := "## Job #100 Artifacts\n\n" +
-		"- **Size (bytes)**: 1048576\n" +
-		"- ⚠️ **Truncated at 1 MB**\n" +
-		"\nThe content is base64-encoded as GitLab stores it: the zip archive, or the report file_type named, which may be gzip-compressed. Decode it before reading.\n" +
+		"- **Size (bytes)**: 3000288\n" +
+		"- ⚠️ **Over the 1 MB one response carries, so no content is returned**\n" +
+		"\nA prefix of an archive or a compressed report cannot be opened, so none is returned. Read one file of it with job.download_single_artifact: its path is one of the job's artifacts:paths in .gitlab-ci.yml.\n" +
 		artifactsHints
 	if md != want {
-		t.Errorf("FormatArtifactsMarkdown(truncated)\n got %q\nwant %q", md, want)
+		t.Errorf("FormatArtifactsMarkdown(over the limit)\n got %q\nwant %q", md, want)
 	}
 }
 
@@ -2814,10 +3242,12 @@ func TestFormatSingleArtifactMarkdown_WithJobID(t *testing.T) {
 		JobID:        100,
 		ArtifactPath: "report.txt",
 		Size:         256,
+		Encoding:     "text",
 		Content:      "test report content",
 	})
 	want := "## Job #100: report.txt\n\n" +
 		"- **Size (bytes)**: 256\n" +
+		"- **Encoding**: text\n" +
 		"\n```\ntest report content\n```\n" +
 		singleArtifactHints
 	if md != want {
@@ -2835,10 +3265,12 @@ func TestFormatSingleArtifactMarkdown_WithoutJobID(t *testing.T) {
 	md := FormatSingleArtifactMarkdown(SingleArtifactOutput{
 		ArtifactPath: "output.log",
 		Size:         64,
+		Encoding:     "text",
 		Content:      "log data",
 	})
 	want := "## output.log\n\n" +
 		"- **Size (bytes)**: 64\n" +
+		"- **Encoding**: text\n" +
 		"\n```\nlog data\n```\n" +
 		singleArtifactHints
 	if md != want {
@@ -2846,23 +3278,50 @@ func TestFormatSingleArtifactMarkdown_WithoutJobID(t *testing.T) {
 	}
 }
 
-// TestFormatSingleArtifactMarkdown_Truncated checks that a cut file is marked
-// with the warning sign.
+// TestFormatSingleArtifactMarkdown_Truncated checks that a cut text file is
+// marked with the warning sign and shows the prefix it kept.
 func TestFormatSingleArtifactMarkdown_Truncated(t *testing.T) {
 	md := FormatSingleArtifactMarkdown(SingleArtifactOutput{
 		JobID:        100,
-		ArtifactPath: "big.bin",
-		Size:         1048576,
+		ArtifactPath: "big.log",
+		Size:         2097152,
+		Encoding:     "text",
 		Content:      "...",
 		Truncated:    true,
 	})
-	want := "## Job #100: big.bin\n\n" +
-		"- **Size (bytes)**: 1048576\n" +
+	want := "## Job #100: big.log\n\n" +
+		"- **Size (bytes)**: 2097152\n" +
+		"- **Encoding**: text\n" +
 		"- ⚠️ **Truncated at 1 MB**\n" +
 		"\n```\n...\n```\n" +
 		singleArtifactHints
 	if md != want {
 		t.Errorf("FormatSingleArtifactMarkdown(truncated)\n got %q\nwant %q", md, want)
+	}
+}
+
+// TestFormatSingleArtifactMarkdown_Binary checks the two binary cards: one
+// that fits says its content is base64 and fences it, and one over the limit
+// says no content came back and where to get the file instead.
+func TestFormatSingleArtifactMarkdown_Binary(t *testing.T) {
+	fits := FormatSingleArtifactMarkdown(SingleArtifactOutput{JobID: 100, ArtifactPath: "logo.png", Size: 12, Encoding: "base64", Content: "iVBORw0KGgr//gCA"})
+	wantFits := "## Job #100: logo.png\n\n" +
+		"- **Size (bytes)**: 12\n" +
+		"- **Encoding**: base64\n" +
+		"\nThe file is not text, so its bytes are base64-encoded. Decode them before use.\n" +
+		"\n```\niVBORw0KGgr//gCA\n```\n" +
+		singleArtifactHints
+	if fits != wantFits {
+		t.Errorf("FormatSingleArtifactMarkdown(binary)\n got %q\nwant %q", fits, wantFits)
+	}
+	over := FormatSingleArtifactMarkdown(SingleArtifactOutput{JobID: 100, ArtifactPath: "big.bin", Size: 2097152, Truncated: true})
+	wantOver := "## Job #100: big.bin\n\n" +
+		"- **Size (bytes)**: 2097152\n" +
+		"- ⚠️ **Over the 1 MB one response carries, so no content is returned**\n" +
+		"\nA prefix of a binary file cannot be used, so none is returned. Download the file from GitLab directly.\n" +
+		singleArtifactHints
+	if over != wantOver {
+		t.Errorf("FormatSingleArtifactMarkdown(binary over the limit)\n got %q\nwant %q", over, wantOver)
 	}
 }
 

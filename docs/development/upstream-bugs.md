@@ -81,6 +81,8 @@ for the fork, branch, fix, test and MR workflow.
   - [The work item documents select neither the decision log nor the development widget](#the-work-item-documents-select-neither-the-decision-log-nor-the-development-widget)
   - [The work item documents leave out fields GitLab sends on a work item](#the-work-item-documents-leave-out-fields-gitlab-sends-on-a-work-item)
   - [The saved view documents leave out who made a view, when it changed and how to share it](#the-saved-view-documents-leave-out-who-made-a-view-when-it-changed-and-how-to-share-it)
+  - [DependencyListExport carries four of the eight fields GitLab sends](#dependencylistexport-carries-four-of-the-eight-fields-gitlab-sends)
+  - [The model package file path segment cannot be omitted](#the-model-package-file-path-segment-cannot-be-omitted)
 - [MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)](#mcp-go-sdk-githubcommodelcontextprotocolgo-sdk)
   - [No keep-alive interval for SSE streams on StreamableHTTPOptions](#no-keep-alive-interval-for-sse-streams-on-streamablehttpoptions)
   - [A malformed message ends the session instead of answering -32700](#a-malformed-message-ends-the-session-instead-of-answering--32700)
@@ -137,6 +139,8 @@ for the fork, branch, fix, test and MR workflow.
   - [The API pages list access levels the API refuses](#the-api-pages-list-access-levels-the-api-refuses)
   - [The forks list returns statistics when asked not to](#the-forks-list-returns-statistics-when-asked-not-to)
   - [The contributed projects route writes a keyset link its finder never reads](#the-contributed-projects-route-writes-a-keyset-link-its-finder-never-reads)
+  - [The ML model package route accepts neither PRIVATE-TOKEN nor a GitLab OAuth access token](#the-ml-model-package-route-accepts-neither-private-token-nor-a-gitlab-oauth-access-token)
+  - [SubmoduleHelper compares submodule URLs as text](#submodulehelper-compares-submodule-urls-as-text)
 - [GitLab Orbit (`gitlab-org/orbit/knowledge-graph`)](#gitlab-orbit-gitlab-orgorbitknowledge-graph)
   - [The DSL schema says a path query may omit `rel_types`](#the-dsl-schema-says-a-path-query-may-omit-rel_types)
   - [The DSL schema says the default neighbors direction is `both`](#the-dsl-schema-says-the-default-neighbors-direction-is-both)
@@ -334,6 +338,10 @@ readable without opening the tracker:
 | 110 | gitlab-org/gitlab | [The API pages list access levels the API refuses](#the-api-pages-list-access-levels-the-api-refuses) | Yes, by the merge request | Yes, [gitlab-org/gitlab!261285](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/261285), open, the documentation review pending | No | No; a refused value is answered 400, except that `access.approve_project` and `access.approve_group` grant Developer for `0` and report as approved a request that `5` leaves pending where GitLab does not accept it | None yet; this server's own schemas offer refused values: eleven filters `5` (six of them `60` too), six writes `0`, five project writes `5` and the group member update `60`; #1280 tracks it |
 | 111 | gitlab-org/gitlab | [The forks list returns statistics when asked not to](#the-forks-list-returns-statistics-when-asked-not-to) | Yes, [gitlab-org/gitlab#633318](https://gitlab.com/gitlab-org/gitlab/-/issues/633318) | No | No | No; `project.list_forks` with `statistics: false` answers every fork's statistics, and an administrator's `project.list_user_starred` with `with_custom_attributes: false` the custom attributes | None taken |
 | 112 | gitlab-org/gitlab | [The contributed projects route writes a keyset link its finder never reads](#the-contributed-projects-route-writes-a-keyset-link-its-finder-never-reads) | No | No | No | No | Yes, `project.list_user_contributed` refuses keyset pagination and pages by offset only |
+| 113 | client-go | [`DependencyListExport` carries four of the eight fields GitLab sends](#dependencylistexport-carries-four-of-the-eight-fields-gitlab-sends) | No; for the joint merge request | No | No | No | Yes, the export create and status read take the four from the captured response |
+| 114 | gitlab-org/gitlab | [The ML model package route accepts neither PRIVATE-TOKEN nor a GitLab OAuth access token](#the-ml-model-package-route-accepts-neither-private-token-nor-a-gitlab-oauth-access-token) | No | No | No | Yes, for an oauth HTTP mode session holding a GitLab OAuth access token, which cannot download a model file at all | Yes, in part: `model_registry.download` sends the token as Bearer, and a Bearer session's 401 names the limit |
+| 115 | client-go | [The model package file path segment cannot be omitted](#the-model-package-file-path-segment-cannot-be-omitted) | No; for the joint merge request | No | No | No | Yes, `model_registry.download` sends its own request for a file at the package root |
+| 127 | gitlab-org/gitlab | [SubmoduleHelper compares submodule URLs as text](#submodulehelper-compares-submodule-urls-as-text) | No | No | No | No; GitLab's pages leave such a submodule unlinked | Yes, `repository.list_submodules` and `repository.read_submodule_file` resolve a sibling namespace and the other spellings of the instance's clone URLs |
 
 States verified against the upstream trackers on 2026-09-12, and rows 8 to 23
 again on 2026-09-13 when the go-sdk batch was filed. Rows 39 to 44 were added
@@ -6052,6 +6060,77 @@ purpose as an experiment, and `private` as a field GitLab deprecated for the
 1022.
 
 **Effort**: small: four fields and their tests.
+
+### DependencyListExport carries four of the eight fields GitLab sends
+
+- **Reported**: no. It goes into the joint merge request,
+  [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063),
+  with the other struct gaps of this register.
+- **In review**: no.
+- **Merged**: no. v3.15.0 carries the four fields.
+- **Blocking**: no.
+- **Workaround**: yes. `dependency.export_create` and `dependency.export_get`
+  (`internal/tools/dependencies/dependencies.go`) call the SDK under
+  `gitlabclient.WithResponseCapture` (ADR-0021) and read `status`,
+  `export_type`, `send_email` and `expires_at` from the captured answer. It
+  retires when the struct models them.
+
+**Where**: `dependency_list_export.go`, `DependencyListExport`, at v3.15.0,
+which `CreateDependencyListExport` and `GetDependencyListExport` decode into.
+
+**What**: GitLab renders a dependency list export through
+`API::Entities::DependencyListExport`, which exposes `id`, `status` (the
+state's name: `created`, `running`, `finished` or `failed`), `has_finished`,
+`export_type`, `send_email`, `expires_at`, `self` and `download`. The struct
+models `id`, `has_finished`, `self` and `download`. The status is the field a
+caller polls on, and the one this server's own hints told a model to wait
+for, while the output it was handed had only the boolean.
+
+**How we found it**: issue 1307. GitLab's generated record carries no
+response entity for the `dependency_list_exports` routes, so R-PATH never
+compared them; the entity itself is in `gitlab-api-live.json`.
+
+**Effort**: small: four fields and a decoding test.
+
+### The model package file path segment cannot be omitted
+
+- **Reported**: no. It goes into the joint merge request,
+  [gitlab-org/api/client-go!3063](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3063),
+  with the other gaps of this register.
+- **In review**: no.
+- **Merged**: no. v3.15.0 writes the segment.
+- **Blocking**: no.
+- **Workaround**: yes. `model_registry.download`
+  (`internal/tools/modelregistry/model_registry.go`) sends a request of its own
+  for a file at the package root (`downloadFromPackageRoot`, on the route
+  `rootFilePath` builds) and calls the SDK for a file in a directory. It
+  retires when the method can leave the path out.
+
+**Where**: `model_registry.go`, `DownloadMachineLearningModelPackage`, at
+v3.15.0, whose route is `projects/%s/packages/ml_models/%s/files/%s/%s` with
+the path escaped into the third placeholder whatever its value.
+
+**What**: GitLab declares the route as
+`:id/packages/ml_models/:model_version_id/files/(*path/):file_name`
+(`lib/api/ml_model_packages.rb`), the path an optional group, and looks the
+file up by the path and the file name joined. A file uploaded at the root of a
+model version's package has no path, and the method cannot ask for one: an
+empty path is sent as `files//model.bin` and `.` as `files/./model.bin`.
+Against GitLab 19.4.2, through its nginx and straight at Workhorse's socket,
+`files/model.bin` and `files//model.bin` answer 200 and `files/./model.bin`
+answers 404 `Not found`, the package's own not-found, since the file looked up
+is `./model.bin`. The empty segment works by the tolerance of the router rather
+than by the route's declaration, and the one spelling a caller would reach for
+to name the root does not work at all.
+
+**How we found it**: issue 1318. This server required the path, so a file at
+the root of a package could not be downloaded; the root form was settled by a
+live check against a CE 19.4.2 on 2026-10-12, which uploaded one file at the
+root and one nested to a private project's model version and asked for both
+in every spelling.
+
+**Effort**: small: an option that drops the segment, or a path argument the
+method leaves out when it is empty, and a routing test.
 
 ## MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)
 
@@ -11973,6 +12052,110 @@ first page twice as two pages and was then told the listing was complete.
 mocked each project list the way GitLab answers it and found that the
 contributed route's link does not advance; read from the 19.4.1 source and
 from master.
+
+### The ML model package route accepts neither PRIVATE-TOKEN nor a GitLab OAuth access token
+
+- **Reported**: no. An issue on gitlab-org/gitlab is the next step.
+- **In review**: no.
+- **Merged**: no. Measured on 19.4.2 on 2026-10-12, and read on master at
+  `f23a2b35383` (2026-09-23).
+- **Blocking**: yes, for an oauth HTTP mode session whose credential is a
+  GitLab OAuth access token: no request this server can make downloads a model
+  file with it. No for a personal access token.
+- **Workaround**: yes, in part. `model_registry.download`
+  (`internal/tools/modelregistry/model_registry.go`) sends the token as
+  `Authorization: Bearer` on this route through
+  `gitlabclient.Client.BearerToken`, beside the PRIVATE-TOKEN header the client
+  sends everywhere else, so a personal access token reads the files of a
+  private project. A 401 from the route in a session whose client sends Bearer
+  is answered with a refusal that names this limit and the way round it, a
+  personal access token (`errModelRouteRefusesOAuth`). A fix upstream retires
+  both.
+
+**Where**: `lib/api/ml_model_packages.rb`, which declares
+`authenticate_with { |accept| accept.token_types(:personal_access_token,
+:job_token).sent_through(:http_bearer_token) }`, and
+`lib/gitlab/api_authentication/token_resolver.rb`, which resolves what that
+declaration admits.
+
+**What**: two refusals the route's own declaration produces. The first is the
+header: the API guard reads only the locations a route's `authenticate_with`
+names, and this one names the Bearer header alone, so a personal access token
+sent as PRIVATE-TOKEN, the header GitLab documents for personal access tokens
+everywhere else, leaves `current_user` nil and a private project answers 404
+`Project Not Found`. On 19.4.2 the same token answers 200 as Bearer and 404 as
+PRIVATE-TOKEN, for a file at the root and a nested one alike, and 200 as
+PRIVATE-TOKEN on `GET /projects/:id`. The second is the token type: a Bearer
+token is resolved as a personal access token and then as a job token, and a
+GitLab OAuth access token is neither, so `with_job_token` raises
+`UnauthorizedError` and the route answers 401 on every project, public ones
+included. Nothing in the answer says why, and the route's documentation shows
+Bearer without saying that it is the only header, or that an OAuth token is
+not accepted.
+
+**What it costs this server**: before the workaround, every download from a
+private project read as a file that does not exist for a personal access
+token, the common credential. With it, an oauth HTTP mode session holding an
+OAuth access token still cannot download a model file, and is told so rather
+than told its token is invalid.
+
+**How we found it**: issue 1318, reproduced on an EE instance of the e2e
+stack; the triage review read the token resolver for the OAuth half (read from
+the source, not measured), and the live check of 2026-10-12 on CE 19.4.2
+measured the header half for both forms of the file's path.
+
+### SubmoduleHelper compares submodule URLs as text
+
+- **Reported**: no. An issue on gitlab-org/gitlab is the next step.
+- **In review**: no.
+- **Merged**: no. Read on master at `851b3d564ad` (2026-10-13), where the
+  helper last changed on 2026-06-26.
+- **Blocking**: no. GitLab's own pages leave such a submodule as plain text
+  or link it to the URL as written, where a project link was due.
+- **Workaround**: yes. `repository.list_submodules` and
+  `repository.read_submodule_file` resolve a submodule by what its remote
+  names rather than by the text GitLab compares
+  (`internal/tools/repositorysubmodules/list.go`, `submoduleResolver`): a
+  relative URL's containment is judged by path segment, a web clone URL is
+  compared by scheme, host and port, and an SSH one by account, host and
+  port. A fix upstream makes the two agree again.
+
+**Where**: `app/helpers/submodule_helper.rb`, `relative_self_links` and
+`extract_namespace_project` with `self_url?`, which decide what a submodule
+links to in GitLab's pages, the repository tree among them.
+
+**What**: two comparisons made on the URL's text where git, which fetches the
+submodule, reads an address.
+
+- `relative_self_links` refuses a relative URL whose target namespace
+  `start_with?` the superproject's own path, to keep a URL inside the
+  superproject from linking anywhere, since no project can live below another
+  one. A string prefix also matches a sibling namespace whose name only begins
+  with the superproject's: from `group/app`, `../app-tools/lib.git` lands in
+  `group/app-tools`, which `"/group/app-tools".start_with?("/group/app")`
+  takes for a path inside `group/app`, and the submodule is not linked. git
+  fetches it from `group/app-tools/lib` on the same instance.
+- `extract_namespace_project` strips `Gitlab.config.gitlab.url` or the SSH
+  path prefix of the shell configuration (`ssh_path_prefix`) only when the
+  URL `start_with?` it, and
+  `self_url?` then compares the URL with those two strings joined to the
+  project's path. A remote that names this instance in any other spelling is
+  not linked: the ssh:// form of an SCP clone URL
+  (`ssh://git@gitlab.example.com/group/lib.git` beside the prefix
+  `git@gitlab.example.com:`), a host written in capitals, the default port
+  written out (`https://gitlab.example.com:443/...`), or credentials in the
+  URL. git reaches the same project through each of them.
+
+**What it costs this server**: nothing at run time. This server used to follow
+the helper rule for rule, which listed such a submodule as naming no project
+and refused to read it, where the remote names a project on the instance that
+git reads it from. It now departs from the helper on these two comparisons
+only, and says so where it resolves.
+
+**How we found it**: the review of issue 1317's resolver, which followed the
+helper and found that a sibling namespace and the ssh:// spelling of the
+instance's own SCP remotes, which the resolver before it read, were no longer
+resolved; read from the source on master, not measured.
 
 ## GitLab Orbit (`gitlab-org/orbit/knowledge-graph`)
 

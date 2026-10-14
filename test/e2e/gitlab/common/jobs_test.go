@@ -10,6 +10,7 @@
 package common
 
 import (
+	"bytes"
 	"encoding/base64"
 	"slices"
 	"strings"
@@ -262,6 +263,161 @@ func TestJob_Lifecycle_ArtifactsManualPlayCancelRetryAndErase(t *testing.T) {
 			e.T.Errorf("erase answered job %d, want %d", erased.ID, build.ID)
 		}
 	})
+}
+
+// The job of jobLargeArtifactsCIYAML, and the binary file it writes beside a
+// blob larger than the one MiB a response carries of an archive.
+const (
+	jobLargeArtifactsJob  = "large-artifacts"
+	jobBinaryArtifactPath = "out/logo.bin"
+)
+
+// jobBinaryArtifactBytes is what the job writes to jobBinaryArtifactPath: a
+// PNG signature and four bytes no UTF-8 decoder keeps, which a JSON string
+// used to turn into U+FFFD.
+var jobBinaryArtifactBytes = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00, 0x80}
+
+// jobLargeArtifactsCIYAML runs one job whose archive holds three million
+// random bytes, which no compression brings under a MiB, and the binary file.
+const jobLargeArtifactsCIYAML = `stages:
+  - test
+
+` + jobLargeArtifactsJob + `:
+  stage: test
+  script:
+    - mkdir -p out
+    - head -c 3000000 /dev/urandom > out/blob.bin
+    - |
+      printf '\211PNG\r\n\032\n\377\376\000\200' > ` + jobBinaryArtifactPath + `
+  artifacts:
+    paths:
+      - out/
+    expire_in: 1 day
+  tags: []
+`
+
+// TestJob_Artifacts_LargeArchiveAndBinaryFile runs a pipeline whose archive
+// is larger than a MiB and reads it on every surface: the archive comes back
+// with its real size and no content, where its first MiB used to come back
+// base64-encoded and unopenable, and the binary file in it comes back
+// base64-encoded and byte for byte, where its invalid UTF-8 bytes used to
+// come back as U+FFFD.
+func TestJob_Artifacts_LargeArchiveAndBinaryFile(t *testing.T) {
+	e := harness.New(t, harness.Needs(harness.NeedRunner), harness.Locks(harness.LockRunner))
+
+	harness.SurfacesWith(e, func(e *harness.Env) fixture.Project {
+		project := fixture.NewProject(e, fixture.WithNamePrefix("bigart"))
+		fixture.CommitFile(e, project, project.DefaultBranch, fixture.CIFilePath, jobLargeArtifactsCIYAML, "ci: write a large archive and a binary file")
+		pipeline := fixture.NewPipeline(e, project, project.DefaultBranch)
+		if pipeline.Status != "success" {
+			e.T.Fatalf("pipeline %d ended as %q, want success", pipeline.ID, pipeline.Status)
+		}
+		return project
+	}, func(e *harness.Env, surface harness.Surface, project fixture.Project) {
+		s := e.On(surface)
+		params := map[string]any{"project_id": project.IDParam()}
+		byRef := withParams(params, map[string]any{"ref_name": project.DefaultBranch, "job": jobLargeArtifactsJob})
+
+		archive := harness.Do[jobs.ArtifactsOutput](s, actionJobDownloadArtifacts, byRef)
+		if !archive.Truncated || archive.Content != "" || archive.Size <= 1<<20 {
+			e.T.Errorf("the large archive answered truncated %v, %d bytes, %d characters of content; want its real size over a MiB and no content",
+				archive.Truncated, archive.Size, len(archive.Content))
+		}
+
+		single := harness.Do[jobs.SingleArtifactOutput](s, actionJobDownloadSingleArtifactByRef, withParams(byRef, map[string]any{"artifact_path": jobBinaryArtifactPath}))
+		decoded, err := base64.StdEncoding.DecodeString(single.Content)
+		if single.Encoding != "base64" || err != nil || !bytes.Equal(decoded, jobBinaryArtifactBytes) {
+			e.T.Errorf("the binary artifact answered encoding %q and %x (%v), want base64 of %x", single.Encoding, decoded, err, jobBinaryArtifactBytes)
+		}
+	})
+}
+
+// The job of jobLongLogCIYAML and the line its log ends with.
+const (
+	jobLongLogJob   = "long-log"
+	jobLongLogFatal = "FATAL unit test TestCheckout failed expected 200 got 500"
+)
+
+// jobLongLogCIYAML runs one job that prints three thousand lines, some 160
+// KB with the runner's own output, and then fails with jobLongLogFatal.
+const jobLongLogCIYAML = `stages:
+  - test
+
+` + jobLongLogJob + `:
+  stage: test
+  script:
+    - 'for i in $(seq 1 3000); do echo "installing dependency number $i of the build ......"; done'
+    - 'echo "` + jobLongLogFatal + `"'
+    - exit 1
+  tags: []
+`
+
+// TestJob_Trace_LongLogKeepsItsFailure runs a job whose log is longer than
+// the 100 KB one trace read returns and ends in a failure, and reads it on
+// every surface: the log keeps its end, the failure included, says how much
+// of its beginning it left out, and carries none of the runner's color codes
+// or section markers; tail_lines returns exactly the last lines of that end,
+// and reaches the failure once it asks for as many lines as the failure is
+// from the end. The read used to keep the first 100 KB, so the failure was
+// exactly what it dropped.
+func TestJob_Trace_LongLogKeepsItsFailure(t *testing.T) {
+	e := harness.New(t, harness.Needs(harness.NeedRunner), harness.Locks(harness.LockRunner))
+
+	type run struct {
+		project  fixture.Project
+		pipeline fixture.Pipeline
+	}
+	harness.SurfacesWith(e, func(e *harness.Env) run {
+		project := fixture.NewProject(e, fixture.WithNamePrefix("longlog"))
+		fixture.CommitFile(e, project, project.DefaultBranch, fixture.CIFilePath, jobLongLogCIYAML, "ci: print a long log and fail")
+		pipeline := fixture.NewPipeline(e, project, project.DefaultBranch)
+		if pipeline.Status != "failed" {
+			e.T.Fatalf("pipeline %d ended as %q, want failed", pipeline.ID, pipeline.Status)
+		}
+		return run{project: project, pipeline: pipeline}
+	}, func(e *harness.Env, surface harness.Surface, r run) {
+		s := e.On(surface)
+		listed := harness.Do[jobs.ListOutput](s, actionJobList, map[string]any{"project_id": r.project.IDParam(), "pipeline_id": r.pipeline.ID})
+		job := jobNamed(e, listed, jobLongLogJob)
+		byJob := map[string]any{"project_id": r.project.IDParam(), "job_id": job.ID}
+
+		trace := harness.Do[jobs.TraceOutput](s, actionJobTrace, byJob)
+		if !trace.Truncated || trace.OmittedBytes <= 0 || len(trace.Trace) > 100<<10 {
+			e.T.Errorf("the long log answered truncated %v, %d bytes, %d omitted; want its last 100 KB at most and the rest counted", trace.Truncated, len(trace.Trace), trace.OmittedBytes)
+		}
+		if !strings.Contains(trace.Trace, jobLongLogFatal) {
+			e.T.Errorf("the long log does not carry its failing line %q", jobLongLogFatal)
+		}
+		if strings.Contains(trace.Trace, "\x1b[") || strings.Contains(trace.Trace, "section_start:") {
+			e.T.Errorf("the log still carries terminal markup: %q", firstLine(trace.Trace))
+		}
+
+		// The runner writes lines of its own after the script's last output,
+		// the cleanup section and "ERROR: Job failed" among them, and how many
+		// is the runner's to decide, so the tails are held to the end of the
+		// log read whole: five lines are its last five, and as many lines as
+		// the failure is from the end start at the failure.
+		lines := traceLines(trace.Trace)
+		failure := slices.IndexFunc(lines, func(line string) bool { return strings.Contains(line, jobLongLogFatal) })
+		if failure < 0 || len(lines) < 5 {
+			e.T.Fatalf("the long log read whole has %d lines and its failure at %d, want five or more and the failure", len(lines), failure)
+		}
+		last := harness.Do[jobs.TraceOutput](s, actionJobTrace, withParams(byJob, map[string]any{"tail_lines": 5}))
+		if got := traceLines(last.Trace); !slices.Equal(got, lines[len(lines)-5:]) {
+			e.T.Errorf("tail_lines 5 answered %q, want the last five lines of the log %q", got, lines[len(lines)-5:])
+		}
+		fromFailure := len(lines) - failure
+		reaching := harness.Do[jobs.TraceOutput](s, actionJobTrace, withParams(byJob, map[string]any{"tail_lines": fromFailure}))
+		if got := traceLines(reaching.Trace); len(got) != fromFailure || !strings.Contains(got[0], jobLongLogFatal) {
+			e.T.Errorf("tail_lines %d answered %q, want %d lines starting at the failure", fromFailure, got, fromFailure)
+		}
+	})
+}
+
+// traceLines splits a job log into its lines, the newline that ends the last
+// one dropped.
+func traceLines(trace string) []string {
+	return strings.Split(strings.TrimSuffix(trace, "\n"), "\n")
 }
 
 // TestJob_ProjectWide_ListsAndDeletesArtifacts lists the jobs of a shared
