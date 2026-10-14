@@ -13,10 +13,13 @@ import (
 	"go/parser"
 	"go/token"
 	"log/slog"
+	"maps"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -685,6 +688,138 @@ func TestComplete_ResourceMRIID(t *testing.T) {
 	}
 }
 
+// TestComplete_IIDs_AnOlderOrClosedItem_IsOffered completes a merge request and
+// an issue IID in a project holding more items than one page, two in three of
+// them closed or merged, on both reference types.
+//
+// The completers used to read the 20 newest open items and keep the ones whose
+// IID began with what was typed, so in a project of 500 the IID 12 and the ten
+// after it were never offered, a closed item was never offered at all, and the
+// answer said nothing more matched.
+func TestComplete_IIDs_AnOlderOrClosedItem_IsOffered(t *testing.T) {
+	cases := []struct {
+		name    string
+		items   int
+		typed   string
+		want    []string
+		hasMore bool
+	}{
+		{
+			name: "eleven match and ten are shown", items: 500, typed: "12",
+			want:    []string{"12", "120", "121", "122", "123", "124", "125", "126", "127", "128"},
+			hasMore: true,
+		},
+		{name: "every match is shown", items: 149, typed: "15", want: []string{"15"}},
+		{name: "a longer IID may follow one digit longer", items: 150, typed: "15", want: []string{"15", "150"}, hasMore: true},
+		{name: "a closed item typed whole", items: 500, typed: "300", want: []string{"300"}},
+		{name: "one digit typed", items: 500, typed: "1", want: []string{"1", "10", "11", "12", "13", "14", "15", "16", "17", "18"}, hasMore: true},
+	}
+	for _, argument := range []string{"merge_request_iid", "issue_iid"} {
+		for _, ref := range []string{refPrompt, refResource} {
+			for _, testCase := range cases {
+				t.Run(argument+"/"+ref+"/"+testCase.name, func(t *testing.T) {
+					h := NewHandler(testutil.NewTestClient(t, newIIDListing(t, testCase.items)))
+					req := &mcp.CompleteRequest{}
+					req.Params = &mcp.CompleteParams{
+						Ref:      &mcp.CompleteReference{Type: ref, Name: "review_mr", URI: "gitlab://project/{project_id}/mr/{merge_request_iid}"},
+						Argument: mcp.CompleteParamsArgument{Name: argument, Value: testCase.typed},
+						Context:  &mcp.CompleteContext{Arguments: map[string]string{"project_id": "42"}},
+					}
+
+					result, err := h.Complete(context.Background(), req)
+					if err != nil {
+						t.Fatalf(fmtUnexpectedErr, err)
+					}
+					if !slices.Equal(result.Completion.Values, testCase.want) {
+						t.Errorf("typing %q offered %v, want %v", testCase.typed, result.Completion.Values, testCase.want)
+					}
+					if result.Completion.HasMore != testCase.hasMore {
+						t.Errorf("hasMore = %t, want %t", result.Completion.HasMore, testCase.hasMore)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestComplete_IDs_AnOlderItemTypedWhole_IsOffered completes a pipeline ID, a
+// commit SHA and a job ID in a project holding more of each than one page, on
+// the prompt reference and on the resource templates that carry them.
+//
+// The completers used to read one listing of the 20 newest and keep what began
+// with what was typed, so an older pipeline, commit or job was never offered,
+// even typed whole, and hasMore said nothing more matched. The templates were
+// answered with nothing at all, since only four of their variables were routed.
+func TestComplete_IDs_AnOlderItemTypedWhole_IsOffered(t *testing.T) {
+	cases := []struct {
+		name     string
+		ref      string
+		uri      string
+		argument string
+		typed    string
+		resolved map[string]string
+		want     []string
+		hasMore  bool
+	}{
+		{
+			name: "pipeline on a prompt", ref: refPrompt, argument: "pipeline_id", typed: "7",
+			want: []string{"7"}, hasMore: true,
+		},
+		{
+			name: "pipeline on its template", ref: refResource, uri: "gitlab://project/{project_id}/pipeline/{pipeline_id}",
+			argument: "pipeline_id", typed: "7", want: []string{"7"}, hasMore: true,
+		},
+		{
+			name: "pipeline on the jobs template", ref: refResource, uri: "gitlab://project/{project_id}/pipeline/{pipeline_id}/jobs",
+			argument: "pipeline_id", typed: "7", want: []string{"7"}, hasMore: true,
+		},
+		{
+			name: "commit on a prompt", ref: refPrompt, argument: "sha", typed: "0000000c",
+			want: []string{"0000000c"}, hasMore: true,
+		},
+		{
+			name: "commit on its template, typed in capitals", ref: refResource, uri: "gitlab://project/{project_id}/commit/{sha}",
+			argument: "sha", typed: "0000000C", want: []string{"0000000c"}, hasMore: true,
+		},
+		{
+			name: "job on its template, looked up in the project", ref: refResource, uri: "gitlab://project/{project_id}/job/{job_id}",
+			argument: "job_id", typed: "11", want: []string{"11"}, hasMore: true,
+		},
+		{
+			name: "job on a prompt, in its pipeline", ref: refPrompt, argument: "job_id", typed: "12",
+			resolved: map[string]string{"pipeline_id": "6"}, want: []string{"12"},
+		},
+		{
+			name: "job on a prompt, in another pipeline", ref: refPrompt, argument: "job_id", typed: "3",
+			resolved: map[string]string{"pipeline_id": "6"}, want: []string{},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			h := NewHandler(testutil.NewTestClient(t, newIDListing(t, 500)))
+			arguments := map[string]string{"project_id": "42"}
+			maps.Copy(arguments, testCase.resolved)
+			req := &mcp.CompleteRequest{}
+			req.Params = &mcp.CompleteParams{
+				Ref:      &mcp.CompleteReference{Type: testCase.ref, Name: "review_mr", URI: testCase.uri},
+				Argument: mcp.CompleteParamsArgument{Name: testCase.argument, Value: testCase.typed},
+				Context:  &mcp.CompleteContext{Arguments: arguments},
+			}
+
+			result, err := h.Complete(context.Background(), req)
+			if err != nil {
+				t.Fatalf(fmtUnexpectedErr, err)
+			}
+			if !slices.Equal(result.Completion.Values, testCase.want) {
+				t.Errorf("typing %q offered %v, want %v", testCase.typed, result.Completion.Values, testCase.want)
+			}
+			if result.Completion.HasMore != testCase.hasMore {
+				t.Errorf("hasMore = %t, want %t", result.Completion.HasMore, testCase.hasMore)
+			}
+		})
+	}
+}
+
 // TestComplete_ResourceMRIIDWithoutProjectID verifies that resource merge_request_iid
 // completion returns empty results when no project_id is resolved.
 func TestComplete_ResourceMRIIDWithoutProjectID(t *testing.T) {
@@ -1125,12 +1260,14 @@ func TestComplete_PromptMilestoneTitle_APIError(t *testing.T) {
 
 // TestComplete_PromptJobID verifies that completing a prompt's job_id argument
 // returns jobs for a pipeline when both project_id and pipeline_id are provided.
+// The pipeline is 1, the smallest ID GitLab gives, which the completer has to
+// accept while refusing 0 and below.
 func TestComplete_PromptJobID(t *testing.T) {
 	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v4/projects/42/pipelines/10/jobs" {
+		if r.URL.Path == "/api/v4/projects/42/pipelines/1/jobs" {
 			testutil.RespondJSON(w, http.StatusOK, `[
-				{"id":501,"name":"build","status":"success","pipeline":{"id":10}},
-				{"id":502,"name":"test","status":"running","pipeline":{"id":10}}
+				{"id":501,"name":"build","status":"success","pipeline":{"id":1}},
+				{"id":502,"name":"test","status":"running","pipeline":{"id":1}}
 			]`)
 			return
 		}
@@ -1142,7 +1279,7 @@ func TestComplete_PromptJobID(t *testing.T) {
 	req.Params = &mcp.CompleteParams{
 		Ref:      &mcp.CompleteReference{Type: refPrompt},
 		Argument: mcp.CompleteParamsArgument{Name: "job_id", Value: "50"},
-		Context:  &mcp.CompleteContext{Arguments: map[string]string{"project_id": "42", "pipeline_id": "10"}},
+		Context:  &mcp.CompleteContext{Arguments: map[string]string{"project_id": "42", "pipeline_id": "1"}},
 	}
 
 	result, err := h.Complete(context.Background(), req)
@@ -1216,22 +1353,35 @@ func TestComplete_PromptJobIDWithoutDependencies(t *testing.T) {
 }
 
 // TestComplete_PromptJobIDInvalidPipelineID verifies that job_id completion
-// returns empty results when pipeline_id is not a valid integer.
+// answers empty, asking GitLab nothing, when pipeline_id names no pipeline:
+// not a number, or not a positive one. A zero in particular must not widen the
+// search to every job of the project, which is what the job template asks.
 func TestComplete_PromptJobIDInvalidPipelineID(t *testing.T) {
-	h := NewHandler(testutil.NewTestClient(t, http.NotFoundHandler()))
-	req := &mcp.CompleteRequest{}
-	req.Params = &mcp.CompleteParams{
-		Ref:      &mcp.CompleteReference{Type: refPrompt},
-		Argument: mcp.CompleteParamsArgument{Name: "job_id", Value: "50"},
-		Context:  &mcp.CompleteContext{Arguments: map[string]string{"project_id": "42", "pipeline_id": "not-a-number"}},
-	}
+	for _, pipelineID := range []string{"not-a-number", "0", "-3"} {
+		t.Run(pipelineID, func(t *testing.T) {
+			var requests atomic.Int64
+			h := NewHandler(testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				http.NotFound(w, r)
+			})))
+			req := &mcp.CompleteRequest{}
+			req.Params = &mcp.CompleteParams{
+				Ref:      &mcp.CompleteReference{Type: refPrompt},
+				Argument: mcp.CompleteParamsArgument{Name: "job_id", Value: "50"},
+				Context:  &mcp.CompleteContext{Arguments: map[string]string{"project_id": "42", "pipeline_id": pipelineID}},
+			}
 
-	result, err := h.Complete(context.Background(), req)
-	if err != nil {
-		t.Fatalf(fmtUnexpectedErr, err)
-	}
-	if len(result.Completion.Values) != 0 {
-		t.Errorf("expected empty values for invalid pipeline_id, got %d", len(result.Completion.Values))
+			result, err := h.Complete(context.Background(), req)
+			if err != nil {
+				t.Fatalf(fmtUnexpectedErr, err)
+			}
+			if len(result.Completion.Values) != 0 {
+				t.Errorf("expected empty values for invalid pipeline_id, got %d", len(result.Completion.Values))
+			}
+			if n := requests.Load(); n != 0 {
+				t.Errorf("%d requests were sent for pipeline_id %q, which names no pipeline", n, pipelineID)
+			}
+		})
 	}
 }
 
@@ -1266,10 +1416,12 @@ func TestComplete_APIErrorPaths(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := NewHandler(testutil.NewTestClient(t, errHandler))
+			// A digit, so the IID completers reach the failing GitLab too:
+			// a value no IID begins with is answered without asking.
 			req := &mcp.CompleteRequest{}
 			req.Params = &mcp.CompleteParams{
 				Ref:      &mcp.CompleteReference{Type: tt.refType},
-				Argument: mcp.CompleteParamsArgument{Name: tt.argName, Value: "x"},
+				Argument: mcp.CompleteParamsArgument{Name: tt.argName, Value: "1"},
 				Context:  tt.context,
 			}
 
@@ -1290,16 +1442,16 @@ const fmtExpected1Value = "expected 1 value, got %d"
 // Shared assertion format for unexpected values in format helper tests.
 const fmtUnexpected = "unexpected: %s"
 
-// TestToResult_LimitEnforced verifies that [toResult] caps values at
-// [maxCompletionResults] and sets HasMore when input exceeds the limit.
-// Total is omitted (zero) because [toResult] does not know the upstream count.
-func TestToResult_LimitEnforced(t *testing.T) {
+// TestToResultWithTotal_NoTotal_LimitEnforced verifies that
+// [toResultWithTotal] caps values at [maxCompletionResults] and sets HasMore
+// when input exceeds the limit, and omits a total nobody counted.
+func TestToResultWithTotal_NoTotal_LimitEnforced(t *testing.T) {
 	values := make([]string, 15)
 	for i := range values {
 		values[i] = "item"
 	}
 
-	result := toResult(values)
+	result := toResultWithTotal(values, 0)
 	if len(result.Completion.Values) != maxCompletionResults {
 		t.Errorf("expected %d values, got %d", maxCompletionResults, len(result.Completion.Values))
 	}
@@ -1311,12 +1463,12 @@ func TestToResult_LimitEnforced(t *testing.T) {
 	}
 }
 
-// TestToResult_UnderLimit verifies that [toResult] returns all values and
-// HasMore=false when input is within the limit. Total is omitted because
-// [toResult] does not know the upstream count.
-func TestToResult_UnderLimit(t *testing.T) {
+// TestToResultWithTotal_NoTotal_UnderLimit verifies that [toResultWithTotal]
+// returns all values and HasMore=false when input is within the limit, and
+// omits a total nobody counted.
+func TestToResultWithTotal_NoTotal_UnderLimit(t *testing.T) {
 	values := []string{"a", "b", "c"}
-	result := toResult(values)
+	result := toResultWithTotal(values, 0)
 	if len(result.Completion.Values) != 3 {
 		t.Errorf("expected 3 values, got %d", len(result.Completion.Values))
 	}
@@ -1328,9 +1480,10 @@ func TestToResult_UnderLimit(t *testing.T) {
 	}
 }
 
-// TestToResult_Empty verifies that [toResult] handles an empty input slice.
-func TestToResult_Empty(t *testing.T) {
-	result := toResult([]string{})
+// TestToResultWithTotal_Empty verifies that [toResultWithTotal] handles an
+// empty input slice.
+func TestToResultWithTotal_Empty(t *testing.T) {
+	result := toResultWithTotal([]string{}, 0)
 	if len(result.Completion.Values) != 0 {
 		t.Errorf("expected 0 values, got %d", len(result.Completion.Values))
 	}
@@ -1887,15 +2040,21 @@ var completableArguments = []struct {
 	{name: "group_id", ref: refResource},
 	{name: "merge_request_iid", ref: refResource, resolved: map[string]string{"project_id": "42"}},
 	{name: "issue_iid", ref: refResource, resolved: map[string]string{"project_id": "42"}},
+	{name: "pipeline_id", ref: refResource, resolved: map[string]string{"project_id": "42"}},
+	{name: "sha", ref: refResource, resolved: map[string]string{"project_id": "42"}},
+	{name: "job_id", ref: refResource, resolved: map[string]string{"project_id": "42"}},
 }
 
 // completeRequest builds a completion request for one argument, with the
 // sibling arguments the dispatcher needs already resolved.
 func completeRequest(ref, name string, resolved map[string]string) *mcp.CompleteRequest {
+	// A digit, because it is a value every completer sends to GitLab: an IID,
+	// a pipeline or a job is made of digits, and a value nothing of the kind
+	// begins with is answered without asking.
 	req := &mcp.CompleteRequest{}
 	req.Params = &mcp.CompleteParams{
 		Ref:      &mcp.CompleteReference{Type: ref, Name: "review_mr"},
-		Argument: mcp.CompleteParamsArgument{Name: name, Value: "a"},
+		Argument: mcp.CompleteParamsArgument{Name: name, Value: "1"},
 	}
 	if len(resolved) > 0 {
 		req.Params.Context = &mcp.CompleteContext{Arguments: resolved}
@@ -2091,4 +2250,274 @@ func TestComplete_AnAbandonedRequest_IsNotBlamedOnTheWiring(t *testing.T) {
 	if strings.Contains(logged.String(), toolutil.UnattributedRequestMessage) {
 		t.Errorf("a client that pressed stop was logged at warn as a wiring defect:\n%s", logged.String())
 	}
+}
+
+// The two listings the IID completers read, for project 42.
+const (
+	pathProjectMergeRequests = "/api/v4/projects/42/merge_requests"
+	pathProjectIssues        = "/api/v4/projects/42/issues"
+)
+
+// iidListing answers project 42's merge request and issue listings the way
+// GitLab does, over items whose IIDs run from 1 to n in the order they were
+// created.
+//
+// It honors everything that decides which items a page holds: iids[], state,
+// the creation order in either direction, per_page and page, and it sets the
+// pagination headers GitLab sets. Two items in three are closed or merged, so
+// a completer that asks for open items only loses them. It also refuses, as
+// GitLab's own nginx does, a query string longer than
+// [iidListingQueryLimit].
+type iidListing struct {
+	t     *testing.T
+	n     int
+	mu    sync.Mutex
+	asked []url.Values
+}
+
+// newIIDListing returns a listing of n items.
+func newIIDListing(t *testing.T, n int) *iidListing {
+	t.Helper()
+	return &iidListing{t: t, n: n}
+}
+
+// iidListingState is the state the listing gives an item: open, closed and
+// merged in turn, the first one open.
+func iidListingState(iid int) string {
+	switch iid % 3 {
+	case 1:
+		return "opened"
+	case 2:
+		return "merged"
+	default:
+		return "closed"
+	}
+}
+
+// iidListingQueryLimit is the longest query string the listing answers, as
+// client-go encodes it.
+//
+// GitLab writes the request's query string into every link of the Link header
+// it answers a listing with, and the nginx a GitLab package bundles refuses
+// response headers over its 4 KiB buffer with a 502 ("upstream sent too big
+// header"). Measured on CE 19.4.2, an issue listing naming the 111 IIDs that
+// begin with 1 up to two digits longer was refused, and one naming the 100
+// from 100 to 199 was not; a longer instance URL or project path takes the
+// line lower, so the stand-in draws it at 1 KiB.
+const iidListingQueryLimit = 1024
+
+// ServeHTTP answers one listing request.
+func (l *iidListing) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != pathProjectMergeRequests && r.URL.Path != pathProjectIssues {
+		http.NotFound(w, r)
+		return
+	}
+	query := r.URL.Query()
+	l.mu.Lock()
+	l.asked = append(l.asked, query)
+	l.mu.Unlock()
+
+	if len(r.URL.RawQuery) > iidListingQueryLimit {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+
+	if orderBy := query.Get("order_by"); orderBy != "" && orderBy != "created_at" {
+		l.t.Errorf("order_by = %q; the listing orders by creation only", orderBy)
+	}
+	wanted := map[int]bool{}
+	for _, raw := range query["iids[]"] {
+		iid, err := strconv.Atoi(raw)
+		if err != nil {
+			l.t.Errorf("iids[] carried %q, which GitLab refuses as an integer", raw)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		wanted[iid] = true
+	}
+	var items []int
+	for iid := 1; iid <= l.n; iid++ {
+		if len(wanted) > 0 && !wanted[iid] {
+			continue
+		}
+		if state := query.Get("state"); state != "" && state != "all" && state != iidListingState(iid) {
+			continue
+		}
+		items = append(items, iid)
+	}
+	if query.Get("sort") != "asc" {
+		slices.Reverse(items)
+	}
+	perPage := listingParam(query, "per_page", 20)
+	page := listingParam(query, "page", 1)
+	start := min((page-1)*perPage, len(items))
+	end := min(start+perPage, len(items))
+	body := make([]string, 0, end-start)
+	for _, iid := range items[start:end] {
+		body = append(body, `{"id":`+strconv.Itoa(1000+iid)+`,"iid":`+strconv.Itoa(iid)+
+			`,"title":"Item","state":"`+iidListingState(iid)+`"}`)
+	}
+	headers := testutil.PaginationHeaders{Page: strconv.Itoa(page), PerPage: strconv.Itoa(perPage), Total: strconv.Itoa(len(items))}
+	if end < len(items) {
+		headers.NextPage = strconv.Itoa(page + 1)
+	}
+	testutil.RespondJSONWithPagination(w, http.StatusOK, "["+strings.Join(body, ",")+"]", headers)
+}
+
+// requests returns the query of every request the listing answered.
+func (l *iidListing) requests() []url.Values {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.asked)
+}
+
+// idListing answers project 42's pipelines, jobs and commits the way GitLab
+// does, over n of each numbered from 1 in the order they were created: every
+// listing newest first and paged with GitLab's headers, and each item looked up
+// by its ID or SHA, with a 404 for one that does not exist.
+//
+// Job j belongs to pipeline (j+1)/2, so pipeline p holds jobs 2p-1 and 2p.
+// Commit i's SHA is i in hexadecimal, padded to eight digits, followed by 32
+// a's; a lookup by a prefix of four characters or more finds the one commit it
+// begins, as git resolves an abbreviated object name.
+type idListing struct {
+	t     *testing.T
+	n     int
+	mu    sync.Mutex
+	paths []string
+}
+
+// newIDListing returns a listing of n pipelines, n jobs and n commits.
+func newIDListing(t *testing.T, n int) *idListing {
+	t.Helper()
+	return &idListing{t: t, n: n}
+}
+
+// idListingSHA is commit i's SHA.
+func idListingSHA(i int) string {
+	hex := strconv.FormatInt(int64(i), 16)
+	return strings.Repeat("0", 8-len(hex)) + hex + strings.Repeat("a", 32)
+}
+
+// ServeHTTP answers one request.
+func (l *idListing) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rest, ok := strings.CutPrefix(r.URL.Path, "/api/v4/projects/42/")
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	l.mu.Lock()
+	l.paths = append(l.paths, rest)
+	l.mu.Unlock()
+
+	newest := func(ids []int) []int {
+		slices.Reverse(ids)
+		return ids
+	}
+	all := make([]int, 0, l.n)
+	for id := 1; id <= l.n; id++ {
+		all = append(all, id)
+	}
+	switch {
+	case rest == "pipelines":
+		l.page(w, r, newest(all), idListingPipeline)
+	case strings.HasPrefix(rest, "pipelines/") && strings.HasSuffix(rest, "/jobs"):
+		pipeline, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(rest, "pipelines/"), "/jobs"))
+		var jobs []int
+		for _, job := range []int{2*pipeline - 1, 2 * pipeline} {
+			if job >= 1 && job <= l.n {
+				jobs = append(jobs, job)
+			}
+		}
+		l.page(w, r, newest(jobs), idListingJob)
+	case strings.HasPrefix(rest, "pipelines/"):
+		l.one(w, strings.TrimPrefix(rest, "pipelines/"), idListingPipeline)
+	case rest == "jobs":
+		l.page(w, r, newest(all), idListingJob)
+	case strings.HasPrefix(rest, "jobs/"):
+		l.one(w, strings.TrimPrefix(rest, "jobs/"), idListingJob)
+	case rest == "repository/commits":
+		l.page(w, r, newest(all), idListingCommit)
+	case strings.HasPrefix(rest, "repository/commits/"):
+		ref := strings.TrimPrefix(rest, "repository/commits/")
+		found := 0
+		for id := 1; id <= l.n && len(ref) >= 4; id++ {
+			if strings.HasPrefix(idListingSHA(id), ref) {
+				found = id
+				break
+			}
+		}
+		if found == 0 {
+			testutil.RespondJSON(w, http.StatusNotFound, `{"message":"404 Commit Not Found"}`)
+			return
+		}
+		testutil.RespondJSON(w, http.StatusOK, idListingCommit(found))
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// one answers the lookup of one numbered item.
+func (l *idListing) one(w http.ResponseWriter, raw string, render func(int) string) {
+	id, err := strconv.Atoi(raw)
+	if err != nil || id < 1 || id > l.n {
+		testutil.RespondJSON(w, http.StatusNotFound, `{"message":"404 Not found"}`)
+		return
+	}
+	testutil.RespondJSON(w, http.StatusOK, render(id))
+}
+
+// page answers one page of a listing of ids, already in GitLab's order.
+func (l *idListing) page(w http.ResponseWriter, r *http.Request, ids []int, render func(int) string) {
+	query := r.URL.Query()
+	perPage := listingParam(query, "per_page", 20)
+	page := listingParam(query, "page", 1)
+	start := min((page-1)*perPage, len(ids))
+	end := min(start+perPage, len(ids))
+	body := make([]string, 0, end-start)
+	for _, id := range ids[start:end] {
+		body = append(body, render(id))
+	}
+	headers := testutil.PaginationHeaders{Page: strconv.Itoa(page), PerPage: strconv.Itoa(perPage)}
+	if end < len(ids) {
+		headers.NextPage = strconv.Itoa(page + 1)
+	}
+	testutil.RespondJSONWithPagination(w, http.StatusOK, "["+strings.Join(body, ",")+"]", headers)
+}
+
+// requested returns the path, below the project, of every request answered.
+func (l *idListing) requested() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.paths)
+}
+
+// idListingPipeline renders pipeline id.
+func idListingPipeline(id int) string {
+	return `{"id":` + strconv.Itoa(id) + `,"iid":` + strconv.Itoa(id) + `,"ref":"main","status":"success"}`
+}
+
+// idListingJob renders job id, in pipeline (id+1)/2.
+func idListingJob(id int) string {
+	return `{"id":` + strconv.Itoa(id) + `,"name":"build","status":"success","pipeline":{"id":` + strconv.Itoa((id+1)/2) + `}}`
+}
+
+// idListingCommit renders commit id.
+func idListingCommit(id int) string {
+	sha := idListingSHA(id)
+	return `{"id":"` + sha + `","short_id":"` + sha[:8] + `","title":"Commit ` + strconv.Itoa(id) + `"}`
+}
+
+// listingParam reads a positive integer parameter, or GitLab's default for it
+// when the request did not send one.
+func listingParam(query url.Values, name string, fallback int) int {
+	raw := query.Get(name)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return fallback
+	}
+	return value
 }

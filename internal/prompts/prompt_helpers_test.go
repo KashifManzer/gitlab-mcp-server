@@ -1782,3 +1782,106 @@ func TestMergeDuration_OnlyOneOfTheTwoTimestamps_IsZeroRatherThanADereference(t 
 		})
 	}
 }
+
+// pinClock makes every reading of the clock in this package answer at until the
+// test ends. No test of this package runs in parallel, which is what makes a
+// package-level seam safe to swap.
+func pinClock(t *testing.T, at time.Time) {
+	t.Helper()
+	previous := timeNow
+	timeNow = func() time.Time { return at }
+	t.Cleanup(func() { timeNow = previous })
+}
+
+// TestEventsAfter_SendsTheUTCDayBeforeTheFirstDayWanted pins the one date
+// rule every events request of this package follows.
+//
+// GitLab keeps the events created after the end of the after day, so the date
+// to send is the day before the first one wanted, and the day is the UTC one:
+// an instant late on 4 October in UTC that a local clock already calls
+// 5 October still wants 4 October read whole.
+func TestEventsAfter_SendsTheUTCDayBeforeTheFirstDayWanted(t *testing.T) {
+	madrid := time.FixedZone("CEST", 2*60*60)
+	tests := []struct {
+		name  string
+		first time.Time
+		want  string
+	}{
+		{name: "midnight UTC", first: time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC), want: "2026-10-04"},
+		{name: "the last instant of a UTC day", first: time.Date(2026, 10, 5, 23, 59, 59, 0, time.UTC), want: "2026-10-04"},
+		{name: "a local instant whose UTC day is the day before", first: time.Date(2026, 10, 5, 1, 0, 0, 0, madrid), want: "2026-10-03"},
+		{name: "the first of a month", first: time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC), want: "2026-10-31"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := eventsAfter(tt.first).String(); got != tt.want {
+				t.Errorf("eventsAfter(%s) = %s, want %s", tt.first, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestThreadState_ReadsADiscussionAsGitLabResolvesIt pins the one rule both
+// discussion-counting prompts share: a thread is a discussion, not a note.
+//
+// GitLab resolves per discussion. ResolvableDiscussion#resolvable? holds when
+// any of its notes is resolvable, and #resolved? when none of its resolvable
+// notes is still to be resolved; resolving one updates every note. Counting
+// per note, as both prompts used to, made one thread with two replies read as
+// three unresolved threads, which is enough to tip release_readiness past its
+// not-ready threshold on a merge request with a single open question.
+func TestThreadState_ReadsADiscussionAsGitLabResolvesIt(t *testing.T) {
+	tests := []struct {
+		name           string
+		notes          []*gl.Note
+		wantResolvable bool
+		wantUnresolved bool
+	}{
+		{name: "no notes", notes: nil},
+		{
+			name:  "a plain comment is no thread",
+			notes: []*gl.Note{{Resolvable: false}},
+		},
+		{
+			name:  "a system note is no thread even when it claims to be resolvable",
+			notes: []*gl.Note{{Resolvable: true, System: true}},
+		},
+		{
+			name: "an opening note and two replies, all unresolved, are one unresolved thread",
+			notes: []*gl.Note{
+				{Resolvable: true}, {Resolvable: true}, {Resolvable: true},
+			},
+			wantResolvable: true, wantUnresolved: true,
+		},
+		{
+			name: "a resolved thread with a comment beside it is one resolved thread",
+			notes: []*gl.Note{
+				{Resolvable: true, Resolved: true}, {Resolvable: false}, {Resolvable: true, Resolved: true},
+			},
+			wantResolvable: true,
+		},
+		{
+			name: "one note still to resolve leaves the whole thread unresolved",
+			notes: []*gl.Note{
+				{Resolvable: true, Resolved: true}, {Resolvable: true, Resolved: false},
+			},
+			wantResolvable: true, wantUnresolved: true,
+		},
+		{
+			name: "a resolved note on a non-resolvable comment does not resolve anything",
+			notes: []*gl.Note{
+				{Resolvable: false, Resolved: false}, {Resolvable: true, Resolved: true},
+			},
+			wantResolvable: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolvable, unresolved := threadState(&gl.Discussion{ID: "d", Notes: tt.notes})
+			if resolvable != tt.wantResolvable || unresolved != tt.wantUnresolved {
+				t.Errorf("threadState() = (resolvable %v, unresolved %v), want (%v, %v)",
+					resolvable, unresolved, tt.wantResolvable, tt.wantUnresolved)
+			}
+		})
+	}
+}

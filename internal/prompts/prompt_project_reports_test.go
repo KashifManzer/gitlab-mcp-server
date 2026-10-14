@@ -269,7 +269,26 @@ func TestMRDiscussionHealth_MissingProjectID(t *testing.T) {
 
 // unassigned_items.
 
-// TestUnassignedItems_FindsUnownedItems verifies UnassignedItems when finds unowned items.
+// answerLikeGitLabsAssigneeFilter writes body when the request asks for the
+// items with no assignee the way GitLab reads that question, and an empty list
+// otherwise. Issuables::AssigneeFilter treats an assignee_id as "no assignee"
+// only when it is None (FILTER_NONE, compared case-insensitively); any other
+// value, 0 included, runs assigned_to with that id and matches nothing, since no
+// user has id 0. A mock that ignored the parameter could not tell the prompt
+// asking for None from one asking for a user who does not exist.
+func answerLikeGitLabsAssigneeFilter(w http.ResponseWriter, r *http.Request, body string) {
+	if !strings.EqualFold(r.URL.Query().Get("assignee_id"), "None") {
+		respondJSON(w, http.StatusOK, `[]`)
+		return
+	}
+	respondJSON(w, http.StatusOK, body)
+}
+
+// TestUnassignedItems_FindsUnownedItems verifies that the report counts the
+// items GitLab answers for assignee_id=None, which is the only value its filter
+// reads as "no assignee". The prompt used to send 0, which GitLab reads as a
+// user id, so a real instance answered nothing and the report congratulated a
+// project full of unowned work.
 func TestUnassignedItems_FindsUnownedItems(t *testing.T) {
 	created := time.Now().Add(-48 * time.Hour)
 	mux := http.NewServeMux()
@@ -282,7 +301,7 @@ func TestUnassignedItems_FindsUnownedItems(t *testing.T) {
 			},
 		}
 		data, _ := json.Marshal(mrs)
-		respondJSON(w, http.StatusOK, string(data))
+		answerLikeGitLabsAssigneeFilter(w, r, string(data))
 	})
 	mux.HandleFunc("GET /api/v4/projects/{project}/issues", func(w http.ResponseWriter, r *http.Request) {
 		issues := []*gl.Issue{
@@ -290,7 +309,7 @@ func TestUnassignedItems_FindsUnownedItems(t *testing.T) {
 			{IID: 6, Title: "Task without owner", State: "opened", CreatedAt: &created, WebURL: "http://example.com/issues/6"},
 		}
 		data, _ := json.Marshal(issues)
-		respondJSON(w, http.StatusOK, string(data))
+		answerLikeGitLabsAssigneeFilter(w, r, string(data))
 	})
 
 	session := newMCPSession(t, mux)
@@ -666,6 +685,11 @@ func TestProjectEventDays_ReadsEachTimestampGitLabSendsAndSkipsWhatItCannot(t *t
 // never zero for one merge request and non-zero for another in the same run, so
 // the summary could count every merge request that has any thread at all. The
 // whole point of the report is to name the ones still waiting on somebody.
+//
+// A thread is a discussion, as GitLab resolves it, so the first merge
+// request's unresolved thread carries two replies and its resolved one a reply
+// of its own: counted per note they would read as five threads and three
+// unresolved.
 func TestMRDiscussionHealth_ThreadsAndUnresolvedThreadsAreCountedSeparately(t *testing.T) {
 	mux := http.NewServeMux()
 	// The third merge request carries no author, which is what GitLab sends for
@@ -679,11 +703,20 @@ func TestMRDiscussionHealth_ThreadsAndUnresolvedThreadsAreCountedSeparately(t *t
 		]`)
 	})
 	mux.HandleFunc("GET /api/v4/projects/{project}/merge_requests/1/discussions", func(w http.ResponseWriter, _ *http.Request) {
-		respondJSON(w, http.StatusOK, `[{"id":"d1","notes":[
-			{"id":1,"resolvable":true,"resolved":false},
-			{"id":2,"resolvable":true,"resolved":true},
-			{"id":3,"resolvable":false,"resolved":false}
-		]}]`)
+		respondJSON(w, http.StatusOK, `[
+			{"id":"d1","notes":[
+				{"id":1,"resolvable":true,"resolved":false},
+				{"id":2,"resolvable":true,"resolved":false},
+				{"id":3,"resolvable":true,"resolved":false}
+			]},
+			{"id":"d1b","notes":[
+				{"id":5,"resolvable":true,"resolved":true},
+				{"id":6,"resolvable":true,"resolved":true}
+			]},
+			{"id":"d1c","individual_note":true,"notes":[
+				{"id":7,"resolvable":false,"resolved":false}
+			]}
+		]`)
 	})
 	mux.HandleFunc("GET /api/v4/projects/{project}/merge_requests/{iid}/discussions", func(w http.ResponseWriter, _ *http.Request) {
 		respondJSON(w, http.StatusOK, `[{"id":"d2","notes":[{"id":4,"resolvable":true,"resolved":true}]}]`)

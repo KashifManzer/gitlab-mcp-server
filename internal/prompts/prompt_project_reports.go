@@ -128,11 +128,10 @@ func handleProjectActivityReport(ctx context.Context, client *gitlabclient.Clien
 		return nil, err
 	}
 	since := sinceDate(days)
-	sinceISO := gl.ISOTime(since)
 
 	// Project events
 	events, _, err := client.GL().Events.ListProjectVisibleEvents(projectID, &gl.ListProjectVisibleEventsOptions{
-		After:   &sinceISO,
+		After:   eventsAfter(since),
 		PerPage: maxListItems,
 	}, gl.WithContext(ctx))
 	if err != nil {
@@ -383,16 +382,17 @@ func collectMRDiscussionInfos(ctx context.Context, client *gitlabclient.Client, 
 	return infos
 }
 
-// countDiscussionThreads tallies resolvable and unresolved notes in discussions.
+// countDiscussionThreads tallies the resolvable and the unresolved threads of
+// a merge request, one per discussion as [threadState] reads it, so a question
+// with replies is one thread rather than one per note.
 func countDiscussionThreads(info *mrDiscussionInfo, discussions []*gl.Discussion) {
 	for _, d := range discussions {
-		for _, n := range d.Notes {
-			if n.Resolvable {
-				info.threads++
-				if !n.Resolved {
-					info.unresolved++
-				}
-			}
+		resolvable, unresolved := threadState(d)
+		if resolvable {
+			info.threads++
+		}
+		if unresolved {
+			info.unresolved++
 		}
 	}
 }
@@ -419,10 +419,14 @@ func handleUnassignedItems(ctx context.Context, client *gitlabclient.Client, req
 		return nil, toolutil.InvalidParams(errors.New("unassigned_items: project_id is required"))
 	}
 
+	// GitLab's assignee filter reads "no assignee" from assignee_id=None alone:
+	// any other value, 0 included, is a user id, and no user has id 0, so the
+	// lists would come back empty whatever the project holds.
+
 	// Unassigned MRs
 	unassignedMRs, _, err := client.GL().MergeRequests.ListProjectMergeRequests(projectID, &gl.ListProjectMergeRequestsOptions{
 		State:      new("opened"),
-		AssigneeID: gl.AssigneeID(0),
+		AssigneeID: gl.AssigneeID(gl.UserIDNone),
 		PerPage:    maxListItems,
 	}, gl.WithContext(ctx))
 	warnFetch(ctx, "unassigned merge requests", err)
@@ -430,7 +434,7 @@ func handleUnassignedItems(ctx context.Context, client *gitlabclient.Client, req
 	// Unassigned issues
 	unassignedIssues, _, err := client.GL().Issues.ListProjectIssues(projectID, &gl.ListProjectIssuesOptions{
 		State:      new("opened"),
-		AssigneeID: gl.AssigneeID(0),
+		AssigneeID: gl.AssigneeID(gl.UserIDNone),
 		PerPage:    maxListItems,
 	}, gl.WithContext(ctx))
 	warnFetch(ctx, "unassigned issues", err)
