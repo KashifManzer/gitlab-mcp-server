@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +22,21 @@ import (
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
 )
+
+// TestUpdate_EmptyMilestones_ReachTheBody holds a release's milestones to []
+// detaching every one. The handler used to drop an empty list and answer with
+// the milestones still attached (issue 1306).
+func TestUpdate_EmptyMilestones_ReachTheBody(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[UpdateInput](map[string]any{"project_id": "42", "tag_name": "v1", "milestones": []any{}})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	client, recorder := testutil.RecordWrites(t, `{}`, `{"tag_name":"v1","name":"v1"}`)
+	if _, err = Update(t.Context(), client, input); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	recorder.AssertMembers(t, map[string]string{"milestones": `[]`})
+}
 
 // Test constants for release API endpoint paths and expected values.
 const (
@@ -1227,6 +1244,64 @@ func TestCreate_RefusedAsExisting_CarriesTheHint(t *testing.T) {
 	}
 }
 
+// TestCreate_RefWanted_SaysTheTagDoesNotExist holds GitLab's 422 "Ref is not
+// specified" to a hint about the missing tag rather than about a release that
+// already exists. GitLab answers so when the tag names no existing tag and the
+// caller gave no ref to create it from; the hint used to say a release for the
+// tag might already exist, which sent the caller to release.update for a
+// release that was never there (issue 1333, part 6).
+func TestCreate_RefWanted_SaysTheTagDoesNotExist(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusUnprocessableEntity, `{"message":"Ref is not specified"}`)
+	}))
+	_, err := Create(context.Background(), client, CreateInput{ProjectID: "42", TagName: "v9.9.9"})
+	if err == nil {
+		t.Fatal("expected an error for a 422")
+	}
+	for _, want := range []string{"does not exist", "ref", "tag.create"} {
+		t.Run(want, func(t *testing.T) {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want it to mention %q", err, want)
+			}
+		})
+	}
+	if strings.Contains(err.Error(), "may already exist") {
+		t.Errorf("error = %q, which still says the release may already exist", err)
+	}
+}
+
+// TestCreate_PermissionRefusal_NamesTheRole holds a refusal of a missing
+// permission to the hint naming the role a release needs, at 401 as well as
+// 403: GitLab answers a missing permission with 401 at some routes (entry 55
+// of docs/development/upstream-bugs.md), so a hint keyed on 403 alone was
+// never shown there. A refusal of the token itself names no role.
+func TestCreate_PermissionRefusal_NamesTheRole(t *testing.T) {
+	const roleHint = "Developer role or higher"
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		wantHint bool
+	}{
+		{"401 with no token error", http.StatusUnauthorized, `{"message":"401 Unauthorized"}`, true},
+		{"403 with no token error", http.StatusForbidden, `{"message":"403 Forbidden"}`, true},
+		{"401 for a revoked token", http.StatusUnauthorized, `{"error":"invalid_token","error_description":"Token was revoked. You have to re-authorize from the user."}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				testutil.RespondJSON(w, tc.status, tc.body)
+			}))
+			_, err := Create(context.Background(), client, CreateInput{ProjectID: "42", TagName: "v1.0.0"})
+			if err == nil {
+				t.Fatalf("Create() error = nil, want the %d reported", tc.status)
+			}
+			if got := strings.Contains(err.Error(), roleHint); got != tc.wantHint {
+				t.Errorf("Create() error = %q, carries the role hint = %t, want %t", err, got, tc.wantHint)
+			}
+		})
+	}
+}
+
 // TestCreate_ForbiddenError covers the 403 error branch in Create.
 func TestCreate_ForbiddenError(t *testing.T) {
 	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1833,37 +1908,40 @@ func TestReleaseUpdate_SendsTheTitleAndNotesItWasGiven(t *testing.T) {
 	}
 }
 
-// TestReleaseUpdate_PartialUpdateSendsNullTitleAndNoMilestones records what an
-// update that changes only the release date puts on the wire, which is two
-// separate facts about the same body.
+// TestReleaseUpdate_PartialUpdate_SendsOnlyWhatTheCallerSet holds the body of
+// an update to the keys the caller set and no other.
 //
-// The milestones key is absent, and must stay absent: its guard is a length
-// comparison whose relaxation attaches a pointer to an empty slice, and GitLab
-// documents an empty milestones value as "remove every milestone".
-//
-// The title and the notes, by contrast, are sent as explicit nulls, because
-// client-go's UpdateReleaseOptions spells those two fields without
-// `omitempty`. That is recorded rather than endorsed: this test is what fails,
-// deliberately, on the day the SDK adds the tag and the nulls stop being sent.
-func TestReleaseUpdate_PartialUpdateSendsNullTitleAndNoMilestones(t *testing.T) {
-	client, body := capturedRequest(t, http.MethodPut, pathReleaseV120, http.StatusOK,
-		`{"tag_name":"v1.2.0","name":"Untouched","description":"untouched"}`)
-
-	if _, err := Update(context.Background(), client, UpdateInput{
-		ProjectID:  "42",
-		TagName:    testTagV120,
-		ReleasedAt: "2026-01-15T10:00:00Z",
-	}); err != nil {
-		t.Fatalf("Update() unexpected error: %v", err)
+// client-go's UpdateReleaseOptions spells the title and the notes without
+// `omitempty`, so an update that left them out sent both as null, and GitLab
+// stores what it is sent: the notes were erased and the title fell back to
+// the tag on every update of the release date or the milestones (issue 1305,
+// upstream register row 121). The milestones key stays absent too, since
+// GitLab documents an empty milestones value as "remove every milestone".
+func TestReleaseUpdate_PartialUpdate_SendsOnlyWhatTheCallerSet(t *testing.T) {
+	tests := []struct {
+		name  string
+		input UpdateInput
+		want  []string
+	}{
+		{"released_at alone", UpdateInput{ReleasedAt: "2026-01-15T10:00:00Z"}, []string{"released_at"}},
+		{"milestones alone", UpdateInput{Milestones: []string{"m1"}}, []string{"milestones"}},
+		{"name alone", UpdateInput{Name: "Renamed"}, []string{"name"}},
+		{"description alone", UpdateInput{Description: "rewritten"}, []string{"description"}},
 	}
-
-	if strings.Contains(string(*body), `"milestones"`) {
-		t.Errorf("request carries milestones although the caller gave none: %s", string(*body))
-	}
-	for _, key := range []string{"name", "description"} {
-		t.Run(key, func(t *testing.T) {
-			if !strings.Contains(string(*body), `"`+key+`":null`) {
-				t.Errorf("client-go no longer sends %q as null: %s", key, string(*body))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, body := capturedRequest(t, http.MethodPut, pathReleaseV120, http.StatusOK,
+				`{"tag_name":"v1.2.0","name":"Untouched","description":"untouched"}`)
+			tt.input.ProjectID, tt.input.TagName = "42", testTagV120
+			if _, err := Update(context.Background(), client, tt.input); err != nil {
+				t.Fatalf("Update() unexpected error: %v", err)
+			}
+			var sent map[string]json.RawMessage
+			if err := json.Unmarshal(*body, &sent); err != nil {
+				t.Fatalf("unmarshal request body: %v; body=%q", err, string(*body))
+			}
+			if got := slices.Sorted(maps.Keys(sent)); !slices.Equal(got, tt.want) {
+				t.Errorf("update body keys = %v, want %v; body=%s", got, tt.want, string(*body))
 			}
 		})
 	}

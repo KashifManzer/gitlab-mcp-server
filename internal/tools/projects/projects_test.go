@@ -29,6 +29,119 @@ import (
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
 )
 
+// TestUpdate_EmptyValues_ReachTheBody holds every text setting of a project
+// that an empty value empties, and every list [] empties, to reaching GitLab.
+// The handler used to drop each of them and answer with the old values as an
+// update (issue 1306).
+func TestUpdate_EmptyValues_ReachTheBody(t *testing.T) {
+	texts := []string{
+		"description", "merge_commit_template", "squash_commit_template", "suggestion_commit_message",
+		"ci_config_path", "mr_default_title_template", "issue_branch_template", "merge_request_title_regex",
+		"merge_request_title_regex_description", "external_authorization_classification_label",
+	}
+	params := map[string]any{
+		"project_id":                             "42",
+		"topics":                                 []any{},
+		"tag_list":                               []any{},
+		"container_expiration_policy_attributes": map[string]any{"name_regex_delete": "", "name_regex_keep": ""},
+	}
+	// client-go copies name_regex_delete into the deprecated name_regex the
+	// API still reads, so the empty value reaches both.
+	want := map[string]string{
+		"topics":                                 `[]`,
+		"tag_list":                               `[]`,
+		"container_expiration_policy_attributes": `{"name_regex_delete":"","name_regex_keep":"","name_regex":""}`,
+	}
+	for _, name := range texts {
+		params[name] = ""
+		want[name] = `""`
+	}
+	input, err := toolutil.UnmarshalParams[UpdateInput](params)
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	client, recorder := testutil.RecordWrites(t, `{}`, projectJSON)
+	if _, err = Update(t.Context(), client, input); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	recorder.AssertMembers(t, want)
+}
+
+// TestUpdate_ZeroSettings_ReachTheBody holds a 0 for each integer setting
+// GitLab stores 0 for, or refuses with a reason, to the body: no approvals
+// before a merge, a full clone for CI, and a mirror user of nobody are values
+// of their own, and a job timeout of 0 is GitLab's to refuse ("needs to be
+// between 10 minutes and 1 month") rather than this server's to drop. The
+// handler forwarded each only when it was above 0, so the update reported
+// success with the setting unchanged (issue 1306).
+func TestUpdate_ZeroSettings_ReachTheBody(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[UpdateInput](map[string]any{
+		"project_id": "42", "approvals_before_merge": 0, "ci_default_git_depth": 0, "build_timeout": 0, "mirror_user_id": 0,
+	})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	client, recorder := testutil.RecordWrites(t, `{}`, projectJSON)
+	if _, err = Update(t.Context(), client, input); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	recorder.AssertMembers(t, map[string]string{
+		"approvals_before_merge": "0", "ci_default_git_depth": "0", "build_timeout": "0", "mirror_user_id": "0",
+	})
+}
+
+// TestUpdate_ZeroLimits_GoOutAsNull holds a max_artifacts_size and a
+// ci_delete_pipelines_in_seconds of 0 to null in the body. GitLab stores
+// neither as 0 (the artifact size must be above 0, and pipelines are kept at
+// least a day), and null is what puts each back to its default: the instance's
+// artifact size limit, and pipelines kept for ever. client-go's pointers are
+// tagged omitempty and cannot carry a null (issue 1306, upstream register row
+// 122).
+func TestUpdate_ZeroLimits_GoOutAsNull(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[UpdateInput](map[string]any{
+		"project_id": "42", "max_artifacts_size": 0, "ci_delete_pipelines_in_seconds": 0,
+	})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	client, recorder := testutil.RecordWrites(t, `{}`, projectJSON)
+	if _, err = Update(t.Context(), client, input); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	recorder.AssertMembers(t, map[string]string{"max_artifacts_size": "null", "ci_delete_pipelines_in_seconds": "null"})
+}
+
+// TestUpdate_PositiveLimits_ReachTheBody holds a max_artifacts_size and a
+// ci_delete_pipelines_in_seconds above 0 to the body as given.
+func TestUpdate_PositiveLimits_ReachTheBody(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[UpdateInput](map[string]any{
+		"project_id": "42", "max_artifacts_size": 50, "ci_delete_pipelines_in_seconds": 86400,
+	})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	client, recorder := testutil.RecordWrites(t, `{}`, projectJSON)
+	if _, err = Update(t.Context(), client, input); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	recorder.AssertMembers(t, map[string]string{"max_artifacts_size": "50", "ci_delete_pipelines_in_seconds": "86400"})
+}
+
+// TestEditHook_EmptyValues_ReachTheBody holds a project hook's description,
+// branch filter and custom template to an empty value removing each (issue
+// 1306).
+func TestEditHook_EmptyValues_ReachTheBody(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[EditHookInput](map[string]any{"project_id": "42", "hook_id": 1, "description": "", "push_events_branch_filter": "", "custom_webhook_template": ""})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	client, recorder := testutil.RecordWrites(t, `{}`, `{"id":1,"url":"https://example.com"}`)
+	if _, err = EditHook(t.Context(), client, input); err != nil {
+		t.Fatalf("EditHook() error: %v", err)
+	}
+	recorder.AssertMembers(t, map[string]string{"description": `""`, "push_events_branch_filter": `""`, "custom_webhook_template": `""`})
+}
+
 // Test endpoint paths and fixture values used across project operation tests.
 const (
 	errExpectedValidation = "expected validation error"
@@ -1059,9 +1172,9 @@ func TestProjectHandlers_ValidationErrors(t *testing.T) {
 // pointers are populated with the requested values. This protects Premium push
 // rule metadata from being dropped during option conversion.
 func TestBuildUpdateOpts_MergeRequestTitleRegexOptions(t *testing.T) {
-	opts := buildUpdateOpts(UpdateInput{
-		MergeRequestTitleRegex:            testCommitRegex,
-		MergeRequestTitleRegexDescription: "Conventional commits",
+	opts, _ := buildUpdateOpts(UpdateInput{
+		MergeRequestTitleRegex:            new(testCommitRegex),
+		MergeRequestTitleRegexDescription: new("Conventional commits"),
 	})
 	if opts.MergeRequestTitleRegex == nil || *opts.MergeRequestTitleRegex != testCommitRegex {
 		t.Fatalf("MergeRequestTitleRegex = %v, want %q", opts.MergeRequestTitleRegex, testCommitRegex)
@@ -3533,11 +3646,11 @@ func TestAddHook_WithAllEvents(t *testing.T) {
 		ProjectID:                 "42",
 		URL:                       testHookURL,
 		Name:                      "full-hook",
-		Description:               "all events",
+		Description:               new("all events"),
 		Token:                     "secret",
 		SigningToken:              "signing-secret",
 		PushEvents:                new(true),
-		PushEventsBranchFilter:    "main",
+		PushEventsBranchFilter:    new("main"),
 		IssuesEvents:              new(true),
 		ConfidentialIssuesEvents:  new(true),
 		MergeRequestsEvents:       new(true),
@@ -3556,7 +3669,7 @@ func TestAddHook_WithAllEvents(t *testing.T) {
 		ResourceDeployTokenEvents: new(true),
 		VulnerabilityEvents:       new(true),
 		EnableSSLVerification:     new(true),
-		CustomWebhookTemplate:     "tpl",
+		CustomWebhookTemplate:     new("tpl"),
 		BranchFilterStrategy:      "all",
 	})
 	if err != nil {
@@ -3605,11 +3718,11 @@ func TestEditHook_WithAllEvents(t *testing.T) {
 		HookID:                    1,
 		URL:                       "https://example.com/hook-updated",
 		Name:                      "updated-hook",
-		Description:               "updated",
+		Description:               new("updated"),
 		Token:                     "new-secret",
 		SigningToken:              "new-signing-secret",
 		PushEvents:                new(true),
-		PushEventsBranchFilter:    testBranchDevelop,
+		PushEventsBranchFilter:    new(testBranchDevelop),
 		IssuesEvents:              new(false),
 		ConfidentialIssuesEvents:  new(false),
 		MergeRequestsEvents:       new(true),
@@ -3628,7 +3741,7 @@ func TestEditHook_WithAllEvents(t *testing.T) {
 		ResourceDeployTokenEvents: new(true),
 		VulnerabilityEvents:       new(true),
 		EnableSSLVerification:     new(false),
-		CustomWebhookTemplate:     "new-tpl",
+		CustomWebhookTemplate:     new("new-tpl"),
 		BranchFilterStrategy:      "regex",
 	})
 	if err != nil {
@@ -4198,7 +4311,7 @@ func TestBuildUpdateOpts_AllFields(t *testing.T) {
 	input := UpdateInput{
 		ProjectID:                        "42",
 		Name:                             "updated",
-		Description:                      "new desc",
+		Description:                      new("new desc"),
 		Visibility:                       testPublic,
 		DefaultBranch:                    testBranchDevelop,
 		MergeMethod:                      "ff",
@@ -4210,18 +4323,18 @@ func TestBuildUpdateOpts_AllFields(t *testing.T) {
 		MergeRequestsEnabled:           &mrOn,
 		WikiEnabled:                    &wikiOn,
 		JobsEnabled:                    &jobsOn,
-		CIConfigPath:                   "custom-ci.yml",
+		CIConfigPath:                   new("custom-ci.yml"),
 		AllowMergeOnSkippedPipeline:    &allowSkipped,
 		RemoveSourceBranchAfterMerge:   &removeBranch,
 		AutocloseReferencedIssues:      &autoclose,
-		MergeCommitTemplate:            "Merge: %{title}",
-		SquashCommitTemplate:           "Squash: %{title}",
-		MRDefaultTitleTemplate:         "Draft: %{source_branch}",
+		MergeCommitTemplate:            new("Merge: %{title}"),
+		SquashCommitTemplate:           new("Squash: %{title}"),
+		MRDefaultTitleTemplate:         new("Draft: %{source_branch}"),
 		MergePipelinesEnabled:          &mergePipelines,
 		MergeTrainsEnabled:             &mergeTrains,
 		ProtectMergeRequestPipelines:   &protectMRPipelines,
 		ResolveOutdatedDiffDiscussions: &resolveOutdated,
-		ApprovalsBeforeMerge:           2,
+		ApprovalsBeforeMerge:           new(int64(2)),
 		LFSEnabled:                     &issuesOn,
 		RequestAccessEnabled:           &mrOn,
 		SharedRunnersEnabled:           &wikiOn,
@@ -4233,7 +4346,7 @@ func TestBuildUpdateOpts_AllFields(t *testing.T) {
 		SnippetsAccessLevel:            "private",
 	}
 
-	opts := buildUpdateOpts(input)
+	opts, _ := buildUpdateOpts(input)
 	assertEditProjectOpts(t, opts)
 }
 
@@ -4523,10 +4636,10 @@ func TestProjectAddHook_AllOptionalEvents(t *testing.T) {
 		ProjectID:                 "42",
 		URL:                       testHookURL,
 		Name:                      testHookName,
-		Description:               "A test webhook",
+		Description:               new("A test webhook"),
 		Token:                     "secret",
 		PushEvents:                &pushEvents,
-		PushEventsBranchFilter:    "main",
+		PushEventsBranchFilter:    new("main"),
 		IssuesEvents:              &issuesEvents,
 		ConfidentialIssuesEvents:  &confidentialIssues,
 		MergeRequestsEvents:       &mrEvents,
@@ -4541,7 +4654,7 @@ func TestProjectAddHook_AllOptionalEvents(t *testing.T) {
 		EmojiEvents:               &emojiEvents,
 		ResourceAccessTokenEvents: &resourceTokenEvents,
 		EnableSSLVerification:     &sslVerify,
-		CustomWebhookTemplate:     `{"text":"{{event}}"}`,
+		CustomWebhookTemplate:     new(`{"text":"{{event}}"}`),
 		BranchFilterStrategy:      "wildcard",
 	})
 	if err != nil {
@@ -4588,10 +4701,10 @@ func TestProjectEditHook_AllOptionalEvents(t *testing.T) {
 		HookID:                    5,
 		URL:                       "https://example.com/updated",
 		Name:                      "updated-hook",
-		Description:               "Updated hook",
+		Description:               new("Updated hook"),
 		Token:                     "new-secret",
 		PushEvents:                &pushEvents,
-		PushEventsBranchFilter:    testBranchDevelop,
+		PushEventsBranchFilter:    new(testBranchDevelop),
 		IssuesEvents:              &issuesEvents,
 		ConfidentialIssuesEvents:  &confidentialIssues,
 		MergeRequestsEvents:       &mrEvents,
@@ -4606,7 +4719,7 @@ func TestProjectEditHook_AllOptionalEvents(t *testing.T) {
 		EmojiEvents:               &emojiEvents,
 		ResourceAccessTokenEvents: &resourceTokenEvents,
 		EnableSSLVerification:     &sslVerify,
-		CustomWebhookTemplate:     `{"text":"updated"}`,
+		CustomWebhookTemplate:     new(`{"text":"updated"}`),
 		BranchFilterStrategy:      "regex",
 	})
 	if err != nil {
@@ -5035,7 +5148,7 @@ func TestUpdate_AutomaticRebaseEnabled_ReachesTheOptionOnlyWhenGiven(t *testing.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := buildUpdateOpts(UpdateInput{ProjectID: "42", AutomaticRebaseEnabled: tt.input})
+			opts, _ := buildUpdateOpts(UpdateInput{ProjectID: "42", AutomaticRebaseEnabled: tt.input})
 			if !reflect.DeepEqual(opts.AutomaticRebaseEnabled, tt.input) {
 				t.Errorf("AutomaticRebaseEnabled = %v, want %v", opts.AutomaticRebaseEnabled, tt.input)
 			}
@@ -7664,10 +7777,10 @@ func TestAddHook_AllOptionalFields(t *testing.T) {
 		ProjectID:                 "42",
 		URL:                       "https://hook.example.com",
 		Name:                      "my-hook",
-		Description:               "desc",
+		Description:               new("desc"),
 		Token:                     "secret",
 		PushEvents:                &bTrue,
-		PushEventsBranchFilter:    "main",
+		PushEventsBranchFilter:    new("main"),
 		IssuesEvents:              &bTrue,
 		ConfidentialIssuesEvents:  &bFalse,
 		MergeRequestsEvents:       &bTrue,
@@ -7682,7 +7795,7 @@ func TestAddHook_AllOptionalFields(t *testing.T) {
 		EmojiEvents:               &bFalse,
 		ResourceAccessTokenEvents: &bTrue,
 		EnableSSLVerification:     &bTrue,
-		CustomWebhookTemplate:     `{"text":"hello"}`,
+		CustomWebhookTemplate:     new(`{"text":"hello"}`),
 		BranchFilterStrategy:      "wildcard",
 	})
 	if err != nil {
@@ -7709,10 +7822,10 @@ func TestEditHook_AllOptionalFields(t *testing.T) {
 		HookID:                    1,
 		URL:                       "https://updated.example.com",
 		Name:                      "updated",
-		Description:               "new desc",
+		Description:               new("new desc"),
 		Token:                     "newsecret",
 		PushEvents:                &bTrue,
-		PushEventsBranchFilter:    "develop",
+		PushEventsBranchFilter:    new("develop"),
 		IssuesEvents:              &bFalse,
 		ConfidentialIssuesEvents:  &bTrue,
 		MergeRequestsEvents:       &bTrue,
@@ -7727,7 +7840,7 @@ func TestEditHook_AllOptionalFields(t *testing.T) {
 		EmojiEvents:               &bTrue,
 		ResourceAccessTokenEvents: &bFalse,
 		EnableSSLVerification:     &bFalse,
-		CustomWebhookTemplate:     `{"text":"updated"}`,
+		CustomWebhookTemplate:     new(`{"text":"updated"}`),
 		BranchFilterStrategy:      "regex",
 	})
 	if err != nil {
@@ -8294,8 +8407,8 @@ func TestContainerExpirationPolicyInput_ToGL(t *testing.T) {
 		Cadence:         "7d",
 		KeepN:           &keep,
 		OlderThan:       "30d",
-		NameRegexDelete: "del",
-		NameRegexKeep:   "keep",
+		NameRegexDelete: new("del"),
+		NameRegexKeep:   new("keep"),
 		Enabled:         new(true),
 	}
 	got := p.toGL()
@@ -8381,9 +8494,9 @@ func TestBuildUpdateOpts_AdditiveFields_AllMapped(t *testing.T) {
 		MergeRequestDefaultTargetSelf:            new(true),
 		MergeTrainsSkipTrainAllowed:              new(true),
 		PrintingMergeRequestLinkEnabled:          new(true),
-		SuggestionCommitMessage:                  "scm",
-		MRDefaultTitleTemplate:                   "mdtt",
-		IssueBranchTemplate:                      "ibt",
+		SuggestionCommitMessage:                  new("scm"),
+		MRDefaultTitleTemplate:                   new("mdtt"),
+		IssueBranchTemplate:                      new("ibt"),
 		IssuesTemplate:                           "it",
 		MergeRequestsTemplate:                    "mrt",
 		SnippetsEnabled:                          new(true),
@@ -8394,16 +8507,16 @@ func TestBuildUpdateOpts_AdditiveFields_AllMapped(t *testing.T) {
 		ShowDefaultAwardEmojis:                   new(true),
 		GroupRunnersEnabled:                      new(true),
 		KeepLatestArtifact:                       new(true),
-		BuildTimeout:                             600,
-		MaxArtifactsSize:                         100,
+		BuildTimeout:                             new(int64(600)),
+		MaxArtifactsSize:                         new(int64(100)),
 		AutoDevopsEnabled:                        new(true),
 		AutoDevopsDeployStrategy:                 "manual",
 		AutoDuoCodeReviewEnabled:                 new(true),
 		BuildGitStrategy:                         "clone",
 		AutoCancelPendingPipelines:               "enabled",
 		CICDCatalogEnabled:                       new(true),
-		CIDefaultGitDepth:                        20,
-		CIDeletePipelinesInSeconds:               86400,
+		CIDefaultGitDepth:                        new(int64(20)),
+		CIDeletePipelinesInSeconds:               new(int64(86400)),
 		CIDisplayPipelineVariables:               new(true),
 		CIForwardDeploymentEnabled:               new(true),
 		CIForwardDeploymentRollbackAllowed:       new(true),
@@ -8419,15 +8532,15 @@ func TestBuildUpdateOpts_AdditiveFields_AllMapped(t *testing.T) {
 		MirrorTriggerBuilds:                      new(true),
 		MirrorBranchRegex:                        "main",
 		MirrorOverwritesDivergedBranches:         new(true),
-		MirrorUserID:                             9,
+		MirrorUserID:                             new(int64(9)),
 		OnlyMirrorProtectedBranches:              new(true),
 		EnforceAuthChecksOnUploads:               new(true),
-		ExternalAuthorizationClassificationLabel: "label",
+		ExternalAuthorizationClassificationLabel: new("label"),
 		ContainerExpirationPolicyAttributes:      &ContainerExpirationPolicyInput{KeepN: &keep},
 		RepositoryAccessLevel:                    "enabled",
 		ForkingAccessLevel:                       "private",
 	}
-	opts := buildUpdateOpts(input)
+	opts, _ := buildUpdateOpts(input)
 	assertUpdateAdditiveScalars(t, opts)
 	assertUpdateAdditiveBools(t, opts)
 	assertUpdateAdditiveMisc(t, opts)
@@ -8560,7 +8673,7 @@ func TestBuildUpdateOpts_AccessLevels_AllMapped(t *testing.T) {
 		ModelExperimentsAccessLevel:      "enabled",
 		ModelRegistryAccessLevel:         "private",
 	}
-	opts := buildUpdateOpts(input)
+	opts, _ := buildUpdateOpts(input)
 	levels := map[string]*gl.AccessControlValue{
 		"IssuesAccessLevel":                opts.IssuesAccessLevel,
 		"MergeRequestsAccessLevel":         opts.MergeRequestsAccessLevel,
@@ -8585,7 +8698,7 @@ func TestBuildUpdateOpts_AccessLevels_AllMapped(t *testing.T) {
 		})
 	}
 	// Bool toggle still bridges when access-level string is absent.
-	bridged := buildUpdateOpts(UpdateInput{ProjectID: "1", IssuesEnabled: new(false)})
+	bridged, _ := buildUpdateOpts(UpdateInput{ProjectID: "1", IssuesEnabled: new(false)})
 	if bridged.IssuesAccessLevel == nil || *bridged.IssuesAccessLevel != gl.DisabledAccessControl {
 		t.Error("IssuesEnabled bool did not bridge to IssuesAccessLevel")
 	}
@@ -8610,7 +8723,7 @@ func TestBuildUpdateOpts_EachDeprecatedToggle_BridgesToItsOwnAccessLevel(t *test
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := buildUpdateOpts(tc.input)
+			opts, _ := buildUpdateOpts(tc.input)
 			levels := map[string]*gl.AccessControlValue{
 				"IssuesAccessLevel":        opts.IssuesAccessLevel,
 				"MergeRequestsAccessLevel": opts.MergeRequestsAccessLevel,

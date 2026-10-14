@@ -99,8 +99,8 @@ type ListInput struct {
 	View                   string                     `json:"view,omitempty"                jsonschema:"Set to 'simple' to return only basic MR fields"`
 	WIP                    string                     `json:"wip,omitempty"                 jsonschema:"Filter by draft/WIP status: 'yes' for draft MRs, 'no' for non-draft"`
 	AuthorID               int64                      `json:"author_id,omitempty"           jsonschema:"Filter by author user ID"`
-	AssigneeID             int64                      `json:"assignee_id,omitempty"         jsonschema:"Filter by assignee user ID"`
-	ReviewerID             int64                      `json:"reviewer_id,omitempty"         jsonschema:"Filter by reviewer user ID"`
+	AssigneeID             toolutil.StringOrInt       `json:"assignee_id,omitempty"         jsonschema:"Filter by assignee: a user ID, None for merge requests nobody is assigned, or Any for those somebody is"`
+	ReviewerID             toolutil.StringOrInt       `json:"reviewer_id,omitempty"         jsonschema:"Filter by reviewer: a user ID, None for merge requests with no reviewer, or Any for those with one"`
 	ApproverIDs            toolutil.ApproverIDsFilter `json:"approver_ids,omitempty"        jsonschema:"Filter by MRs with all listed users as eligible approvers. Accepts user IDs, or exactly one of \"Any\" (has approvers) or \"None\" (has none)"`
 	ApprovedByIDs          toolutil.ApproverIDsFilter `json:"approved_by_ids,omitempty"     jsonschema:"Filter by MRs approved by all listed user IDs. Accepts user IDs, or exactly one of \"Any\" (approved by someone) or \"None\" (unapproved)"`
 	ApprovedByUsernames    []string                   `json:"approved_by_usernames,omitempty" jsonschema:"Filter by MRs approved by all listed usernames"`
@@ -146,8 +146,8 @@ type mergeRequestListFilters struct {
 	WIP                 string
 	Environment         string
 	AuthorID            int64
-	AssigneeID          int64
-	ReviewerID          int64
+	AssigneeID          toolutil.StringOrInt
+	ReviewerID          toolutil.StringOrInt
 	ApproverIDs         toolutil.ApproverIDsFilter
 	ApprovedByIDs       toolutil.ApproverIDsFilter
 	ApprovedByUsernames []string
@@ -190,8 +190,8 @@ type mergeRequestListTarget struct {
 	wip                 func(*string)
 	environment         func(*string)
 	authorID            func(int64)
-	assigneeID          func(int64)
-	reviewerID          func(int64)
+	assigneeID          func(*gl.AssigneeIDValue)
+	reviewerID          func(*gl.ReviewerIDValue)
 	approverIDs         func(*gl.ApproverIDsValue)
 	approvedByIDs       func(*gl.ApproverIDsValue)
 	approvedByUsernames func([]string)
@@ -264,8 +264,9 @@ func applyMergeRequestListFilters(input mergeRequestListFilters, target mergeReq
 	setString(input.OrderBy, target.orderBy)
 	setString(input.Sort, target.sort)
 	setInt64(input.AuthorID, target.authorID)
-	setInt64(input.AssigneeID, target.assigneeID)
-	setInt64(input.ReviewerID, target.reviewerID)
+	if err := applyUserIDFilters(input, target); err != nil {
+		return err
+	}
 	if err := setApproverIDs(input.ApproverIDs, target.approverIDs); err != nil {
 		return fmt.Errorf("approver_ids: %w", err)
 	}
@@ -309,6 +310,27 @@ func applyMergeRequestListFilters(input mergeRequestListFilters, target mergeReq
 		}
 	}
 	toolutil.ApplyListOptions(target.listOptions, toolutil.PaginationInput{Page: input.Page, PerPage: input.PerPage}, input.Keyset)
+	return nil
+}
+
+// applyUserIDFilters sets the assignee and reviewer filters, each a user ID,
+// None or Any, refusing 0 and anything else no user is before any request
+// (issue 1354).
+func applyUserIDFilters(input mergeRequestListFilters, target mergeRequestListTarget) error {
+	assignee, err := toolutil.AssigneeFilter("assignee_id", input.AssigneeID)
+	if err != nil {
+		return err
+	}
+	reviewer, err := toolutil.ReviewerFilter("reviewer_id", input.ReviewerID)
+	if err != nil {
+		return err
+	}
+	if assignee != nil {
+		target.assigneeID(assignee)
+	}
+	if reviewer != nil {
+		target.reviewerID(reviewer)
+	}
 	return nil
 }
 
@@ -364,17 +386,19 @@ func setTime(field, value string, setter func(*time.Time)) error {
 // MilestoneID is a pointer, as on issues.UpdateInput, because GitLab reads
 // milestone_id=0 as "unassign" and a plain int64 cannot tell that zero from an
 // omitted field: the description promised "0 to unset" while the handler
-// dropped every zero on the floor.
+// dropped every zero on the floor. AssigneeID is a pointer for the same
+// reason: GitLab documents assignee_id=0 as unassigning everybody (issue
+// 1306).
 type UpdateInput struct {
 	ProjectID          toolutil.StringOrInt `json:"project_id"                    jsonschema:"Project ID or URL-encoded path,required"`
 	MRIID              int64                `json:"merge_request_iid"                        jsonschema:"Merge request IID (project-scoped, not 'merge_request_id'),required"`
 	Title              string               `json:"title,omitempty"               jsonschema:"New title"`
-	Description        string               `json:"description,omitempty"         jsonschema:"New description"`
+	Description        *string              `json:"description,omitempty"         jsonschema:"New description. Pass an empty string to remove it. Omit the field to leave it untouched"`
 	TargetBranch       string               `json:"target_branch,omitempty"       jsonschema:"New target branch"`
-	AssigneeID         int64                `json:"assignee_id,omitempty"          jsonschema:"Single user ID to assign (use assignee_ids for multiple)"`
-	AssigneeIDs        []int64              `json:"assignee_ids,omitempty"         jsonschema:"User IDs to assign as merge request assignees"`
-	ReviewerIDs        []int64              `json:"reviewer_ids,omitempty"         jsonschema:"User IDs to add as reviewers"`
-	Labels             []string             `json:"labels,omitempty"               jsonschema:"Label names to replace all labels on the merge request"`
+	AssigneeID         *int64               `json:"assignee_id,omitempty"          jsonschema:"Single user ID to assign (use assignee_ids for multiple). Pass 0 to remove every assignee. Omit the field to leave them untouched"`
+	AssigneeIDs        []int64              `json:"assignee_ids,omitempty"         jsonschema:"User IDs that replace the merge request's assignees. Pass [] to remove every assignee. Omit the field to leave them untouched"`
+	ReviewerIDs        []int64              `json:"reviewer_ids,omitempty"         jsonschema:"User IDs that replace the merge request's reviewers. Pass [] to remove every reviewer. Omit the field to leave them untouched"`
+	Labels             []string             `json:"labels,omitempty"               jsonschema:"Label names that replace all labels on the merge request. Pass [] to remove every label. Omit the field to leave them untouched"`
 	AddLabels          []string             `json:"add_labels,omitempty"          jsonschema:"Label names to add without removing existing"`
 	RemoveLabels       []string             `json:"remove_labels,omitempty"       jsonschema:"Label names to remove"`
 	MilestoneID        *int64               `json:"milestone_id,omitempty"        jsonschema:"Milestone ID (0 to unset)"`
@@ -390,8 +414,8 @@ type MergeInput struct {
 	ProjectID                 toolutil.StringOrInt `json:"project_id"                              jsonschema:"Project ID or URL-encoded path,required"`
 	MRIID                     int64                `json:"merge_request_iid"                                  jsonschema:"Merge request IID (project-scoped, not 'merge_request_id'),required"`
 	MergeCommitMessage        string               `json:"merge_commit_message,omitempty"           jsonschema:"Custom merge commit message"`
-	Squash                    *bool                `json:"squash,omitempty"                         jsonschema:"Squash commits on merge. Only set if explicitly requested by the user. Omit to preserve repository defaults"`
-	ShouldRemoveSourceBranch  *bool                `json:"should_remove_source_branch,omitempty"   jsonschema:"Delete source branch after merge. Only set if explicitly requested by the user. Omit to preserve repository defaults"`
+	Squash                    *bool                `json:"squash,omitempty"                         jsonschema:"Squash commits on merge. Only set if explicitly requested by the user. Omit to apply the merge request's own squash setting. false is refused when the merge request squashes on merge, since GitLab ignores false on this route: turn its squash off first with merge_request.update"`
+	ShouldRemoveSourceBranch  *bool                `json:"should_remove_source_branch,omitempty"   jsonschema:"Delete source branch after merge. Only set if explicitly requested by the user. Omit to apply the merge request's own Delete source branch setting. Set false to keep the branch even when that setting is on"`
 	AutoMerge                 *bool                `json:"auto_merge,omitempty"                     jsonschema:"Automatically merge when pipeline succeeds (auto-merge)"`
 	MergeWhenPipelineSucceeds *bool                `json:"merge_when_pipeline_succeeds,omitempty"   jsonschema:"Deprecated alias for auto_merge: merge when the pipeline succeeds. Prefer auto_merge"`
 	SHA                       string               `json:"sha,omitempty"                            jsonschema:"Head SHA of the merge request. Merge only if HEAD matches (safety check)"`
@@ -746,8 +770,10 @@ func buildUpdateOpts(input UpdateInput) *gl.UpdateMergeRequestOptions {
 	if input.Title != "" {
 		opts.Title = new(input.Title)
 	}
-	if input.Description != "" {
-		opts.Description = new(toolutil.NormalizeText(input.Description))
+	// Presence decides, never emptiness: an empty description is the caller
+	// removing it (issue 1306).
+	if input.Description != nil {
+		opts.Description = new(toolutil.NormalizeText(*input.Description))
 	}
 	if input.TargetBranch != "" {
 		opts.TargetBranch = new(input.TargetBranch)
@@ -755,17 +781,22 @@ func buildUpdateOpts(input UpdateInput) *gl.UpdateMergeRequestOptions {
 	if input.StateEvent != "" {
 		opts.StateEvent = new(input.StateEvent)
 	}
-	if input.AssigneeID != 0 {
-		opts.AssigneeID = new(input.AssigneeID)
+	if input.AssigneeID != nil {
+		opts.AssigneeID = input.AssigneeID
 	}
-	if len(input.AssigneeIDs) > 0 {
+	// The three lists replace what the merge request holds, so an empty one is
+	// a value of its own: [] removes every assignee or reviewer and labels ""
+	// every label. Presence is decided by nil, which is what a field the
+	// caller left out decodes to, and never by length (issue 1300).
+	if input.AssigneeIDs != nil {
 		opts.AssigneeIDs = &input.AssigneeIDs
 	}
-	if len(input.ReviewerIDs) > 0 {
+	if input.ReviewerIDs != nil {
 		opts.ReviewerIDs = &input.ReviewerIDs
 	}
-	if labels := labelOptions(input.Labels); labels != nil {
-		opts.Labels = labels
+	if input.Labels != nil {
+		labels := gl.LabelOptions(input.Labels)
+		opts.Labels = &labels
 	}
 	if labels := labelOptions(input.AddLabels); labels != nil {
 		opts.AddLabels = labels
@@ -818,11 +849,17 @@ func Update(ctx context.Context, client *gitlabclient.Client, input UpdateInput)
 	return mergeRequestOutput("mrUpdate", mr, captured)
 }
 
-// Merge accepts (merges) a merge request. When squash or
-// should_remove_source_branch are not explicitly set by the caller, the
-// function pre-fetches the MR to detect project-level requirements
-// (squash_on_merge, force_remove_source_branch) and applies them
-// automatically, avoiding merge rejections from enforced settings.
+// Merge accepts (merges) a merge request. It reads the merge request first,
+// for two reasons. When the caller left squash out and the merge request
+// squashes on merge, it sends squash=true, which a project whose squash option
+// is always needs when the merge request's own squash flag is off. When the
+// caller sent squash=false and the merge request squashes on merge, it refuses
+// before merging, because GitLab ignores squash=false on this route and would
+// squash anyway (D12 of issue 1293). should_remove_source_branch is the
+// caller's alone: GitLab applies the merge request's own flag when it is left
+// out and keeps the branch on an explicit false, and the handler used to send
+// the flag in place of the caller's false. The read also lets a 405 be
+// explained by what blocks the merge.
 func Merge(ctx context.Context, client *gitlabclient.Client, input MergeInput) (Output, error) {
 	if err := ctx.Err(); err != nil {
 		return Output{}, err
@@ -834,21 +871,15 @@ func Merge(ctx context.Context, client *gitlabclient.Client, input MergeInput) (
 		return Output{}, toolutil.ErrRequiredInt64("mrMerge", "merge_request_iid")
 	}
 
-	// Always pre-fetch the MR to detect enforced project merge settings.
-	// Projects can require squash (squash_option=always) or force source
-	// branch deletion — the API rejects merge requests that violate these
-	// constraints. LLMs tend to explicitly send squash=false even when
-	// omitting it would be correct, so we override when the MR indicates
-	// an enforced setting.
 	//gitlab:request optional: a failed prefetch is ignored and the merge runs with the caller's options, so only the merge itself is needed
 	prefetched, _, fetchErr := client.GL().MergeRequests.GetMergeRequest(string(input.ProjectID), input.MRIID, nil, gl.WithContext(ctx))
-	if fetchErr == nil {
-		if prefetched.SquashOnMerge {
-			input.Squash = &prefetched.SquashOnMerge
+	if fetchErr == nil && prefetched.SquashOnMerge {
+		if input.Squash != nil && !*input.Squash {
+			return Output{}, fmt.Errorf("mrMerge: merge request !%d squashes its commits on merge, and GitLab ignores squash=false on the merge route, so it would squash anyway. "+
+				"To merge without squashing, turn its squash off first with merge_request.update and squash=false, then merge; "+
+				"a project whose squash option is always squashes whatever the merge request says", input.MRIID)
 		}
-		if prefetched.ForceRemoveSourceBranch {
-			input.ShouldRemoveSourceBranch = &prefetched.ForceRemoveSourceBranch
-		}
+		input.Squash = new(true)
 	}
 
 	opts := &gl.AcceptMergeRequestOptions{}
@@ -1233,8 +1264,8 @@ type ListGlobalInput struct {
 	View                   string                     `json:"view,omitempty"                jsonschema:"Set to 'simple' to return only basic MR fields"`
 	WIP                    string                     `json:"wip,omitempty"                 jsonschema:"Filter by draft/WIP status: 'yes' for draft MRs, 'no' for non-draft"`
 	AuthorID               int64                      `json:"author_id,omitempty"           jsonschema:"Filter by author user ID"`
-	AssigneeID             int64                      `json:"assignee_id,omitempty"         jsonschema:"Filter by assignee user ID"`
-	ReviewerID             int64                      `json:"reviewer_id,omitempty"         jsonschema:"Filter by reviewer user ID"`
+	AssigneeID             toolutil.StringOrInt       `json:"assignee_id,omitempty"         jsonschema:"Filter by assignee: a user ID, None for merge requests nobody is assigned, or Any for those somebody is"`
+	ReviewerID             toolutil.StringOrInt       `json:"reviewer_id,omitempty"         jsonschema:"Filter by reviewer: a user ID, None for merge requests with no reviewer, or Any for those with one"`
 	ApproverIDs            toolutil.ApproverIDsFilter `json:"approver_ids,omitempty"        jsonschema:"Filter by MRs with all listed users as eligible approvers. Accepts user IDs, or exactly one of \"Any\" (has approvers) or \"None\" (has none)"`
 	ApprovedByIDs          toolutil.ApproverIDsFilter `json:"approved_by_ids,omitempty"     jsonschema:"Filter by MRs approved by all listed user IDs. Accepts user IDs, or exactly one of \"Any\" (approved by someone) or \"None\" (unapproved)"`
 	ApprovedByUsernames    []string                   `json:"approved_by_usernames,omitempty" jsonschema:"Filter by MRs approved by all listed usernames"`
@@ -1387,16 +1418,16 @@ func setInt64Ptr(target **int64) func(int64) {
 	}
 }
 
-// setAssigneeIDPtr returns a setter that wraps an int64 user ID into the SDK's
-// *AssigneeIDValue via gl.AssigneeID.
-func setAssigneeIDPtr(target **gl.AssigneeIDValue) func(int64) {
-	return func(value int64) { *target = gl.AssigneeID(value) }
+// setAssigneeIDPtr returns a setter that stores an assignee filter, a user ID
+// or None or Any, on the target options field.
+func setAssigneeIDPtr(target **gl.AssigneeIDValue) func(*gl.AssigneeIDValue) {
+	return func(value *gl.AssigneeIDValue) { *target = value }
 }
 
-// setReviewerIDPtr returns a setter that wraps an int64 user ID into the SDK's
-// *ReviewerIDValue via gl.ReviewerID.
-func setReviewerIDPtr(target **gl.ReviewerIDValue) func(int64) {
-	return func(value int64) { *target = gl.ReviewerID(value) }
+// setReviewerIDPtr returns a setter that stores a reviewer filter, a user ID
+// or None or Any, on the target options field.
+func setReviewerIDPtr(target **gl.ReviewerIDValue) func(*gl.ReviewerIDValue) {
+	return func(value *gl.ReviewerIDValue) { *target = value }
 }
 
 // setApproverIDsPtr returns a setter that wraps a slice of user IDs into the
@@ -1445,8 +1476,8 @@ type ListGroupInput struct {
 	View                   string                     `json:"view,omitempty"                jsonschema:"Set to 'simple' to return only basic MR fields"`
 	WIP                    string                     `json:"wip,omitempty"                 jsonschema:"Filter by draft/WIP status: 'yes' for draft MRs, 'no' for non-draft"`
 	AuthorID               int64                      `json:"author_id,omitempty"           jsonschema:"Filter by author user ID"`
-	AssigneeID             int64                      `json:"assignee_id,omitempty"         jsonschema:"Filter by assignee user ID"`
-	ReviewerID             int64                      `json:"reviewer_id,omitempty"         jsonschema:"Filter by reviewer user ID"`
+	AssigneeID             toolutil.StringOrInt       `json:"assignee_id,omitempty"         jsonschema:"Filter by assignee: a user ID, None for merge requests nobody is assigned, or Any for those somebody is"`
+	ReviewerID             toolutil.StringOrInt       `json:"reviewer_id,omitempty"         jsonschema:"Filter by reviewer: a user ID, None for merge requests with no reviewer, or Any for those with one"`
 	ApproverIDs            toolutil.ApproverIDsFilter `json:"approver_ids,omitempty"        jsonschema:"Filter by MRs with all listed users as eligible approvers. Accepts user IDs, or exactly one of \"Any\" (has approvers) or \"None\" (has none)"`
 	ApprovedByIDs          toolutil.ApproverIDsFilter `json:"approved_by_ids,omitempty"     jsonschema:"Filter by MRs approved by all listed user IDs. Accepts user IDs, or exactly one of \"Any\" (approved by someone) or \"None\" (unapproved)"`
 	ApprovedByUsernames    []string                   `json:"approved_by_usernames,omitempty" jsonschema:"Filter by MRs approved by all listed usernames"`

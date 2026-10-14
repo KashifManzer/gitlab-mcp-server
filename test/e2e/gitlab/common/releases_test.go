@@ -8,6 +8,7 @@ package common
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/releaselinks"
@@ -62,14 +63,41 @@ func releaseLinkLifecycle(e *harness.Env, s *harness.Session, release map[string
 		e.T.Errorf("release link update answered %+v, want link %d renamed", linkUpdated, link.ID)
 	}
 
+	// The second batch link carries a direct asset path, which the dynamic
+	// surface used to delete from every batch entry before the handler saw
+	// it, so the link was created without its permalink (issue 1326).
 	batch := harness.Do[releaselinks.CreateBatchOutput](s, actionReleaseLinkCreateBatch, withParams(release, map[string]any{
 		"links": []map[string]any{
 			{"name": "batch-one", "url": "https://example.com/releases/" + tag + "/batch-one.zip"},
-			{"name": "batch-two", "url": "https://example.com/releases/" + tag + "/batch-two.zip"},
+			{"name": "batch-two", "url": "https://example.com/releases/" + tag + "/batch-two.zip", "direct_asset_path": "/batch-two.zip"},
 		},
 	}))
 	if len(batch.Created) != 2 {
 		e.T.Errorf("release link create batch answered %+v, want the two links created", batch)
+	}
+	permalink := "/-/releases/" + tag + "/downloads/batch-two.zip"
+	if !slices.ContainsFunc(batch.Created, func(link releaselinks.Output) bool {
+		return link.Name == "batch-two" && strings.HasSuffix(link.DirectAssetURL, permalink)
+	}) {
+		e.T.Errorf("release link create batch answered %+v, want batch-two with a direct asset URL ending in %s", batch.Created, permalink)
+	}
+
+	// An empty direct asset path removes it, which GitLab does only on null,
+	// so the link goes back to answering with its own URL. The update used
+	// to drop the empty value and report success with the permalink still in
+	// place (issue 1306). GitLab updates a link only when the request carries
+	// its name or its URL, so the current name goes beside the removal.
+	if index := slices.IndexFunc(batch.Created, func(link releaselinks.Output) bool { return link.Name == "batch-two" }); index >= 0 {
+		second := withParams(release, map[string]any{"link_id": batch.Created[index].ID})
+		updated := harness.Do[releaselinks.Output](s, actionReleaseLinkUpdate, withParams(second, map[string]any{"name": "batch-two", "direct_asset_path": ""}))
+		cleared := harness.Do[releaselinks.Output](s, actionReleaseLinkGet, second)
+		assertOwnURL := func(call string, out releaselinks.Output) {
+			if strings.HasSuffix(out.DirectAssetURL, permalink) || out.DirectAssetURL != out.URL {
+				e.T.Errorf("release link %s after removing the direct asset path answered %+v, want the link's own URL as its direct asset URL", call, out)
+			}
+		}
+		assertOwnURL("update", updated)
+		assertOwnURL("get", cleared)
 	}
 
 	linkDeleted := harness.Do[releaselinks.Output](s, actionReleaseLinkDelete, byLink)
@@ -109,9 +137,22 @@ func TestRelease_Lifecycle_CreateGetUpdateListLinksDelete(t *testing.T) {
 			e.T.Errorf("release get answered %+v, want %q on %s with its description", got, title, tag.Name)
 		}
 		updated := harness.Do[releases.Output](s, actionReleaseUpdate, withParams(params, map[string]any{"description": "updated e2e release"}))
-		if updated.TagName != tag.Name || updated.Description != "updated e2e release" {
-			e.T.Errorf("release update answered %+v, want the release on %s with the new description", updated, tag.Name)
+		if updated.TagName != tag.Name || updated.Description != "updated e2e release" || updated.Name != title {
+			e.T.Errorf("release update answered %+v, want the release %q on %s with the new description", updated, title, tag.Name)
 		}
+		// An update of the release date alone used to send the title and the
+		// notes as null, which GitLab stores: the notes were erased and the
+		// title fell back to the tag (issue 1305).
+		redated := harness.Do[releases.Output](s, actionReleaseUpdate, withParams(params, map[string]any{"released_at": "2026-01-15T10:00:00Z"}))
+		reread := harness.Do[releases.Output](s, actionReleaseGet, params)
+		assertKept := func(call string, out releases.Output) {
+			if out.Name != title || out.Description != "updated e2e release" {
+				e.T.Errorf("release %s after a date-only update reads name %q and notes %q, want %q and %q",
+					call, out.Name, out.Description, title, "updated e2e release")
+			}
+		}
+		assertKept("update", redated)
+		assertKept("get", reread)
 		listed := harness.Do[releases.ListOutput](s, actionReleaseList, map[string]any{"project_id": project.IDParam()})
 		if !slices.Contains(releaseTagNames(listed.Releases), tag.Name) {
 			e.T.Errorf("the release listing does not hold %s: %v", tag.Name, releaseTagNames(listed.Releases))

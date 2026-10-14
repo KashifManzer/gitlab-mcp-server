@@ -30,6 +30,63 @@ import (
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
 )
 
+// listWithParams adapts a list handler to the params a meta or dynamic route
+// hands it, decoded by toolutil.UnmarshalParams as those routes decode them.
+func listWithParams[I any](list func(context.Context, *gitlabclient.Client, I) (ListOutput, error)) func(context.Context, *gitlabclient.Client, map[string]any) error {
+	return func(ctx context.Context, client *gitlabclient.Client, params map[string]any) error {
+		input, err := toolutil.UnmarshalParams[I](params)
+		if err != nil {
+			return err
+		}
+		_, err = list(ctx, client, input)
+		return err
+	}
+}
+
+// TestListFilters_AssigneeAndReviewerID_TakeAUserIDNoneOrAny holds
+// assignee_id and reviewer_id on the three merge request lists to what
+// GitLab's filters take: a user ID, None for merge requests with nobody in the
+// role, and Any for those with somebody. Both used to be integers whose 0 was
+// dropped, so None and Any were refused before a request and 0 listed every
+// merge request whatever its assignee or reviewer (issue 1354).
+func TestListFilters_AssigneeAndReviewerID_TakeAUserIDNoneOrAny(t *testing.T) {
+	lists := []struct {
+		name   string
+		call   func(context.Context, *gitlabclient.Client, map[string]any) error
+		params map[string]any
+	}{
+		{name: "merge_request.list", call: listWithParams(List), params: map[string]any{"project_id": "42"}},
+		{name: "merge_request.list_global", call: listWithParams(ListGlobal)},
+		{name: "merge_request.list_group", call: listWithParams(ListGroup), params: map[string]any{"group_id": "7"}},
+	}
+	for _, list := range lists {
+		for _, filter := range []string{"assignee_id", "reviewer_id"} {
+			for _, c := range testutil.UserIDFilterCases() {
+				t.Run(list.name+"/"+filter+"/"+c.Name, func(t *testing.T) {
+					client, recorder := testutil.RecordQueries(t, `[]`)
+					err := list.call(t.Context(), client, c.Params(list.params, filter))
+					recorder.AssertUserIDFilter(t, filter, c, err)
+				})
+			}
+		}
+	}
+}
+
+// TestUpdate_EmptyDescription_ReachesTheBody holds a merge request's
+// description to an empty value removing it. The handler used to drop it and
+// answer with the old description as an update (issue 1306).
+func TestUpdate_EmptyDescription_ReachesTheBody(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[UpdateInput](map[string]any{"project_id": "42", "merge_request_iid": 1, "description": ""})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	client, recorder := testutil.RecordWrites(t, `{}`, `{"id":1,"iid":1,"title":"x"}`)
+	if _, err = Update(t.Context(), client, input); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	recorder.AssertMembers(t, map[string]string{"description": `""`})
+}
+
 // Test constants for merge request endpoint paths and reusable values.
 const (
 	pathMRs                = "/api/v4/projects/42/merge_requests"
@@ -4670,7 +4727,7 @@ func TestUpdate_AssigneeIDSingular(t *testing.T) {
 	out, err := Update(context.Background(), client, UpdateInput{
 		ProjectID:  testProjectID,
 		MRIID:      1,
-		AssigneeID: 28,
+		AssigneeID: new(int64(28)),
 	})
 	if err != nil {
 		t.Fatalf("Update() unexpected error: %v", err)
@@ -4858,87 +4915,104 @@ func TestMerge_AutoDetectsSquashOnMerge(t *testing.T) {
 	}
 }
 
-// TestMerge_AutoDetectsForceRemoveSourceBranch verifies that Merge sets
-// should_remove_source_branch=true when force_remove_source_branch is true
-// on the MR and the caller omitted the parameter.
-func TestMerge_AutoDetectsForceRemoveSourceBranch(t *testing.T) {
-	mrWithForceRemove := `{"id":100,"iid":1,"title":"Test MR","state":"opened","squash_on_merge":false,"force_remove_source_branch":true,"detailed_merge_status":"can_be_merged"}`
+// mrDeletingAndSquashing is a merge request whose own settings delete its
+// source branch and squash on merge: the "Delete source branch" box the
+// project ticks by default, and a squash option of default_on or always.
+const mrDeletingAndSquashing = `{"id":100,"iid":1,"title":"Test MR","state":"opened","squash_on_merge":true,"force_remove_source_branch":true,"detailed_merge_status":"can_be_merged"}`
 
-	var mergeRequestBody string
+// mergeAgainst drives Merge on merge request 1 with the pre-fetch answered by
+// prefetched, and returns the merge body the mock received (nil when no merge
+// was sent) and Merge's error.
+func mergeAgainst(t *testing.T, prefetched string, input MergeInput) (map[string]json.RawMessage, error) {
+	t.Helper()
+	var body map[string]json.RawMessage
+	capture := captureJSONBody(t, http.MethodPut, pathMR1+"/merge", http.StatusOK, mrJSONCoverage, &body)
 	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == pathMR1:
-			testutil.RespondJSON(w, http.StatusOK, mrWithForceRemove)
-		case r.Method == http.MethodPut && r.URL.Path == pathMR1+"/merge":
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read request body: %v", err)
-				http.Error(w, "read request body", http.StatusInternalServerError)
-				return
-			}
-			mergeRequestBody = string(body)
-			testutil.RespondJSON(w, http.StatusOK, mrJSONCoverage)
-		default:
-			http.NotFound(w, r)
+		if r.Method == http.MethodGet && r.URL.Path == pathMR1 {
+			testutil.RespondJSON(w, http.StatusOK, prefetched)
+			return
 		}
+		capture(w, r)
 	}))
+	input.ProjectID, input.MRIID = testProjectID, 1
+	_, err := Merge(context.Background(), client, input)
+	return body, err
+}
 
-	out, err := Merge(context.Background(), client, MergeInput{
-		ProjectID: testProjectID,
-		MRIID:     1,
-	})
-	if err != nil {
-		t.Fatalf("Merge() unexpected error: %v", err)
+// TestMerge_ShouldRemoveSourceBranch_IsTheCallersOrTheMergeRequests holds the
+// merge body to the caller's choice about the source branch, and to no key at
+// all when the caller made none. GitLab applies the merge request's own
+// force_remove_source_branch when the key is absent
+// (MergeRequests::MergeService#delete_source_branch? fetches the param with
+// that flag as its default) and keeps the branch on an explicit false. The
+// handler used to overwrite every choice with the merge request's flag, so a
+// branch the caller asked to keep was deleted (issue 1293).
+func TestMerge_ShouldRemoveSourceBranch_IsTheCallersOrTheMergeRequests(t *testing.T) {
+	tests := []struct {
+		name  string
+		input MergeInput
+		want  map[string]string
+	}{
+		{"omitted leaves it to the merge request", MergeInput{}, map[string]string{"squash": "true"}},
+		{"false keeps the branch", MergeInput{ShouldRemoveSourceBranch: new(false)}, map[string]string{"squash": "true", "should_remove_source_branch": "false"}},
+		{"true deletes it", MergeInput{ShouldRemoveSourceBranch: new(true)}, map[string]string{"squash": "true", "should_remove_source_branch": "true"}},
 	}
-	if out.IID != 1 {
-		t.Errorf(fmtIIDWant, out.IID)
-	}
-	if !strings.Contains(mergeRequestBody, `"should_remove_source_branch":true`) {
-		t.Errorf("expected merge body to contain should_remove_source_branch=true, got %s", mergeRequestBody)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := mergeAgainst(t, mrDeletingAndSquashing, tt.input)
+			if err != nil {
+				t.Fatalf("Merge() unexpected error: %v", err)
+			}
+			assertBodyKeys(t, body, tt.want)
+		})
 	}
 }
 
-// TestMerge_EnforcedSquashOverridesExplicitFalse verifies that when the MR
-// has squash_on_merge=true (enforced by project settings), the Merge function
-// overrides an explicit squash=false from the caller to prevent API rejection.
-func TestMerge_EnforcedSquashOverridesExplicitFalse(t *testing.T) {
-	mrWithSquashOnMerge := `{"id":100,"iid":1,"title":"Test MR","state":"opened","squash_on_merge":true,"force_remove_source_branch":false,"detailed_merge_status":"can_be_merged"}`
-
-	var mergeRequestBody string
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == pathMR1:
-			testutil.RespondJSON(w, http.StatusOK, mrWithSquashOnMerge)
-		case r.Method == http.MethodPut && r.URL.Path == pathMR1+"/merge":
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read request body: %v", err)
-				http.Error(w, "read request body", http.StatusInternalServerError)
-				return
+// TestMerge_SquashFalseOnASquashingRequest_IsRefusedBeforeTheMerge holds a
+// squash=false the merge request's own setting would overrule to a refusal
+// that sends no merge. GitLab ignores squash=false on the merge route (it
+// updates the merge request's squash only when the param is true) and
+// squashes whenever the merge request does, so the merge would squash however
+// the call was written; the handler used to send squash=true in its place and
+// report the squashed merge as asked. The refusal names merge_request.update,
+// which turns the merge request's squash off first.
+func TestMerge_SquashFalseOnASquashingRequest_IsRefusedBeforeTheMerge(t *testing.T) {
+	body, err := mergeAgainst(t, mrDeletingAndSquashing, MergeInput{Squash: new(false)})
+	if err == nil {
+		t.Fatal("Merge() succeeded, want a refusal of squash=false on a merge request that squashes on merge")
+	}
+	for _, want := range []string{"squash", "merge_request.update", "always"} {
+		t.Run(want, func(t *testing.T) {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Merge() error = %q, want it to mention %q", err, want)
 			}
-			mergeRequestBody = string(body)
-			testutil.RespondJSON(w, http.StatusOK, mrJSONCoverage)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+		})
+	}
+	if body != nil {
+		t.Errorf("a merge was sent with body %v, want none", body)
+	}
+}
 
-	boolFalse := false
-	out, err := Merge(context.Background(), client, MergeInput{
-		ProjectID:                testProjectID,
-		MRIID:                    1,
-		Squash:                   &boolFalse,
-		ShouldRemoveSourceBranch: &boolFalse,
-	})
+// TestMerge_SquashTrueOnASquashingRequest_IsSent holds a squash=true that
+// agrees with the merge request's own setting to the merge it asks for: only
+// a false the merge request would overrule is refused.
+func TestMerge_SquashTrueOnASquashingRequest_IsSent(t *testing.T) {
+	body, err := mergeAgainst(t, mrDeletingAndSquashing, MergeInput{Squash: new(true)})
 	if err != nil {
 		t.Fatalf("Merge() unexpected error: %v", err)
 	}
-	if out.IID != 1 {
-		t.Errorf(fmtIIDWant, out.IID)
+	assertBodyKeys(t, body, map[string]string{"squash": "true"})
+}
+
+// TestMerge_SquashFalseOnARequestThatDoesNotSquash_IsSent holds an explicit
+// false to the body when the merge request would not squash anyway, so the
+// refusal above is reached only where GitLab would overrule the caller.
+func TestMerge_SquashFalseOnARequestThatDoesNotSquash_IsSent(t *testing.T) {
+	body, err := mergeAgainst(t, mrJSONCoverage, MergeInput{Squash: new(false)})
+	if err != nil {
+		t.Fatalf("Merge() unexpected error: %v", err)
 	}
-	if !strings.Contains(mergeRequestBody, `"squash":true`) {
-		t.Errorf("expected enforced squash_on_merge to override explicit false, got body: %s", mergeRequestBody)
-	}
+	assertBodyKeys(t, body, map[string]string{"squash": "false"})
 }
 
 // TestMerge_ExplicitSquashRespectedWhenNotEnforced verifies that when the MR
@@ -5898,8 +5972,8 @@ func TestList_NewFilterFields_ReachQuery(t *testing.T) {
 		View:                   "simple",
 		WIP:                    "no",
 		AuthorID:               7,
-		AssigneeID:             8,
-		ReviewerID:             9,
+		AssigneeID:             "8",
+		ReviewerID:             "9",
 		ApproverIDs:            toolutil.ApproverIDsFilter{"11", "12"},
 		ApprovedByIDs:          toolutil.ApproverIDsFilter{"13"},
 		ApprovedByUsernames:    []string{"alice", "bob"},
@@ -6016,8 +6090,8 @@ func TestListGlobal_NewFilterFields_ReachQuery(t *testing.T) {
 		View:                   "simple",
 		WIP:                    "yes",
 		AuthorID:               1,
-		AssigneeID:             2,
-		ReviewerID:             3,
+		AssigneeID:             "2",
+		ReviewerID:             "3",
 		ApproverIDs:            toolutil.ApproverIDsFilter{"4"},
 		ApprovedByIDs:          toolutil.ApproverIDsFilter{"5", "6"},
 		WithLabelsDetails:      &boolTrue,
@@ -6065,8 +6139,8 @@ func TestListGroup_NewFilterFields_ReachQuery(t *testing.T) {
 		View:                   "simple",
 		WIP:                    "no",
 		AuthorID:               10,
-		AssigneeID:             20,
-		ReviewerID:             30,
+		AssigneeID:             "20",
+		ReviewerID:             "30",
 		ApproverIDs:            toolutil.ApproverIDsFilter{"40"},
 		ApprovedByIDs:          toolutil.ApproverIDsFilter{"50"},
 		WithLabelsDetails:      &boolTrue,
@@ -7055,8 +7129,8 @@ func TestUpdate_OptionalFields_ReachTheBody(t *testing.T) {
 		want  map[string]string
 	}{
 		{"every optional field", UpdateInput{
-			Title: "Updated", Description: "New desc", TargetBranch: "develop", StateEvent: "close",
-			AssigneeID: 7, AssigneeIDs: []int64{8, 9}, ReviewerIDs: []int64{10},
+			Title: "Updated", Description: new("New desc"), TargetBranch: "develop", StateEvent: "close",
+			AssigneeID: new(int64(7)), AssigneeIDs: []int64{8, 9}, ReviewerIDs: []int64{10},
 			Labels: []string{testLabelBug}, AddLabels: []string{"security"}, RemoveLabels: []string{"stale"},
 			MilestoneID: new(int64(11)), RemoveSourceBranch: new(true), Squash: new(false),
 			DiscussionLocked: new(true), AllowCollaboration: new(false),
@@ -7075,6 +7149,65 @@ func TestUpdate_OptionalFields_ReachTheBody(t *testing.T) {
 			assertBodyKeys(t, updateBody(t, tt.input), tt.want)
 		})
 	}
+}
+
+// TestUpdate_EmptyLists_ReplaceWithNothing holds an explicit empty list of
+// assignees, reviewers or labels to the body: GitLab reads each as the list
+// that replaces the current one, so [] removes every assignee or reviewer and
+// labels "" removes every label. The handler used to forward a list only when
+// it held something, so the one value that empties it never left, and the
+// update reported success with the merge request unchanged (issue 1300).
+// add_labels and remove_labels are changes rather than replacements, so an
+// empty one still sends nothing.
+func TestUpdate_EmptyLists_ReplaceWithNothing(t *testing.T) {
+	tests := []struct {
+		name  string
+		input UpdateInput
+		want  map[string]string
+	}{
+		{"assignee_ids", UpdateInput{AssigneeIDs: []int64{}}, map[string]string{"assignee_ids": "[]"}},
+		{"reviewer_ids", UpdateInput{ReviewerIDs: []int64{}}, map[string]string{"reviewer_ids": "[]"}},
+		{"labels", UpdateInput{Labels: []string{}}, map[string]string{"labels": `""`}},
+		{
+			"all three",
+			UpdateInput{AssigneeIDs: []int64{}, ReviewerIDs: []int64{}, Labels: []string{}},
+			map[string]string{"assignee_ids": "[]", "reviewer_ids": "[]", "labels": `""`},
+		},
+		{"add and remove labels empty", UpdateInput{AddLabels: []string{}, RemoveLabels: []string{}}, map[string]string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertBodyKeys(t, updateBody(t, tt.input), tt.want)
+		})
+	}
+}
+
+// TestUpdate_EmptyListsThroughTheMetaDecoder_ReachTheBody drives the same
+// empty lists through toolutil.UnmarshalParams, the decoder the meta and
+// dynamic routes hand their arguments to, so a [] a model writes is held to
+// the request and not only one a Go caller builds.
+func TestUpdate_EmptyListsThroughTheMetaDecoder_ReachTheBody(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[UpdateInput](map[string]any{
+		"assignee_ids": []any{}, "reviewer_ids": []any{}, "labels": []any{},
+	})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	assertBodyKeys(t, updateBody(t, input), map[string]string{"assignee_ids": "[]", "reviewer_ids": "[]", "labels": `""`})
+}
+
+// TestUpdate_AssigneeIDZero_RemovesEveryAssignee holds assignee_id 0 to the
+// body. GitLab documents 0 as the value of assignee_id that unassigns
+// everybody, and the handler forwarded the field only when it was not 0, so
+// the one value that removes the assignees never left and the update reported
+// success with the merge request unchanged (issue 1306). The arguments go
+// through toolutil.UnmarshalParams, as every surface's do.
+func TestUpdate_AssigneeIDZero_RemovesEveryAssignee(t *testing.T) {
+	input, err := toolutil.UnmarshalParams[UpdateInput](map[string]any{"assignee_id": 0})
+	if err != nil {
+		t.Fatalf("UnmarshalParams() error: %v", err)
+	}
+	assertBodyKeys(t, updateBody(t, input), map[string]string{"assignee_id": "0"})
 }
 
 // TestUpdate_EachFlagAlone_ReachesOnlyItsOwnKey drives the four boolean options

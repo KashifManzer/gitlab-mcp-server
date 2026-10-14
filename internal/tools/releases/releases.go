@@ -71,7 +71,7 @@ type UpdateInput struct {
 	Name        string               `json:"name,omitempty"        jsonschema:"New release title"`
 	Description string               `json:"description,omitempty" jsonschema:"Updated release notes"`
 	ReleasedAt  string               `json:"released_at,omitempty" jsonschema:"New release date in ISO 8601 format"`
-	Milestones  []string             `json:"milestones,omitempty"  jsonschema:"Milestone titles to associate with the release"`
+	Milestones  []string             `json:"milestones,omitempty"  jsonschema:"Milestone titles to associate with the release. Pass [] to detach every milestone. Omit the field to leave them untouched"`
 }
 
 // DeleteInput defines parameters for deleting a release.
@@ -172,20 +172,46 @@ func Create(ctx context.Context, client *gitlabclient.Client, input CreateInput)
 	opts.Assets = assetsOptions(input.Assets)
 	r, _, err := client.GL().Releases.CreateRelease(string(input.ProjectID), opts, gl.WithContext(ctx))
 	if err != nil {
-		switch {
-		case toolutil.IsHTTPStatus(err, http.StatusUnprocessableEntity) || toolutil.IsHTTPStatus(err, http.StatusConflict):
-			return Output{}, toolutil.WrapErrWithHint("releaseCreate", err, "a release for this tag may already exist. Use release.update to modify it, or choose a different tag_name")
-		case toolutil.IsHTTPStatus(err, http.StatusForbidden):
-			return Output{}, toolutil.WrapErrWithHint("releaseCreate", err, "creating releases requires Developer role or higher")
-		default:
-			return Output{}, toolutil.WrapErrWithMessage("releaseCreate", err)
-		}
+		return Output{}, createError(err)
 	}
 	return ToOutput(r), nil
 }
 
+// createError gives a refused release create the hint that fits it. GitLab
+// answers 422 "Ref is not specified" when tag_name names no existing tag and
+// no ref was given to create it from, which is a missing tag rather than a
+// release that already exists. The role hint is keyed on
+// toolutil.IsPermissionRefusal rather than on 403, because GitLab answers a
+// missing permission with 401 at some routes (entry 55 of
+// docs/development/upstream-bugs.md), while a refusal of the token itself
+// names no role.
+//
+// The branches are separate ifs rather than the cases of one switch, because a
+// coverage profile puts no block over a case expression, so mutation testing
+// could not judge the conditions that decide which hint a refusal gets.
+func createError(err error) error {
+	const op = "releaseCreate"
+	unprocessable := toolutil.IsHTTPStatus(err, http.StatusUnprocessableEntity)
+	if unprocessable && toolutil.ContainsAny(err, "Ref is not specified") {
+		return toolutil.WrapErrWithHint(op, err, "the tag does not exist yet. Pass ref (a branch, tag or commit SHA) to create the tag with the release, or create the tag first with tag.create")
+	}
+	if unprocessable || toolutil.IsHTTPStatus(err, http.StatusConflict) {
+		return toolutil.WrapErrWithHint(op, err, "a release for this tag may already exist. Use release.update to modify it, or choose a different tag_name")
+	}
+	if toolutil.IsPermissionRefusal(err) {
+		return toolutil.WrapErrWithHint(op, err, "creating releases requires Developer role or higher")
+	}
+	return toolutil.WrapErrWithMessage(op, err)
+}
+
 // Update modifies an existing release identified by project and tag name.
-// Only non-empty fields in the input are applied as updates.
+// Only the fields the caller set reach GitLab.
+//
+// client-go's UpdateReleaseOptions writes the title and the notes without
+// omitempty, so a field left nil goes out as null and GitLab stores it: the
+// notes are erased and the title falls back to the tag. The request option
+// takes those two keys out of the body whenever the caller did not set them
+// (issue 1305, upstream register row 121).
 func Update(ctx context.Context, client *gitlabclient.Client, input UpdateInput) (Output, error) {
 	if err := ctx.Err(); err != nil {
 		return Output{}, err
@@ -194,21 +220,29 @@ func Update(ctx context.Context, client *gitlabclient.Client, input UpdateInput)
 		return Output{}, errors.New("releaseUpdate: project_id is required. Use project.list to find the ID first, then pass it as project_id")
 	}
 	opts := &gl.UpdateReleaseOptions{}
+	var unset []string
 	if input.Name != "" {
 		opts.Name = new(input.Name)
+	} else {
+		unset = append(unset, "name")
 	}
 	if input.Description != "" {
 		opts.Description = new(toolutil.NormalizeText(input.Description))
+	} else {
+		unset = append(unset, "description")
 	}
 	releasedAt, err := toolutil.ParseTimeField("released_at", input.ReleasedAt)
 	if err != nil {
 		return Output{}, fmt.Errorf("releaseUpdate: %w", err)
 	}
 	opts.ReleasedAt = releasedAt
-	if len(input.Milestones) > 0 {
+	// Presence decides, never emptiness: [] detaches every milestone (issue
+	// 1306).
+	if input.Milestones != nil {
 		opts.Milestones = &input.Milestones
 	}
-	r, _, err := client.GL().Releases.UpdateRelease(string(input.ProjectID), input.TagName, opts, gl.WithContext(ctx))
+	r, _, err := client.GL().Releases.UpdateRelease(string(input.ProjectID), input.TagName, opts, gl.WithContext(ctx),
+		toolutil.EditJSONBody(toolutil.BodyEdit{Drop: unset}))
 	if err != nil {
 		return Output{}, toolutil.WrapErrWithStatusHint("releaseUpdate", err, http.StatusNotFound,
 			"verify tag_name with release.list; updating releases requires Developer role or higher")
