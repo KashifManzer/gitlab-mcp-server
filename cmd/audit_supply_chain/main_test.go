@@ -24,6 +24,10 @@ import (
 // wherever a fixture needs a reference that is pinned the way the rule wants.
 const testSHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 
+// testDigest is an image manifest digest in the one spelling rule 1 accepts
+// for a docker:// step, the only reference to an image a registry cannot move.
+const testDigest = "sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 // TestCheckPinnedUses_MutableReference_IsReported verifies that only
 // 40-character commit SHAs count as a pinned action.
 //
@@ -45,7 +49,12 @@ func TestCheckPinnedUses_MutableReference_IsReported(t *testing.T) {
 		{name: "commit sha with version comment", reference: "actions/checkout@" + testSHA + " # v7", wantOK: true},
 		{name: "subpath action pinned", reference: "github/codeql-action/init@" + testSHA + " # v4", wantOK: true},
 		{name: "local action", reference: "./.github/actions/thing", wantOK: true},
-		{name: "docker action", reference: "docker://alpine:3.22", wantOK: true},
+		{name: "docker image by tag", reference: "docker://alpine:3.22", wantOK: false},
+		{name: "docker image by latest", reference: "docker://alpine:latest", wantOK: false},
+		{name: "docker image by commit sha", reference: "docker://example/image@" + testSHA, wantOK: false},
+		{name: "docker image by short digest", reference: "docker://alpine@sha256:" + strings.Repeat("a", 63), wantOK: false},
+		{name: "docker image by digest", reference: "docker://alpine@" + testDigest, wantOK: true},
+		{name: "docker image by tag and digest", reference: "docker://ghcr.io/owner/image:3.22@" + testDigest, wantOK: true},
 		{name: "quoted mutable tag", reference: `"actions/checkout@v7"`, wantOK: false},
 	}
 
@@ -73,6 +82,210 @@ func TestCheckPinnedUses_UnpinnedReference_NamesLineAndReference(t *testing.T) {
 	want := ".github/workflows/ci.yml:4: uses: actions/checkout@v7 is not pinned to a 40-character commit SHA"
 	if len(problems) != 1 || problems[0] != want {
 		t.Errorf("checkPinnedUses() = %v, want exactly [%q]", problems, want)
+	}
+}
+
+// TestCheckPinnedUses_EverySpellingOfAUsesKey_IsRead verifies that rule 1
+// reads a uses: however YAML lets it be written, in a workflow and in a
+// composite action alike, and names the line the key sits on.
+//
+// Each of these spellings is an ordinary step or job to GitHub Actions and
+// was invisible to the line scan alone (issue 1320): a flow mapping, a quoted
+// key, a flow sequence, a space before the colon, a value on the next line and
+// a reusable workflow written as a flow mapping. A docker:// step is held to a
+// sha256 digest, since an image tag moves exactly as an action tag does.
+func TestCheckPinnedUses_EverySpellingOfAUsesKey_IsRead(t *testing.T) {
+	t.Parallel()
+
+	const tagged = " is not pinned to a 40-character commit SHA"
+	const image = " is not pinned to a sha256 image digest"
+	cases := []struct {
+		name  string
+		steps string
+		want  []string
+	}{
+		{
+			name:  "flow mapping",
+			steps: "      - { name: x, uses: example/tool@v4 }\n",
+			want:  []string{"4: uses: example/tool@v4" + tagged},
+		},
+		{
+			name:  "double-quoted key",
+			steps: "      - \"uses\": example/tool@main\n",
+			want:  []string{"4: uses: example/tool@main" + tagged},
+		},
+		{
+			name:  "single-quoted key",
+			steps: "      - 'uses': example/tool@main\n",
+			want:  []string{"4: uses: example/tool@main" + tagged},
+		},
+		{
+			name:  "space before the colon",
+			steps: "      - uses : example/tool@v4\n",
+			want:  []string{"4: uses: example/tool@v4" + tagged},
+		},
+		{
+			name:  "value on the next line",
+			steps: "      - uses:\n          example/tool@v4\n",
+			want:  []string{"4: uses: example/tool@v4" + tagged},
+		},
+		{
+			name:  "flow mappings, one of them pinned",
+			steps: "      - { uses: example/one@v4 }\n      - { uses: example/two@" + testSHA + " }\n      - { uses: example/three@main }\n",
+			want: []string{
+				"4: uses: example/one@v4" + tagged,
+				"6: uses: example/three@main" + tagged,
+			},
+		},
+		{
+			name:  "docker image by tag",
+			steps: "      - uses: docker://alpine:latest\n",
+			want:  []string{"4: uses: docker://alpine:latest" + image},
+		},
+		{
+			name:  "docker image by tag in a flow mapping",
+			steps: "      - { uses: 'docker://alpine:3' }\n",
+			want:  []string{"4: uses: docker://alpine:3" + image},
+		},
+		{
+			name:  "docker image by digest",
+			steps: "      - uses: docker://alpine@" + testDigest + "\n      - { uses: docker://alpine@" + testDigest + " }\n",
+		},
+		{
+			name:  "pinned flow mapping",
+			steps: "      - { name: x, uses: example/tool@" + testSHA + " }\n",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name+" in a workflow", func(t *testing.T) {
+			t.Parallel()
+
+			text := "jobs:\n  a:\n    steps:\n" + testCase.steps
+			assertPinFindings(t, "wf.yml", text, testCase.want)
+		})
+		t.Run(testCase.name+" in a composite action", func(t *testing.T) {
+			t.Parallel()
+
+			text := "runs:\n  using: composite\n  steps:\n" + strings.ReplaceAll(testCase.steps, "      ", "    ")
+			assertPinFindings(t, "action.yml", text, testCase.want)
+		})
+	}
+}
+
+// TestCheckPinnedUses_StructuralSpellings_AreRead verifies the spellings whose
+// shape is the document's rather than one step's: a flow sequence of steps,
+// a reusable workflow named in a flow mapping or by a quoted key, and a uses:
+// whose value is an alias of a reference written elsewhere or carries an
+// anchor, each judged by the reference it resolves to rather than by the
+// alias or anchor written on its line.
+func TestCheckPinnedUses_StructuralSpellings_AreRead(t *testing.T) {
+	t.Parallel()
+
+	const tagged = " is not pinned to a 40-character commit SHA"
+	cases := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{
+			name: "flow sequence of steps",
+			text: "jobs:\n  a:\n    steps: [ { uses: example/tool@v4 }, { run: make } ]\n",
+			want: []string{"3: uses: example/tool@v4" + tagged},
+		},
+		{
+			name: "flow sequence holding two references",
+			text: "jobs:\n  a:\n    steps: [ { uses: example/one@v4 }, { uses: example/two@main } ]\n",
+			want: []string{"3: uses: example/one@v4" + tagged, "3: uses: example/two@main" + tagged},
+		},
+		{
+			name: "composite steps as a flow sequence",
+			text: "runs: { using: composite, steps: [ { uses: example/tool@v4 } ] }\n",
+			want: []string{"1: uses: example/tool@v4" + tagged},
+		},
+		{
+			name: "reusable workflow as a flow mapping",
+			text: "jobs:\n  a: { uses: example/repo/.github/workflows/x.yml@main }\n",
+			want: []string{"2: uses: example/repo/.github/workflows/x.yml@main" + tagged},
+		},
+		{
+			name: "reusable workflow by a quoted key",
+			text: "jobs:\n  a:\n    \"uses\": example/repo/.github/workflows/x.yml@main\n",
+			want: []string{"3: uses: example/repo/.github/workflows/x.yml@main" + tagged},
+		},
+		{
+			name: "pinned reusable workflow as a flow mapping",
+			text: "jobs:\n  a: { uses: example/repo/.github/workflows/x.yml@" + testSHA + " }\n",
+		},
+		{
+			name: "alias in a block step judged by the reference it names",
+			text: "x-ref: &ref example/tool@v4\njobs:\n  a:\n    steps:\n      - uses: *ref\n",
+			want: []string{"5: uses: example/tool@v4" + tagged},
+		},
+		{
+			name: "alias in a block step naming a pinned reference",
+			text: "x-ref: &ref example/tool@" + testSHA + "\njobs:\n  a:\n    steps:\n      - uses: *ref\n",
+		},
+		{
+			name: "anchored reference in a block step judged by its value",
+			text: "jobs:\n  a:\n    steps:\n      - uses: &ref example/tool@v4\n",
+			want: []string{"4: uses: example/tool@v4" + tagged},
+		},
+		{
+			name: "anchored pinned reference in a block step",
+			text: "jobs:\n  a:\n    steps:\n      - uses: &ref example/tool@" + testSHA + "\n",
+		},
+		{
+			name: "alias in a flow mapping resolved",
+			text: "x-ref: &ref example/tool@v4\njobs:\n  a:\n    steps:\n      - { uses: *ref }\n",
+			want: []string{"5: uses: example/tool@v4" + tagged},
+		},
+		{
+			name: "second document",
+			text: "jobs: {}\n---\njobs:\n  a:\n    steps: [ { uses: example/tool@v4 } ]\n",
+			want: []string{"5: uses: example/tool@v4" + tagged},
+		},
+		{
+			name: "commented-out reference runs nothing and is not read",
+			text: "jobs:\n  a:\n    steps:\n      # - uses: example/tool@v4\n      #uses: example/other@v4\n      - run: make\n",
+		},
+		{
+			name: "reference inside a block scalar read by the line scan",
+			text: "jobs:\n  a:\n    steps:\n      - run: |\n          cat > wf.yml <<'EOF'\n          - uses: example/tool@v4\n          EOF\n",
+			want: []string{"6: uses: example/tool@v4" + tagged},
+		},
+		{
+			name: "mapping value is not a reference",
+			text: "jobs:\n  a:\n    steps:\n      - { with: { uses: { nested: true } }, run: make }\n",
+		},
+		{
+			name: "text that does not parse keeps the line scan",
+			text: "jobs:\n  a:\n    steps:\n      - uses: example/tool@v4\n      - { uses: example/other@v4\n",
+			want: []string{"4: uses: example/tool@v4" + tagged},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			assertPinFindings(t, "wf.yml", testCase.text, testCase.want)
+		})
+	}
+}
+
+// assertPinFindings holds checkPinnedUses on text to exactly the findings
+// want names, each written as line and message after the path label.
+func assertPinFindings(t *testing.T, label, text string, want []string) {
+	t.Helper()
+
+	expected := make([]string, len(want))
+	for index, finding := range want {
+		expected[index] = label + ":" + finding
+	}
+	got := checkPinnedUses(label, text)
+	if strings.Join(got, "\n") != strings.Join(expected, "\n") {
+		t.Errorf("checkPinnedUses(%q) =\n%s\nwant\n%s", text, strings.Join(got, "\n"), strings.Join(expected, "\n"))
 	}
 }
 
@@ -3334,6 +3547,272 @@ func TestAudit_Repository_IsClean(t *testing.T) {
 	}
 	if len(problems) != 0 {
 		t.Errorf("audit() found %d problems:\n%s", len(problems), strings.Join(problems, "\n"))
+	}
+}
+
+// TestLoadWorkflows_ReleaseWorkflow_OnlyTheNewestReleaseMovesAPointer verifies
+// that the release workflow, as loadWorkflows reads it, hands preflight's
+// answer from scripts/release-order.sh to everything that points at the newest
+// release (issue 1323): the image's :latest on both registries, the Docker Hub
+// repository description, the GitHub release marked Latest, npm's dist-tag,
+// the Homebrew tap, the MCP Registry entry and main's manifests.
+//
+// scripts/release_order_sh_test.py holds what the script answers; this holds
+// the workflow to reading the answer, which no script test can see. Without
+// it, a step that moves a pointer could drop its condition and a backport
+// would roll that pointer back to itself with nothing failing. A pointer added
+// to the workflow later is not found by this test and has to be added to it.
+func TestLoadWorkflows_ReleaseWorkflow_OnlyTheNewestReleaseMovesAPointer(t *testing.T) {
+	t.Parallel()
+
+	const newest = "needs.preflight.outputs.newest == 'true'"
+	release := releaseWorkflow(t, repositoryRoot(t))
+
+	t.Run("preflight answers from release-order.sh", func(t *testing.T) {
+		t.Parallel()
+
+		assertPreflightAnswersFromReleaseOrder(t, release)
+	})
+
+	t.Run("only the newest release is pushed as latest", func(t *testing.T) {
+		t.Parallel()
+
+		assertLatestTagsFollow(t, release, newest)
+	})
+
+	t.Run("only the newest release replaces the Docker Hub description", func(t *testing.T) {
+		t.Parallel()
+
+		description := releaseStep(t, releaseJob(t, release, "docker"), stepNamed("Update Docker Hub description"))
+		if condition := pythonStr(description["if"]); !strings.Contains(condition, newest) {
+			t.Errorf("the Docker Hub description step runs if %q, want it behind %s", condition, newest)
+		}
+	})
+
+	t.Run("the GitHub release says whether it is the latest", func(t *testing.T) {
+		t.Parallel()
+
+		assertGitHubReleaseLatestFollowsNewest(t, release)
+	})
+
+	t.Run("npm publishes under preflight's dist-tag", func(t *testing.T) {
+		t.Parallel()
+
+		assertNpmPublishesUnderTheDistTag(t, release)
+	})
+
+	for _, id := range []string{"homebrew", "mcp-registry", "commit-manifests"} {
+		t.Run(id+" runs only for the newest release", func(t *testing.T) {
+			t.Parallel()
+
+			if got := pythonStr(releaseJob(t, release, id)["if"]); got != newest {
+				t.Errorf("job %s runs if %q, want %q", id, got, newest)
+			}
+		})
+	}
+}
+
+// TestLoadWorkflows_ReleaseEnvironment_IsNamedOnlyForATagPush verifies that a
+// dispatched run never holds the release environment's identity (issue 1322).
+//
+// The npm, PyPI and nuget.org trusted publishers bind this repository,
+// release.yml and the release environment, and none of them can bind a ref, so
+// the environment a job names is what tells a release's OIDC identity from a
+// rehearsal's. Every job of release.yml that names an environment has to name
+// it through the one expression that sends a workflow_dispatch to
+// release-rehearsal, the seven publisher jobs have to name one, no other
+// workflow may name release at all, the NuGet login, which mints a key that
+// can push, has to be skipped in a rehearsal, and the REHEARSAL switch that
+// guard reads has to be decided by the same event the expression reads.
+//
+// What decides the environment from outside the tree, its deployment policy
+// and the tag creation rule, is a setting on GitHub that no test here can
+// read; docs/development/repository-settings.md carries the gh api check for
+// each.
+func TestLoadWorkflows_ReleaseEnvironment_IsNamedOnlyForATagPush(t *testing.T) {
+	t.Parallel()
+
+	const expression = "${{ github.event_name == 'workflow_dispatch' && 'release-rehearsal' || 'release' }}"
+	root := repositoryRoot(t)
+	workflows, err := loadWorkflows(root)
+	if err != nil {
+		t.Fatalf("loadWorkflows: %v", err)
+	}
+
+	var named []string
+	for _, loaded := range workflows {
+		jobs, _ := loaded.doc["jobs"].(map[string]any)
+		for _, id := range orderedKeys(jobs, loaded.jobOrder) {
+			job, _ := jobs[id].(map[string]any)
+			environment := job["environment"]
+			if holder, ok := environment.(map[string]any); ok {
+				environment = holder["name"]
+			}
+			if environment == nil {
+				continue
+			}
+			value := pythonStr(environment)
+			switch {
+			case loaded.path == workflowDir+"/release.yml":
+				named = append(named, id)
+				if value != expression {
+					t.Errorf("%s job %s runs in %q, want %q", loaded.path, id, value, expression)
+				}
+			case strings.Contains(value, "release"):
+				t.Errorf("%s job %s names the environment %q; only release.yml may name a release environment",
+					loaded.path, id, value)
+			}
+		}
+	}
+	want := []string{"release", "npm", "pypi", "nuget", "homebrew", "mcp-registry", "commit-manifests"}
+	if strings.Join(named, ",") != strings.Join(want, ",") {
+		t.Errorf("release.yml jobs naming an environment = %v, want %v", named, want)
+	}
+
+	release := releaseWorkflow(t, root)
+	env, _ := release["env"].(map[string]any)
+	if got, want := pythonStr(env["REHEARSAL"]), "${{ github.event_name == 'workflow_dispatch' }}"; got != want {
+		t.Errorf("release.yml decides REHEARSAL as %q, want %q", got, want)
+	}
+	login := releaseStep(t, releaseJob(t, release, "nuget"), func(step map[string]any) bool {
+		return strings.HasPrefix(pythonStr(step["uses"]), "NuGet/login@")
+	})
+	if got, want := pythonStr(login["if"]), "env.REHEARSAL != 'true'"; got != want {
+		t.Errorf("the NuGet login runs if %q, want %q", got, want)
+	}
+}
+
+// releaseWorkflow returns the release workflow under root as loadWorkflows,
+// the reader every rule of this command uses, decodes it.
+func releaseWorkflow(t *testing.T, root string) map[string]any {
+	t.Helper()
+
+	workflows, err := loadWorkflows(root)
+	if err != nil {
+		t.Fatalf("loadWorkflows: %v", err)
+	}
+	for _, loaded := range workflows {
+		if loaded.path == workflowDir+"/release.yml" && loaded.doc != nil {
+			return loaded.doc
+		}
+	}
+	t.Fatalf("%s/release.yml is not among the workflows under %s", workflowDir, root)
+	return nil
+}
+
+// releaseJob returns one job of a decoded workflow, failing the test when the
+// workflow has no job by that id.
+func releaseJob(t *testing.T, doc map[string]any, id string) map[string]any {
+	t.Helper()
+
+	jobs, _ := doc["jobs"].(map[string]any)
+	job, ok := jobs[id].(map[string]any)
+	if !ok {
+		t.Fatalf("the workflow has no job %q", id)
+	}
+	return job
+}
+
+// releaseStep returns the one step of job that match selects, failing the
+// test when none or more than one does.
+func releaseStep(t *testing.T, job map[string]any, match func(map[string]any) bool) map[string]any {
+	t.Helper()
+
+	steps, _ := job["steps"].([]any)
+	var found []map[string]any
+	for _, raw := range steps {
+		if step, ok := raw.(map[string]any); ok && match(step) {
+			found = append(found, step)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("%d steps of the job match, want exactly 1", len(found))
+	}
+	return found[0]
+}
+
+// stepNamed selects a step by its name.
+func stepNamed(name string) func(map[string]any) bool {
+	return func(step map[string]any) bool { return step["name"] == name }
+}
+
+// assertPreflightAnswersFromReleaseOrder holds the release workflow's
+// preflight job to exporting the three answers of scripts/release-order.sh,
+// each read from the step that runs it.
+func assertPreflightAnswersFromReleaseOrder(t *testing.T, release map[string]any) {
+	t.Helper()
+
+	preflight := releaseJob(t, release, "preflight")
+	outputs, _ := preflight["outputs"].(map[string]any)
+	for _, name := range []string{"stable", "newest", "npm_dist_tag"} {
+		if got, want := pythonStr(outputs[name]), "${{ steps.order.outputs."+name+" }}"; got != want {
+			t.Errorf("preflight output %s = %q, want %q", name, got, want)
+		}
+	}
+	order := releaseStep(t, preflight, func(step map[string]any) bool { return step["id"] == "order" })
+	if run := pythonStr(order["run"]); !strings.Contains(run, "bash scripts/release-order.sh") {
+		t.Errorf("preflight's order step runs %q, want it to ask scripts/release-order.sh", run)
+	}
+}
+
+// assertLatestTagsFollow holds both :latest tags of the publishing image
+// build, ghcr.io's and Docker Hub's, behind condition.
+func assertLatestTagsFollow(t *testing.T, release map[string]any, condition string) {
+	t.Helper()
+
+	// The publishing build is the one whose digest server.json pins; the two
+	// smoke builds before it tag a local image and push nothing.
+	build := releaseStep(t, releaseJob(t, release, "docker"), func(step map[string]any) bool {
+		return step["id"] == "docker-push"
+	})
+	with, _ := build["with"].(map[string]any)
+	var latest []string
+	for line := range strings.SplitSeq(pythonStr(with["tags"]), "\n") {
+		if strings.Contains(line, ":latest") {
+			latest = append(latest, line)
+		}
+	}
+	if len(latest) != 2 {
+		t.Fatalf("the image build names %d :latest tags, want 2 (ghcr.io and Docker Hub):\n%s",
+			len(latest), strings.Join(latest, "\n"))
+	}
+	for _, line := range latest {
+		if !strings.Contains(line, condition) {
+			t.Errorf("the :latest tag %q is pushed whatever preflight answers, want it behind %s", line, condition)
+		}
+	}
+}
+
+// assertGitHubReleaseLatestFollowsNewest holds the step that publishes the
+// GitHub release to passing preflight's newest answer as --latest.
+func assertGitHubReleaseLatestFollowsNewest(t *testing.T, release map[string]any) {
+	t.Helper()
+
+	publish := releaseStep(t, releaseJob(t, release, "release"), stepNamed("Publish release"))
+	env, _ := publish["env"].(map[string]any)
+	if got, want := pythonStr(env["NEWEST"]), "${{ needs.preflight.outputs.newest }}"; got != want {
+		t.Errorf("Publish release sets NEWEST to %q, want %q", got, want)
+	}
+	if run := pythonStr(publish["run"]); !strings.Contains(run, `"--latest=${NEWEST}"`) {
+		t.Errorf("Publish release runs %q, want it to pass --latest=${NEWEST}", run)
+	}
+}
+
+// assertNpmPublishesUnderTheDistTag holds every call of
+// scripts/publish-npm.sh in the npm job to passing preflight's dist-tag.
+func assertNpmPublishesUnderTheDistTag(t *testing.T, release map[string]any) {
+	t.Helper()
+
+	publish := releaseStep(t, releaseJob(t, release, "npm"), stepNamed("Publish to npm"))
+	env, _ := publish["env"].(map[string]any)
+	if got, want := pythonStr(env["NPM_DIST_TAG"]), "${{ needs.preflight.outputs.npm_dist_tag }}"; got != want {
+		t.Errorf("Publish to npm sets NPM_DIST_TAG to %q, want %q", got, want)
+	}
+	run := pythonStr(publish["run"])
+	calls, tagged := strings.Count(run, "scripts/publish-npm.sh"), strings.Count(run, `--tag "${NPM_DIST_TAG}"`)
+	if calls == 0 || calls != tagged {
+		t.Errorf("Publish to npm calls publish-npm.sh %d times and passes the dist-tag %d times, want every call to pass it:\n%s",
+			calls, tagged, run)
 	}
 }
 
