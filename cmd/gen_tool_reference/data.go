@@ -52,7 +52,8 @@ type domain struct {
 
 // decodeDomains parses the data file, refusing a field it does not know and a
 // value after the object, and holds every text to being present and
-// non-empty in each language.
+// non-empty in each language, and to linking only the site's pages of its
+// own language.
 func decodeDomains(raw []byte) (domains, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -67,7 +68,9 @@ func decodeDomains(raw []byte) (domains, error) {
 	categories := map[string]bool{}
 	for _, c := range data.Categories {
 		categories[c.ID] = true
-		problems = append(problems, c.Title.missing("category "+c.ID+" title")...)
+		title := "category " + c.ID + " title"
+		problems = append(problems, c.Title.missing(title)...)
+		problems = append(problems, c.Title.strays(title)...)
 	}
 	used := map[string]bool{}
 	for _, tool := range data.sortedTools() {
@@ -76,10 +79,16 @@ func decodeDomains(raw []byte) (domains, error) {
 		if !categories[d.Category] {
 			problems = append(problems, fmt.Sprintf("%s: unknown category %q", tool, d.Category))
 		}
-		problems = append(problems, d.Title.missing(tool+" title")...)
-		problems = append(problems, d.Description.missing(tool+" description")...)
-		problems = append(problems, d.Overview.missing(tool+" overview")...)
-		problems = append(problems, d.Questions.missing(tool+" questions")...)
+		title, description := tool+" title", tool+" description"
+		overview, questions := tool+" overview", tool+" questions"
+		problems = append(problems, d.Title.missing(title)...)
+		problems = append(problems, d.Description.missing(description)...)
+		problems = append(problems, d.Overview.missing(overview)...)
+		problems = append(problems, d.Questions.missing(questions)...)
+		problems = append(problems, d.Title.strays(title)...)
+		problems = append(problems, d.Description.strays(description)...)
+		problems = append(problems, d.Overview.strays(overview)...)
+		problems = append(problems, d.Questions.strays(questions)...)
 	}
 	for _, c := range data.Categories {
 		if !used[c.ID] {
@@ -108,6 +117,28 @@ func (l localized) missing(what string) []string {
 	for _, language := range languages {
 		if strings.TrimSpace(l[language.code]) == "" {
 			problems = append(problems, fmt.Sprintf("%s has no %s text", what, language.code))
+		}
+	}
+	return problems
+}
+
+// strays names each link a language's text makes into the site's pages of
+// another language.
+func (l localized) strays(what string) []string {
+	var problems []string
+	for _, language := range languages {
+		problems = append(problems, language.strays(what, l[language.code])...)
+	}
+	return problems
+}
+
+// strays names each link an entry of a language's list makes into the
+// site's pages of another language.
+func (l localizedList) strays(what string) []string {
+	var problems []string
+	for _, language := range languages {
+		for _, entry := range l[language.code] {
+			problems = append(problems, language.strays(what, entry)...)
 		}
 	}
 	return problems
