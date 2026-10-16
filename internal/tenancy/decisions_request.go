@@ -71,6 +71,13 @@ func requestDecisions() []Decision {
 			enforce("internal/tools/usagedata", "maxMetricDefinitionsBytes"),
 			enforce("internal/tools/usagedata", "maxRenderedMetrics"),
 			enforce("internal/tools/usagedata", "maxRenderedYAMLBytes"),
+			// The code search Markdown shows the head of each snippet, a
+			// bounded run of bounded lines, and holds its heading, table
+			// rows and snippet sections to one budget for the page, as the
+			// client receives them.
+			enforce("internal/tools/search", "maxSnippetLines"),
+			enforce("internal/tools/search", "maxSnippetLineRunes"),
+			enforce("internal/tools/search", "maxCodeMarkdownBytes"),
 			enforce("internal/tools/projects", "maxAvatarBytes"),
 			enforce("internal/tools/jobs", "maxTraceBytes"),
 			// The lines of a log one trace read counts back from its end.
