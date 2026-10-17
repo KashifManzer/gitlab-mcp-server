@@ -29,8 +29,25 @@ const (
 	noteEmptySnippet = "The snippet GitLab sent for this result is empty."
 	// noteLongLines is what a snippet with a cut line says.
 	noteLongLines = "Lines longer than 300 characters are cut."
+	// notePathMatch is what the section of a file that matched by its path
+	// says, before anything else: its snippet is where the file starts, and
+	// need not hold the query at all.
+	notePathMatch = "This file matched the query by its path, so the snippet is the start of the file rather than the lines around a match."
+	// noteNameMatch is what the section of a file that matched by its path
+	// says when GitLab sent the path itself as the snippet, which is how
+	// exact code search answers a match on a file's name.
+	noteNameMatch = "This file matched the query by its path, and GitLab sent the path in place of a snippet."
 	// codeTableHeader is the header of the code search table.
 	codeTableHeader = "| Project | File | Path | Ref | Start line |\n| --- | --- | --- | --- | --- |\n"
+	// wikiTableHeader is the header of the wiki search table.
+	wikiTableHeader = "| Wiki | Page | Path | Ref | Start line |\n| --- | --- | --- | --- | --- |\n"
+	// hintWikiGet and hintGroupWikiGet are the hints every wiki search
+	// result closes with, one for each kind of wiki a page can belong to.
+	hintWikiGet      = "Use action 'wiki.get' to read a found page of a project wiki, with its project as project_id and its Page as slug"
+	hintGroupWikiGet = "Use action 'group.wiki_get' to read a found page of a group wiki, with its group as group_id and its Page as slug"
+	// hintCutWikiPage is the hint a wiki page with a cut or unshown snippet
+	// adds first.
+	hintCutWikiPage = "Use action 'wiki.get' to read the whole page of a cut or unshown snippet, or group.wiki_get for a group wiki, with its Page from the table, or its path without the extension from the structured result, as slug"
 	// defusedGuidanceHeading is guidanceHeading as the client receives it
 	// anywhere but in the server's own guidance section.
 	defusedGuidanceHeading = "&#128161; **Next steps:**"
@@ -171,13 +188,96 @@ func codeMarkdownBody(md string) string {
 	}
 }
 
-// assertCodeMarkdownRuns checks a page of total results against what its
-// notes say it left out: the table holds rows 1 to r and the sections results
-// 1 to s in order, with s <= r <= total; the snippet note names s+1 to r and
-// the table note r+1 to total, each as one run, in that order and nothing
-// else, whatever reason each gives; and the hint to read a whole file leads
-// whenever either note is there. It returns r and s.
+// listingOracle is what the oracle knows of a listing, apart from the
+// formatter: the subject of its heading, its table header, the row of result
+// i as written before delivery, the hint a page leads with when a note names
+// what it left out, and how many hints a page closes with otherwise. The row
+// of a fuzzed result is spelled from the fields the fuzz varies alone (its
+// path, whether it matched by its path, and for a wiki page whether it
+// belongs to a group), with every other cell the width the fuzz gives it.
+type listingOracle struct {
+	title, header string
+	row           func(i int, bl BlobOutput) string
+	cutHint       string
+	hints         int
+}
+
+// oracleNameMatched reports whether a result is, by the oracle's own reading, exact
+// code search's answer to a file that matched by its name: no blob id, and the
+// file's path, or its file name where it has no path, sent as the whole
+// snippet.
+func oracleNameMatched(bl BlobOutput) bool {
+	name := bl.Path
+	if name == "" {
+		name = bl.Filename
+	}
+	return bl.ID == "" && bl.Data != "" && bl.Data == name
+}
+
+// oraclePathMatched reports whether a result is, by the oracle's own reading, a file
+// that matched by its path: one GitLab gave a blob id, or one exact search
+// answered with its name.
+func oraclePathMatched(bl BlobOutput) bool {
+	return bl.ID != "" || oracleNameMatched(bl)
+}
+
+// oracleStartCell is the Start line cell of a fuzzed result as the oracle spells
+// it: "path match" for a file that matched by its path, and otherwise the
+// width of the start line the fuzz gives a content match.
+func oracleStartCell(bl BlobOutput) string {
+	if oraclePathMatched(bl) {
+		return "path match"
+	}
+	return "0"
+}
+
+// codeOracle is the code scope as the oracle knows it.
+var codeOracle = listingOracle{
+	title:  "Code Search Results",
+	header: codeTableHeader,
+	row: func(_ int, bl BlobOutput) string {
+		return toolutil.MarkdownTableRow("0", "f.go", toolutil.EscapeMdTableCell(bl.Path), "main", oracleStartCell(bl))
+	},
+	cutHint: hintCutSnippet,
+	hints:   1,
+}
+
+// wikiOracle is the wiki scope as the oracle knows it, for the pages
+// fuzzWikiPages builds: every third result is a page of group 7's wiki, the
+// rest pages of project 0's, and the Page column is the path up to the last
+// dot of its last element.
+var wikiOracle = listingOracle{
+	title:  "Wiki Search Results",
+	header: wikiTableHeader,
+	row: func(i int, bl BlobOutput) string {
+		owner := "project 0"
+		if fuzzGroupPage(i) {
+			owner = "group 7"
+		}
+		page := bl.Path
+		if dot := strings.LastIndexByte(page, '.'); dot > strings.LastIndexByte(page, '/') {
+			page = page[:dot]
+		}
+		return toolutil.MarkdownTableRow(owner, toolutil.EscapeMdTableCell(page), toolutil.EscapeMdTableCell(bl.Path), "main", oracleStartCell(bl))
+	},
+	cutHint: hintCutWikiPage,
+	hints:   2,
+}
+
+// assertCodeMarkdownRuns is assertListingRuns for a page of code search
+// results.
 func assertCodeMarkdownRuns(t *testing.T, md string, total int) (rows, sections int) {
+	t.Helper()
+	return assertListingRuns(t, md, total, codeOracle)
+}
+
+// assertListingRuns checks a page of total results of the listing o against
+// what its notes say it left out: the table holds rows 1 to r and the
+// sections results 1 to s in order, with s <= r <= total; the snippet note
+// names s+1 to r and the table note r+1 to total, each as one run, in that
+// order and nothing else, whatever reason each gives; and the hint to read a
+// whole file leads whenever either note is there. It returns r and s.
+func assertListingRuns(t *testing.T, md string, total int, o listingOracle) (rows, sections int) {
 	t.Helper()
 	doc := testutil.ScanGFM(md)
 	rows = doc.Rows
@@ -206,7 +306,7 @@ func assertCodeMarkdownRuns(t *testing.T, md string, total int) (rows, sections 
 	if !slices.EqualFunc(got, want, strings.HasPrefix) {
 		t.Fatalf("notes = %q, want them to open %q (rows %d, sections %d of %d)", got, want, rows, sections, total)
 	}
-	if hints := toolutil.ExtractHints(md); len(want) > 0 && (len(hints) != 2 || hints[0] != hintCutSnippet) {
+	if hints := toolutil.ExtractHints(md); len(want) > 0 && (len(hints) != o.hints+1 || hints[0] != o.cutHint) {
 		t.Fatalf("hints = %q, want the cut hint first while a note names what was left out", hints)
 	}
 	return rows, sections
@@ -255,6 +355,116 @@ func TestFormatCodeMarkdown_TwoResults_SnippetsFollowTheTable(t *testing.T) {
 		"- " + hintFileGet + "\n"
 	if got != want {
 		t.Errorf("two code search results:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestFormatCodeMarkdown_PathMatch_SaysTheSnippetIsTheStartOfTheFile verifies
+// that a result which matched by its path says so in its row and its section,
+// in each shape GitLab answers one with, while a content match keeps the line
+// its snippet starts on. Basic search gives such a file its blob id and the
+// start of the file as its snippet, so its section is headed as a path match
+// and says first that the snippet is the start of the file, before any note
+// about what the snippet's caps cut; an empty file says both that and that
+// GitLab sent nothing of it. Exact code search sends no blob id and answers a
+// file that matched by its name with the path itself as the snippet, start
+// line 1 on GitLab master and 0 on 19.4, so its section says GitLab sent the
+// path in place of a snippet and fences nothing. A content match whose line
+// merely holds the path, ending with the line feed every line of a snippet
+// carries, stays a content match.
+func TestFormatCodeMarkdown_PathMatch_SaysTheSnippetIsTheStartOfTheFile(t *testing.T) {
+	longLine := strings.Repeat("y", maxSnippetLineRunes+1) + "\n"
+	tests := []struct {
+		name  string
+		blobs []BlobOutput
+		want  string
+	}{
+		{
+			name: "path match beside a content match",
+			blobs: []BlobOutput{
+				{ProjectID: 42, Path: "wikis_test.go", Filename: "wikis_test.go", ID: "dad0c4fb7b1d70e47a702cf8d2577c32290dd330", Ref: "main", Startline: 1, Data: "//\n// Copyright 2021\n"},
+				{ProjectID: 42, Path: "wikis.go", Filename: "wikis.go", Ref: "main", Startline: 1, Data: "// Copyright 2021\n"},
+			},
+			want: codeTablePrefix(2) +
+				"| 42 | wikis_test.go | wikis_test.go | main | path match |\n" +
+				"| 42 | wikis.go | wikis.go | main | 1 |\n" +
+				"\n### Result 1: wikis_test.go (project 42, path match)\n\n" +
+				notePathMatch + "\n\n" +
+				"```\n//\n// Copyright 2021\n```\n" +
+				"\n### Result 2: wikis.go (project 42, start line 1)\n\n" +
+				"```\n// Copyright 2021\n```\n" +
+				pageOfFooter(2, hintFileGet),
+		},
+		{
+			name: "empty file matched by its path",
+			blobs: []BlobOutput{
+				{ProjectID: 42, Path: "empty.go", Filename: "empty.go", ID: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", Ref: "main", Startline: 1},
+			},
+			want: codeTablePrefix(1) +
+				"| 42 | empty.go | empty.go | main | path match |\n" +
+				"\n### Result 1: empty.go (project 42, path match)\n\n" +
+				notePathMatch + "\n\n" +
+				noteEmptySnippet + "\n" +
+				pageOfFooter(1, hintFileGet),
+		},
+		{
+			name: "path match whose snippet passes both caps",
+			blobs: []BlobOutput{
+				{ProjectID: 42, Path: "a.go", Filename: "a.go", ID: "0123456789abcdef0123456789abcdef01234567", Ref: "main", Startline: 1, Data: longLine + numberedLines(maxSnippetLines)},
+			},
+			want: codeTablePrefix(1) +
+				"| 42 | a.go | a.go | main | path match |\n" +
+				"\n### Result 1: a.go (project 42, path match)\n\n" +
+				notePathMatch + "\n\n" +
+				"Showing the first 10 of the 11 lines GitLab sent for this result.\n\n" +
+				noteLongLines + "\n\n" +
+				"```\n" + longLine[:maxSnippetLineRunes] + "\n" + numberedLines(maxSnippetLines-1) + "```\n" +
+				pageOfFooter(1, hintCutSnippet, hintFileGet),
+		},
+		{
+			name: "exact search answers a name match with the path",
+			blobs: []BlobOutput{
+				{ProjectID: 65271576, Basename: "./group_wikis_test", Path: "group_wikis_test.go", Filename: "group_wikis_test.go", Ref: "main", Startline: 1, Data: "group_wikis_test.go"},
+				{ProjectID: 65271576, Basename: "./group_wikis", Path: "group_wikis.go", Filename: "group_wikis.go", Ref: "main", Startline: 39, Data: "\t//\n\tGroupWikisService struct {\n"},
+			},
+			want: codeTablePrefix(2) +
+				"| 65271576 | group_wikis_test.go | group_wikis_test.go | main | path match |\n" +
+				"| 65271576 | group_wikis.go | group_wikis.go | main | 39 |\n" +
+				"\n### Result 1: group_wikis_test.go (project 65271576, path match)\n\n" +
+				noteNameMatch + "\n" +
+				"\n### Result 2: group_wikis.go (project 65271576, start line 39)\n\n" +
+				"```\n\t//\n\tGroupWikisService struct {\n```\n" +
+				pageOfFooter(2, hintFileGet),
+		},
+		{
+			name: "exact search on GitLab 19.4 answers a name match on line 0",
+			blobs: []BlobOutput{
+				{ProjectID: 7, Path: "dir/wikis.go", Filename: "dir/wikis.go", Ref: "main", Data: "dir/wikis.go"},
+			},
+			want: codeTablePrefix(1) +
+				"| 7 | dir/wikis.go | dir/wikis.go | main | path match |\n" +
+				"\n### Result 1: dir/wikis.go (project 7, path match)\n\n" +
+				noteNameMatch + "\n" +
+				pageOfFooter(1, hintFileGet),
+		},
+		{
+			name: "a line that holds the path is a content match",
+			blobs: []BlobOutput{
+				{ProjectID: 7, Path: "wikis.go", Filename: "wikis.go", Ref: "main", Startline: 4, Data: "wikis.go\n"},
+			},
+			want: codeTablePrefix(1) +
+				"| 7 | wikis.go | wikis.go | main | 4 |\n" +
+				"\n### Result 1: wikis.go (project 7, start line 4)\n\n" +
+				"```\nwikis.go\n```\n" +
+				pageOfFooter(1, hintFileGet),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FormatCodeMarkdown(CodeOutput{Blobs: tt.blobs, Pagination: pageOf(len(tt.blobs))})
+			if got != tt.want {
+				t.Errorf("FormatCodeMarkdown:\n got %q\nwant %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1144,6 +1354,30 @@ func fuzzPage(kind uint8, n int) toolutil.PaginationOutput {
 	return p
 }
 
+// fuzzShape is the shape of the page FuzzFormatCodeMarkdown renders, apart
+// from the text its results carry: how many times the even results' path
+// repeats, how many results there are, which of the four kinds of page holds
+// them, and which of them matched by their path. A fuzz target takes no
+// struct, so the fuzzer passes the four as one byte each, in that order, and
+// not packed into one integer, which it only ever moves up or down by at most
+// 100, so that every field above the lowest would hardly leave its seed.
+type fuzzShape struct {
+	reps, count, kind, match uint8
+}
+
+// fuzzShapeOf reads the shape the fuzzer passed: one byte per field, a byte
+// the input is short of reading as zero and any past the fourth ignored.
+func fuzzShapeOf(b []byte) fuzzShape {
+	var f [4]uint8
+	copy(f[:], b)
+	return fuzzShape{reps: f[0], count: f[1], kind: f[2], match: f[3]}
+}
+
+// bytes is the fuzz argument fuzzShapeOf reads back as s.
+func (s fuzzShape) bytes() []byte {
+	return []byte{s.reps, s.count, s.kind, s.match}
+}
+
 // FuzzFormatCodeMarkdown holds the code search Markdown to its invariants
 // whatever a snippet or a path holds and whatever page GitLab answered with:
 // valid UTF-8, every fence closed so the one guidance section is the server's,
@@ -1155,7 +1389,11 @@ func fuzzPage(kind uint8, n int) toolutil.PaginationOutput {
 // down the page, the first repeated, so that the rows alone can pass the
 // budget, up to a first row that does not fit at all, and so that rows of two
 // sizes interleave: a table that skipped a row too large and went on with the
-// smaller ones after it would show more rows than one taken in order.
+// smaller ones after it would show more rows than one taken in order. A mask
+// gives some results a blob id, which is how basic search marks a file that
+// matched by its path, a snippet equal to the path is how exact search marks
+// one, and each row and each section shown must say which kind its result is,
+// the section first of all.
 func FuzzFormatCodeMarkdown(f *testing.F) {
 	for _, seed := range []string{
 		"", "a", "```", "````\n```", "a\r\nb\r\n", "a\rb", "\r", "\n\n\n",
@@ -1170,9 +1408,17 @@ func FuzzFormatCodeMarkdown(f *testing.F) {
 		strings.Repeat("x"+strings.Repeat(" ", 290)+"\n", 10),
 		strings.Repeat("x\x01\x7f\u0085\n", 10),
 	} {
-		f.Add(seed, "dir/file.go", "b.go", uint8(0), uint8(1), uint8(0))
-		f.Add(seed, "dir/file.go", "b.go", uint8(0), uint8(39), uint8(1))
+		f.Add(seed, "dir/file.go", "b.go", fuzzShape{count: 1}.bytes())
+		f.Add(seed, "dir/file.go", "b.go", fuzzShape{count: 39, kind: 1}.bytes())
+		f.Add(seed, "dir/file.go", "b.go", fuzzShape{count: 1, match: 1}.bytes())
+		f.Add(seed, "dir/file.go", "b.go", fuzzShape{count: 39, kind: 1, match: 0x5a}.bytes())
 	}
+	// A snippet that is the path itself, which is how exact search answers a
+	// file that matched by its name: alone, beside a blob id, and on the odd
+	// results' path among results of the other.
+	f.Add("dir/file.go", "dir/file.go", "b.go", fuzzShape{count: 1}.bytes())
+	f.Add("dir/file.go", "dir/file.go", "b.go", fuzzShape{count: 1, match: 1}.bytes())
+	f.Add("b.go", "dir/file.go", "b.go", fuzzShape{count: 39, kind: 1, match: 0x5a}.bytes())
 	// Rows of these paths pass the budget on their own: a long path, one that
 	// is longer still once defused, one repeated past what a single row may
 	// carry, so that no row fits at all, and long rows between short ones on
@@ -1190,41 +1436,149 @@ func FuzzFormatCodeMarkdown(f *testing.F) {
 		{path: "a.go", other: strings.Repeat("o", 9500)},
 	} {
 		for kind := range uint8(4) {
-			f.Add("x\n", seed.path, seed.other, seed.reps, uint8(39), kind)
+			f.Add("x\n", seed.path, seed.other, fuzzShape{reps: seed.reps, count: 39, kind: kind}.bytes())
 		}
-		f.Add("x\n", seed.path, seed.other, seed.reps, uint8(0), uint8(1))
-		f.Add(strings.Repeat(strings.Repeat("z", 300)+"\n", 10), seed.path, seed.other, seed.reps, uint8(39), uint8(0))
+		f.Add("x\n", seed.path, seed.other, fuzzShape{reps: seed.reps, kind: 1, match: 0xff}.bytes())
+		f.Add(strings.Repeat(strings.Repeat("z", 300)+"\n", 10), seed.path, seed.other, fuzzShape{reps: seed.reps, count: 39, match: 0xa5}.bytes())
 	}
-	f.Fuzz(func(t *testing.T, data, path, other string, reps, count, kind uint8) {
-		blobs := fuzzBlobs(data, path, other, reps, count)
-		p := fuzzPage(kind, len(blobs))
-		md := FormatCodeMarkdown(CodeOutput{Blobs: blobs, Pagination: p})
-		doc := assertCodeMarkdownSound(t, md)
-		rows, _ := assertCodeMarkdownRuns(t, md, len(blobs))
-		assertCodeTableOracle(t, md, doc, blobs, p, rows)
+	f.Fuzz(func(t *testing.T, data, path, other string, shape []byte) {
+		s := fuzzShapeOf(shape)
+		blobs := fuzzBlobs(data, path, other, s)
+		p := fuzzPage(s.kind, len(blobs))
+		for _, listing := range []struct {
+			o  listingOracle
+			md string
+		}{
+			{o: codeOracle, md: FormatCodeMarkdown(CodeOutput{Blobs: blobs, Pagination: p})},
+			{o: wikiOracle, md: FormatWikiMarkdown(WikiOutput{WikiBlobs: fuzzWikiPages(blobs), Pagination: p})},
+		} {
+			doc := assertCodeMarkdownSound(t, listing.md)
+			rows, sections := assertListingRuns(t, listing.md, len(blobs), listing.o)
+			assertTableOracle(t, listing.md, doc, blobs, p, rows, listing.o)
+			assertMatchKindSections(t, doc, blobs, sections)
+		}
 	})
 }
 
-// fuzzBlobs is the page FuzzFormatCodeMarkdown renders: count%40+1 results
-// of data, the even ones at path repeated reps%48+1 times and the odd ones at
-// other.
-func fuzzBlobs(data, path, other string, reps, count uint8) []BlobOutput {
+// fuzzGroupPage reports whether result i of a fuzzed wiki page belongs to a
+// group wiki rather than a project's: every third result does.
+func fuzzGroupPage(i int) bool {
+	return i%3 == 2
+}
+
+// fuzzWikiPages is the page of wiki search results FuzzFormatCodeMarkdown
+// renders beside blobs: the same results as pages of project 0's wiki,
+// every third of them a page of group 7's wiki instead, which GitLab answers
+// with no project.
+func fuzzWikiPages(blobs []BlobOutput) []WikiBlobOutput {
+	pages := make([]WikiBlobOutput, len(blobs))
+	for i, bl := range blobs {
+		pages[i] = WikiBlobOutput{
+			Basename: bl.Basename, Data: bl.Data, Path: bl.Path, Filename: bl.Filename,
+			ID: bl.ID, Ref: bl.Ref, Startline: bl.Startline, ProjectID: bl.ProjectID,
+		}
+		if fuzzGroupPage(i) {
+			pages[i].GroupID = 7
+		}
+	}
+	return pages
+}
+
+// fuzzBlobs is the page FuzzFormatCodeMarkdown renders: s.count%40+1 results
+// of data, the even ones at path repeated s.reps%48+1 times and the odd ones
+// at other. Result i matched by its path, and carries a blob id, when bit i%8
+// of s.match is set.
+func fuzzBlobs(data, path, other string, s fuzzShape) []BlobOutput {
 	// A path reaches the formatter through JSON decoding, which replaces every
 	// invalid byte, so it is valid UTF-8 by the time it is a field.
-	path = strings.Repeat(strings.ToValidUTF8(path, "\uFFFD"), int(reps%48)+1)
+	path = strings.Repeat(strings.ToValidUTF8(path, "\uFFFD"), int(s.reps%48)+1)
 	other = strings.ToValidUTF8(other, "\uFFFD")
-	blobs := make([]BlobOutput, int(count%40)+1)
+	blobs := make([]BlobOutput, int(s.count%40)+1)
 	for i := range blobs {
 		blobs[i] = BlobOutput{Filename: "f.go", Path: path, Ref: "main", Data: data}
 		if i%2 == 1 {
 			blobs[i].Path = other
 		}
+		if s.match>>(i%8)&1 == 1 {
+			blobs[i].ID = "0123456789abcdef0123456789abcdef01234567"
+			blobs[i].Startline = 1
+		}
 	}
 	return blobs
 }
 
-// assertCodeMarkdownSound checks what holds of every code search response
-// whatever GitLab sent: valid UTF-8 with no carriage return, the heading,
+// assertMatchKindSections checks that each of the first sections results
+// shown says which kind of match it is, section by section and apart from the
+// formatter. A result GitLab gave a blob id is headed as a path match and the
+// first thing its section says, before any note about what the snippet's caps
+// cut, is that the snippet is the start of the file; a result exact search
+// answered with its name is headed as a path match and says first that GitLab
+// sent the path in place of a snippet; every other result is headed with the
+// line its snippet starts on and says neither. Neither note appears anywhere
+// in a section but first. A section's lines are the server's own lines
+// outside a fence from its heading to the next one, so a snippet that spells
+// either note inside its fence is not read as saying it.
+func assertMatchKindSections(t *testing.T, doc *testutil.GFMDocument, blobs []BlobOutput, sections int) {
+	t.Helper()
+	for i, heading := range doc.Headings[1 : sections+1] {
+		suffix := fmt.Sprintf(", start line %d)", blobs[i].Startline)
+		if oraclePathMatched(blobs[i]) {
+			suffix = ", path match)"
+		}
+		if !strings.HasSuffix(heading, suffix) {
+			t.Fatalf("section %d is headed %q, want it to end %q", i+1, heading, suffix)
+		}
+	}
+	bodies := sectionBodies(doc)
+	if len(bodies) != sections {
+		t.Fatalf("%d sections read, want %d", len(bodies), sections)
+	}
+	for i, body := range bodies {
+		want := ""
+		if blobs[i].ID != "" {
+			want = notePathMatch
+		} else if oracleNameMatched(blobs[i]) {
+			want = noteNameMatch
+		}
+		for j, line := range body {
+			says := line == notePathMatch || line == noteNameMatch
+			if j == 0 && line != want && (want != "" || says) {
+				t.Fatalf("section %d opens %q, want %q", i+1, line, want)
+			}
+			if j > 0 && says {
+				t.Fatalf("section %d says %q at line %d of its notes, want it only first", i+1, line, j+1)
+			}
+		}
+		if want != "" && len(body) == 0 {
+			t.Fatalf("section %d says nothing, want it to open %q", i+1, want)
+		}
+	}
+}
+
+// sectionBodies splits the lines of a scanned response that are outside every
+// fence into the snippet sections they follow: one entry per section heading
+// after the list heading, holding the non-blank lines from that heading to the
+// next one, the last section's running to the end of the response.
+func sectionBodies(doc *testutil.GFMDocument) [][]string {
+	var bodies [][]string
+	seen := 0
+	for _, line := range doc.Content {
+		if seen < len(doc.Headings) && strings.TrimSpace(line) == doc.Headings[seen] {
+			seen++
+			if seen > 1 {
+				bodies = append(bodies, nil)
+			}
+			continue
+		}
+		if seen > 1 && strings.TrimSpace(line) != "" {
+			bodies[seen-2] = append(bodies[seen-2], line)
+		}
+	}
+	return bodies
+}
+
+// assertCodeMarkdownSound checks what holds of every code or wiki search
+// response whatever GitLab sent: valid UTF-8 with no carriage return, the heading,
 // table and sections within the budget and the whole within the budget and
 // its tail as delivered, one guidance section, which every fence being closed
 // leaves the server's, and no heading, row, link or list item from GitLab's
@@ -1256,26 +1610,27 @@ func assertCodeMarkdownSound(t *testing.T, md string) *testutil.GFMDocument {
 	return doc
 }
 
-// assertCodeTableOracle holds a rendered page of blobs to what the budget
-// allows, computed here apart from the formatter: the rows shown are the
-// longest run from the first whose heading, counting them, the header and the
-// rows fit as delivered; the response opens with that heading; and the table
-// note, when there is one, offers a smaller page for the results whose row
-// would fit a page of its own and names the ones whose row would not.
-func assertCodeTableOracle(t *testing.T, md string, doc *testutil.GFMDocument, blobs []BlobOutput, p toolutil.PaginationOutput, rows int) {
+// assertTableOracle holds a rendered page of blobs of the listing o to what
+// the budget allows, computed here apart from the formatter: the rows shown
+// are the longest run from the first whose heading, counting them, the header
+// and the rows fit as delivered; the response opens with that heading; and
+// the table note, when there is one, offers a smaller page for the results
+// whose row would fit a page of its own and names the ones whose row would
+// not.
+func assertTableOracle(t *testing.T, md string, doc *testutil.GFMDocument, blobs []BlobOutput, p toolutil.PaginationOutput, rows int, o listingOracle) {
 	t.Helper()
 	heading := func(shown int) string {
 		var b strings.Builder
-		toolutil.WriteListHeading(&b, "Code Search Results", shown, p)
+		toolutil.WriteListHeading(&b, o.title, shown, p)
 		return b.String()
 	}
-	rowSize := func(bl BlobOutput) int {
-		return len(delivered(toolutil.DefuseHintsHeading(toolutil.MarkdownTableRow("0", "f.go", toolutil.EscapeMdTableCell(bl.Path), "main", "0"))))
+	rowSize := func(i int) int {
+		return len(delivered(toolutil.DefuseHintsHeading(o.row(i, blobs[i]))))
 	}
 	n := len(blobs)
-	want, used := 0, len(codeTableHeader)
-	for want < n && len(heading(want+1))+used+rowSize(blobs[want]) <= maxCodeMarkdownBytes {
-		used += rowSize(blobs[want])
+	want, used := 0, len(o.header)
+	for want < n && len(heading(want+1))+used+rowSize(want) <= maxCodeMarkdownBytes {
+		used += rowSize(want)
 		want++
 	}
 	if rows != want {
@@ -1289,7 +1644,7 @@ func assertCodeTableOracle(t *testing.T, md string, doc *testutil.GFMDocument, b
 	}
 	var tooLarge []int
 	for i := rows; i < n; i++ {
-		if len(heading(1))+len(codeTableHeader)+rowSize(blobs[i]) > maxCodeMarkdownBytes {
+		if len(heading(1))+len(o.header)+rowSize(i) > maxCodeMarkdownBytes {
 			tooLarge = append(tooLarge, i+1)
 		}
 	}
@@ -1319,5 +1674,87 @@ func tableNoteReason(run int, tooLarge []int) string {
 		return fmt.Sprintf(", as the response would be too large. Ask for fewer results per page to see them, except result %d, whose row alone would make the response too large.", tooLarge[0])
 	default:
 		return fmt.Sprintf(", as the response would be too large. Ask for fewer results per page to see them, except the %d whose rows alone would make the response too large, the first of them result %d.", len(tooLarge), tooLarge[0])
+	}
+}
+
+// TestFormatWikiMarkdown_NoPages_SaysNoneWereFound verifies that an empty wiki
+// search is the one sentence and nothing else.
+func TestFormatWikiMarkdown_NoPages_SaysNoneWereFound(t *testing.T) {
+	if got, want := FormatWikiMarkdown(WikiOutput{}), "No wiki pages found.\n"; got != want {
+		t.Errorf("empty wiki search:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestFormatWikiMarkdown_Pages_RenderedAsTheBlobsGitLabSends verifies the
+// whole render of a page of wiki search results, which GitLab answers with
+// the blob entity code search answers with: the table names the wiki each
+// page belongs to (a group's for a page advanced search answers with no
+// project), the page by its slug, which is its path without the extension,
+// the path, the ref and the line its snippet starts on, and each snippet
+// follows in a section of its own, a page whose file matched by its path
+// saying its snippet is the start of the file. Values GitLab authored are
+// escaped in the table and in the section headings. A page cut short by the
+// snippet caps closes with the hint naming both wiki actions first.
+func TestFormatWikiMarkdown_Pages_RenderedAsTheBlobsGitLabSends(t *testing.T) {
+	tests := []struct {
+		name  string
+		pages []WikiBlobOutput
+		want  string
+	}{
+		{
+			name: "project wiki, path match beside a content match",
+			pages: []WikiBlobOutput{
+				{ProjectID: 42, Path: "runbook.md", Filename: "runbook.md", ID: "dad0c4fb6e1bbbcd01e2d2b2a3c3b54e49ba8c1c", Ref: "main", Startline: 1, Data: "# Runbook\n"},
+				{ProjectID: 42, Path: "ops/on-call.md", Filename: "ops/on-call.md", Ref: "main", Startline: 3, Data: "See the runbook.\n"},
+			},
+			want: "## Wiki Search Results (2)\n\n" + wikiTableHeader +
+				"| project 42 | runbook | runbook.md | main | path match |\n" +
+				"| project 42 | ops/on-call | ops/on-call.md | main | 3 |\n" +
+				"\n### Result 1: runbook.md (project 42, path match)\n\n" +
+				notePathMatch + "\n\n" +
+				"```\n# Runbook\n```\n" +
+				"\n### Result 2: ops/on-call.md (project 42, start line 3)\n\n" +
+				"```\nSee the runbook.\n```\n" +
+				pageOfFooter(2, hintWikiGet, hintGroupWikiGet),
+		},
+		{
+			name: "group wiki page beside a project page of the group",
+			pages: []WikiBlobOutput{
+				{GroupID: 7, Path: "home.md", Filename: "home.md", Ref: "4f0e1c2", Startline: 1, Data: "runbook\n"},
+				{ProjectID: 42, GroupID: 7, Path: "a|[b].rdoc", Filename: "a|[b].rdoc", Ref: "9a8b7c6", Startline: 2, Data: "runbook\n"},
+				{Path: "v1.2/noext", Filename: "v1.2/noext", Ref: "main", Startline: 5, Data: "runbook\n"},
+			},
+			want: "## Wiki Search Results (3)\n\n" + wikiTableHeader +
+				"| group 7 | home | home.md | 4f0e1c2 | 1 |\n" +
+				"| project 42 | a&#124;&#91;b] | a&#124;&#91;b].rdoc | 9a8b7c6 | 2 |\n" +
+				"| project 0 | v1.2/noext | v1.2/noext | main | 5 |\n" +
+				"\n### Result 1: home.md (group 7, start line 1)\n\n" +
+				"```\nrunbook\n```\n" +
+				"\n### Result 2: a|&#91;b].rdoc (project 42, start line 2)\n\n" +
+				"```\nrunbook\n```\n" +
+				"\n### Result 3: v1.2/noext (project 0, start line 5)\n\n" +
+				"```\nrunbook\n```\n" +
+				pageOfFooter(3, hintWikiGet, hintGroupWikiGet),
+		},
+		{
+			name: "snippet past the line cap",
+			pages: []WikiBlobOutput{
+				{ProjectID: 42, Path: "long.md", Filename: "long.md", Ref: "main", Startline: 1, Data: numberedLines(maxSnippetLines + 1)},
+			},
+			want: "## Wiki Search Results (1)\n\n" + wikiTableHeader +
+				"| project 42 | long | long.md | main | 1 |\n" +
+				"\n### Result 1: long.md (project 42, start line 1)\n\n" +
+				"Showing the first 10 of the 11 lines GitLab sent for this result.\n\n" +
+				"```\n" + numberedLines(maxSnippetLines) + "```\n" +
+				pageOfFooter(1, hintCutWikiPage, hintWikiGet, hintGroupWikiGet),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FormatWikiMarkdown(WikiOutput{WikiBlobs: tt.pages, Pagination: pageOf(len(tt.pages))})
+			if got != tt.want {
+				t.Errorf("FormatWikiMarkdown:\n got %q\nwant %q", got, tt.want)
+			}
+		})
 	}
 }

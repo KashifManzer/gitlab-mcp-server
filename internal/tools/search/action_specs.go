@@ -72,7 +72,7 @@ func searchCodeSpec(client *gitlabclient.Client) toolutil.ActionSpec {
 	options.Aliases = []string{"code search", "file content search", "find code", "search repository files"}
 	options.Tags = append(options.Tags, "code", "blob", "file_content")
 	options.RelatedActions = []string{actionSearchProjects, "repository.file_get", "repository.tree"}
-	options.IndividualTool.Description = "Search code blobs across global, group, or project scope. Returns: matching blobs with file path, basename, ref, starting line, the surrounding snippet, project ID, and pagination metadata. See also: gitlab_search_projects, gitlab_file_get, gitlab_repository_tree."
+	options.IndividualTool.Description = "Search code blobs across global, group, or project scope. Returns: matching blobs with file path, basename, ref, the line the snippet starts on, the snippet, project ID, and pagination metadata. On basic search a file that matched by its path also carries its blob ID, and its snippet is the start of the file rather than the lines around a match. On exact search such a file carries its path in place of a snippet. See also: gitlab_search_projects, gitlab_file_get, gitlab_repository_tree."
 	return toolutil.NewReadActionSpec(specCode, searchRoute(client, Code), options)
 }
 
@@ -164,7 +164,7 @@ var searchActionMeta = map[string]searchActionMetaEntry{
 		aliases:     []string{"search notes", "search comments", "find notes by content", "full-text note search"},
 		tags:        []string{"note", "comment"},
 		related:     []string{actionSearchIssues, actionSearchMergeRequests, actionIssueNoteList},
-		description: "Search note bodies within one project. Returns: matching notes with body, author, noteable type and ID, system flag, and timestamps plus pagination metadata. See also: gitlab_search_issues, gitlab_search_merge_requests, gitlab_issue_note_list.",
+		description: "Search note bodies within one project. Returns: matching notes with body, author, noteable type and ID, system and internal flags, and timestamps plus pagination metadata. See also: gitlab_search_issues, gitlab_search_merge_requests, gitlab_issue_note_list.",
 	},
 	"gitlab_search_snippets": {
 		usage:       "Search snippet titles globally (no group or project scope). Use to locate a snippet by its title keywords across the instance.",
@@ -184,8 +184,8 @@ var searchActionMeta = map[string]searchActionMetaEntry{
 		usage:       "Search wiki page contents across global, group (group_id), or project (project_id) scope. Use to find wiki pages by their body or title keywords.",
 		aliases:     []string{"search wiki", "search wiki content", "find wiki by content", "full-text wiki search"},
 		tags:        []string{"wiki", "blob"},
-		related:     []string{actionSearchCode, "wiki.list", "wiki.get"},
-		description: "Search wiki blobs across global, group, or project scope. Returns: matching wiki pages with slug, title, content snippet, and format plus pagination metadata. See also: gitlab_search_code, gitlab_wiki_list, gitlab_wiki_get.",
+		related:     []string{actionSearchCode, "wiki.list", "wiki.get", "group.wiki_get"},
+		description: "Search wiki blobs across global, group, or project scope. Returns: the file of each matching wiki page with its path (the page slug plus the format's extension), ref, the line the snippet starts on, the snippet, its project ID and, from advanced search, its group ID (a page of a group wiki carries the group alone), and pagination metadata. On basic search a page whose file matched by its path also carries its blob ID, and its snippet is the start of the page. See also: gitlab_search_code, gitlab_wiki_list, gitlab_wiki_get, gitlab_group_wiki_get.",
 	},
 }
 

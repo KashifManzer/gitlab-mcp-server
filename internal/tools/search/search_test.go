@@ -88,6 +88,57 @@ func TestSearchCode_ProjectScope(t *testing.T) {
 	}
 }
 
+// TestSearchCode_PathAndContentMatch_PublishTheBlobIDGitLabSends verifies
+// that a result carries the blob id GitLab sends and that the structured
+// result tells the two kinds of basic-search result apart: GitLab sets the id
+// only on a file that matched by its path, whose data is the start of the
+// file, and answers null for a match on the file's content, which the result
+// leaves out rather than publishing an empty string.
+func TestSearchCode_PathAndContentMatch_PublishTheBlobIDGitLabSends(t *testing.T) {
+	const blobID = "dad0c4fb7b1d70e47a702cf8d2577c32290dd330"
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == pathSearchProject {
+			testutil.AssertQueryParam(t, r, queryScope, scopeBlobs)
+			testutil.RespondJSONWithPagination(w, http.StatusOK, `[
+				{"basename":"wikis_test","data":"//\n// Copyright\n","path":"wikis_test.go",
+				 "filename":"wikis_test.go","id":"`+blobID+`","ref":"main","startline":1,"project_id":42},
+				{"basename":"wikis","data":"// Copyright\n","path":"wikis.go",
+				 "filename":"wikis.go","id":null,"ref":"main","startline":1,"project_id":42}
+			]`, defaultPagination)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+
+	out, err := Code(context.Background(), client, CodeInput{ProjectID: "42", Query: "wikis_test", SearchType: "basic"})
+	if err != nil {
+		t.Fatalf(fmtUnexpErr, err)
+	}
+	if len(out.Blobs) != 2 {
+		t.Fatalf("len(Blobs) = %d, want 2", len(out.Blobs))
+	}
+	if got := out.Blobs[0].ID; got != blobID {
+		t.Errorf("path match ID = %q, want %q", got, blobID)
+	}
+	if got := out.Blobs[1].ID; got != "" {
+		t.Errorf("content match ID = %q, want none", got)
+	}
+	raw, err := json.Marshal(out.Blobs)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var rows []map[string]any
+	if err = json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := rows[0]["id"]; got != blobID {
+		t.Errorf("path match publishes id %v, want %q", got, blobID)
+	}
+	if got, ok := rows[1]["id"]; ok {
+		t.Errorf("content match publishes id %v, want the key left out", got)
+	}
+}
+
 // TestSearchCode_SearchType verifies that the optional search_type parameter
 // is forwarded to GitLab Search API requests.
 func TestSearchCode_SearchType(t *testing.T) {
@@ -534,13 +585,14 @@ func TestSearchCommits_Refused_ReportsTheRefusal(t *testing.T) {
 }
 
 // TestScopedSearches_AnswerClientGoCannotDecode_ReportClientGosDecodeFailure
-// holds the scope of what search.commits passes over: client-go failing to
-// decode GitLab's answer is dropped only for the one search that reads its
-// page from the captured response. Every other search sent at a project, a
-// group or the whole instance, fed an answer with a key of the wrong JSON
-// type, still fails with client-go's own decode error, never with the
-// capture's and never as an empty page. The issue case names iid rather than
-// id because client-go's Issue reads a string id as an external tracker's.
+// holds the scope of what search.commits and search.wiki pass over: client-go
+// failing to decode GitLab's answer is dropped only for the two searches that
+// read their page from the captured response. Every other search sent at a
+// project, a group or the whole instance, fed an answer with a key of the
+// wrong JSON type, still fails with client-go's own decode error, never with
+// the capture's and never as an empty page. The issue case names iid rather
+// than id because client-go's Issue reads a string id as an external
+// tracker's.
 func TestScopedSearches_AnswerClientGoCannotDecode_ReportClientGosDecodeFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -561,9 +613,6 @@ func TestScopedSearches_AnswerClientGoCannotDecode_ReportClientGosDecodeFailure(
 		}},
 		{name: "users", body: `[{"id":"x"}]`, search: func(ctx context.Context, client *gitlabclient.Client) (any, error) {
 			return Users(ctx, client, UsersInput{ProjectID: "42", Query: "x"})
-		}},
-		{name: "wiki", body: `[{"title":5}]`, search: func(ctx context.Context, client *gitlabclient.Client) (any, error) {
-			return Wiki(ctx, client, WikiInput{ProjectID: "42", Query: "x"})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -873,48 +922,129 @@ func TestSearchUsers_EmptyQuery(t *testing.T) {
 // Wiki Blobs
 // ---------------------------------------------------------------------------.
 
-// TestSearchWiki_GlobalScope verifies SearchWiki when global scope.
-func TestSearchWiki_GlobalScope(t *testing.T) {
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == pathSearchGlobal && r.URL.Query().Get(queryScope) == "wiki_blobs" {
-			testutil.RespondJSONWithPagination(w, http.StatusOK, `[{
-				"slug":"home","title":"Home","content":"Welcome to the wiki","format":"markdown"
-			}]`, defaultPagination)
-			return
-		}
-		http.NotFound(w, r)
-	}))
+// TestSearchWiki_EveryScope_PublishesTheBlobsGitLabSends holds search.wiki to
+// the entity GitLab answers the wiki_blobs scope with, which is the blob code
+// search answers with plus group_id (lib/api/search.rb SCOPE_ENTITY,
+// lib/api/entities/blob.rb). Project scope is served by basic search, whose
+// rows carry no group (group_id null) and a blob id only for a page whose file
+// matched by its path; group and global scope are served by advanced search,
+// which sends no id, names the group of the wiki, and answers a page of a
+// group wiki with no project. client-go decodes this scope into its Wiki
+// struct, which holds none of those keys, so every field used to be empty;
+// the rows are read off the captured response, and the pagination headers
+// still reach the output.
+func TestSearchWiki_EveryScope_PublishesTheBlobsGitLabSends(t *testing.T) {
+	const blobID = "dad0c4fb6e1bbbcd01e2d2b2a3c3b54e49ba8c1c"
+	for _, tc := range []struct {
+		name  string
+		path  string
+		input WikiInput
+		body  string
+		want  []WikiBlobOutput
+	}{
+		{
+			name:  "project",
+			path:  pathSearchProject,
+			input: WikiInput{ProjectID: "42", Query: "runbook"},
+			body: `[
+				{"basename":"runbook","data":"# Runbook\n","path":"runbook.md","filename":"runbook.md",
+				 "id":"` + blobID + `","ref":"main","startline":1,"project_id":42,"group_id":null},
+				{"basename":"on-call","data":"See the runbook.\n","path":"on-call.md","filename":"on-call.md",
+				 "id":null,"ref":"main","startline":3,"project_id":42,"group_id":null}
+			]`,
+			want: []WikiBlobOutput{
+				{Basename: "runbook", Data: "# Runbook\n", Path: "runbook.md", Filename: "runbook.md", ID: blobID, Ref: "main", Startline: 1, ProjectID: 42},
+				{Basename: "on-call", Data: "See the runbook.\n", Path: "on-call.md", Filename: "on-call.md", Ref: "main", Startline: 3, ProjectID: 42},
+			},
+		},
+		{
+			name:  "group",
+			path:  pathSearchGroup,
+			input: WikiInput{GroupID: "7", Query: "runbook"},
+			body: `[
+				{"basename":"./runbook","data":"# Runbook\n","path":"runbook.md","filename":"runbook.md",
+				 "id":null,"ref":"4f0e1c2","startline":1,"project_id":null,"group_id":7},
+				{"basename":"ops/on-call","data":"See the runbook.\n","path":"ops/on-call.md","filename":"ops/on-call.md",
+				 "id":null,"ref":"9a8b7c6","startline":2,"project_id":42,"group_id":7}
+			]`,
+			want: []WikiBlobOutput{
+				{Basename: "./runbook", Data: "# Runbook\n", Path: "runbook.md", Filename: "runbook.md", Ref: "4f0e1c2", Startline: 1, GroupID: 7},
+				{Basename: "ops/on-call", Data: "See the runbook.\n", Path: "ops/on-call.md", Filename: "ops/on-call.md", Ref: "9a8b7c6", Startline: 2, ProjectID: 42, GroupID: 7},
+			},
+		},
+		{
+			name:  "global",
+			path:  pathSearchGlobal,
+			input: WikiInput{Query: "runbook"},
+			body: `[{"basename":"./home","data":"runbook\n","path":"home.md","filename":"home.md",
+				 "id":null,"ref":"1d2e3f4","startline":4,"project_id":9,"group_id":null}]`,
+			want: []WikiBlobOutput{
+				{Basename: "./home", Data: "runbook\n", Path: "home.md", Filename: "home.md", Ref: "1d2e3f4", Startline: 4, ProjectID: 9},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != tc.path {
+					http.NotFound(w, r)
+					return
+				}
+				testutil.AssertQueryParam(t, r, queryScope, "wiki_blobs")
+				testutil.RespondJSONWithPagination(w, http.StatusOK, tc.body,
+					testutil.PaginationHeaders{Page: "1", PerPage: "2", NextPage: "2"})
+			}))
 
-	out, err := Wiki(context.Background(), client, WikiInput{Query: "wiki"})
-	if err != nil {
-		t.Fatalf(fmtUnexpErr, err)
-	}
-	if len(out.WikiBlobs) != 1 {
-		t.Fatalf("len(WikiBlobs) = %d, want 1", len(out.WikiBlobs))
-	}
-	if out.WikiBlobs[0].Title != "Home" {
-		t.Errorf(fmtTitleWant, out.WikiBlobs[0].Title, "Home")
+			out, err := Wiki(context.Background(), client, tc.input)
+			if err != nil {
+				t.Fatalf(fmtUnexpErr, err)
+			}
+			if !reflect.DeepEqual(out.WikiBlobs, tc.want) {
+				t.Errorf("WikiBlobs = %+v\nwant %+v", out.WikiBlobs, tc.want)
+			}
+			if out.Pagination.NextPage != 2 || out.Pagination.PerPage != 2 || !out.Pagination.HasMore {
+				t.Errorf("Pagination = %+v, want the headers of the answer", out.Pagination)
+			}
+		})
 	}
 }
 
-// TestSearchWiki_ProjectScope verifies SearchWiki when project scope.
-func TestSearchWiki_ProjectScope(t *testing.T) {
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == pathSearchProject && r.URL.Query().Get(queryScope) == "wiki_blobs" {
-			testutil.RespondJSONWithPagination(w, http.StatusOK, `[{
-				"slug":"setup","title":"Setup","content":"How to set up","format":"markdown"
-			}]`, defaultPagination)
-			return
-		}
-		http.NotFound(w, r)
+// TestSearchWiki_AnswerClientGoCannotDecode_ReadsThePageFromTheCapture holds
+// that search.wiki does not depend on what client-go decoded: its Wiki struct
+// is not the entity GitLab sends, and a key it declares with another type
+// (title, which GitLab does not send for this scope) makes client-go fail
+// the page. The page is read from the captured response all the same.
+func TestSearchWiki_AnswerClientGoCannotDecode_ReadsThePageFromTheCapture(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `[{"basename":"home","path":"home.md","title":5}]`)
 	}))
 
-	out, err := Wiki(context.Background(), client, WikiInput{ProjectID: "42", Query: "setup"})
+	out, err := Wiki(context.Background(), client, WikiInput{ProjectID: "42", Query: "home"})
 	if err != nil {
 		t.Fatalf(fmtUnexpErr, err)
 	}
-	if len(out.WikiBlobs) != 1 {
-		t.Fatalf("len(WikiBlobs) = %d, want 1", len(out.WikiBlobs))
+	if want := []WikiBlobOutput{{Basename: "home", Path: "home.md"}}; !reflect.DeepEqual(out.WikiBlobs, want) {
+		t.Errorf("WikiBlobs = %+v, want %+v", out.WikiBlobs, want)
+	}
+}
+
+// TestSearchWiki_AnswerNoBlobTypeHolds_ReportsTheDecodeFailure pins the other
+// side: an answer client-go's Wiki struct holds and this server's blob type
+// does not (a startline that is a string) is not published as an empty page.
+// Decoding the capture fails, and the handler reports that failure.
+func TestSearchWiki_AnswerNoBlobTypeHolds_ReportsTheDecodeFailure(t *testing.T) {
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		testutil.RespondJSON(w, http.StatusOK, `[{"startline":"x"}]`)
+	}))
+
+	out, err := Wiki(context.Background(), client, WikiInput{ProjectID: "42", Query: "x"})
+	if err == nil {
+		t.Fatal("expected the decode failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode the captured response") {
+		t.Errorf("error = %v, want the capture's decode failure", err)
+	}
+	if !reflect.ValueOf(out).IsZero() {
+		t.Errorf("output = %+v, want none", out)
 	}
 }
 
@@ -1190,24 +1320,6 @@ func TestSearchUsers_GroupScope(t *testing.T) {
 	}
 	if len(out.Users) != 1 {
 		t.Fatalf(fmtLenWant1, len(out.Users))
-	}
-}
-
-// TestSearchWiki_GroupScope verifies SearchWiki when group scope.
-func TestSearchWiki_GroupScope(t *testing.T) {
-	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == pathSearchGroup && r.URL.Query().Get("scope") == "wiki_blobs" {
-			testutil.RespondJSONWithPagination(w, http.StatusOK, `[{"slug":"home","title":"Home","content":"wiki","format":"markdown"}]`, defaultPagination)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	out, err := Wiki(context.Background(), client, WikiInput{GroupID: "7", Query: "wiki"})
-	if err != nil {
-		t.Fatalf(fmtUnexpErr, err)
-	}
-	if len(out.WikiBlobs) != 1 {
-		t.Fatalf(fmtLenWant1, len(out.WikiBlobs))
 	}
 }
 
@@ -1697,6 +1809,27 @@ func TestFormatNotesMarkdown_WithResults(t *testing.T) {
 	}
 }
 
+// TestFormatNotesMarkdown_AnInternalNote_SaysSoBesideItsType verifies that a
+// note only project members can read is marked in the table as well as in the
+// structured result. The body of a hit is quoted in the row, so a caller
+// reading the table alone would otherwise repeat an internal note as if anyone
+// could read it.
+func TestFormatNotesMarkdown_AnInternalNote_SaysSoBesideItsType(t *testing.T) {
+	got := FormatNotesMarkdown(NotesOutput{
+		Notes: []NoteOutput{
+			{Author: "reviewer", NoteableType: "Issue", NoteableIID: 5, Body: "Looks good", Internal: true},
+			{Author: "author", NoteableType: "Issue", NoteableIID: 6, Body: "Thanks"},
+		},
+		Pagination: onePage,
+	})
+	if !strings.Contains(got, "| reviewer | Issue (internal) | #5 | Looks good |\n") {
+		t.Errorf("internal note row missing its marker:\n%s", got)
+	}
+	if !strings.Contains(got, "| author | Issue | #6 | Thanks |\n") {
+		t.Errorf("a note anyone can read is marked:\n%s", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // New formatter tests: Projects
 // ---------------------------------------------------------------------------.
@@ -1787,30 +1920,6 @@ func TestFormatUsersMarkdown_WithResults(t *testing.T) {
 // ---------------------------------------------------------------------------
 // New formatter tests: Wiki
 // ---------------------------------------------------------------------------.
-
-// TestFormatWikiMarkdown_Empty verifies that an empty wiki search is the one
-// sentence and nothing else.
-func TestFormatWikiMarkdown_Empty(t *testing.T) {
-	if got, want := FormatWikiMarkdown(WikiOutput{}), "No wiki pages found.\n"; got != want {
-		t.Errorf("empty wiki search:\n got %q\nwant %q", got, want)
-	}
-}
-
-// TestFormatWikiMarkdown_WithResults verifies the whole render of a page of
-// wiki search results.
-func TestFormatWikiMarkdown_WithResults(t *testing.T) {
-	got := FormatWikiMarkdown(WikiOutput{
-		WikiBlobs:  []WikiBlobOutput{{Title: "Home", Slug: "home", Format: "markdown"}},
-		Pagination: onePage,
-	})
-	want := "## Wiki Search Results (1)\n\n" +
-		"| Title | Slug | Format |\n| --- | --- | --- |\n" +
-		"| Home | home | markdown |\n" +
-		onePageFooter("Use action 'wiki.get' to read the full wiki page, with slug")
-	if got != want {
-		t.Errorf("wiki search:\n got %q\nwant %q", got, want)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Helper tests
@@ -2221,7 +2330,7 @@ func TestActionSpecs_AllSearchRoutes(t *testing.T) {
 		case "users":
 			testutil.RespondJSONWithPagination(w, http.StatusOK, `[{"id":1,"username":"u","name":"U","state":"active","web_url":"https://x"}]`, defaultPagination)
 		case "wiki_blobs":
-			testutil.RespondJSONWithPagination(w, http.StatusOK, `[{"slug":"home","title":"Home","content":"c","format":"markdown"}]`, defaultPagination)
+			testutil.RespondJSONWithPagination(w, http.StatusOK, `[{"basename":"home","data":"c","path":"home.md","filename":"home.md","id":null,"ref":"main","startline":1,"project_id":1}]`, defaultPagination)
 		default:
 			http.NotFound(w, r)
 		}
@@ -2920,7 +3029,7 @@ func TestSearchHandlers_EveryConvertedField_ComesFromItsOwnKey(t *testing.T) {
 			scope: "notes",
 			path:  pathSearchProject,
 			body: `[{"id":31,"body":"needs a changelog entry","noteable_type":"MergeRequest",` +
-				`"noteable_id":44,"noteable_iid":8,"system":true,"author":{"username":"reviewer-a"},` +
+				`"noteable_id":44,"noteable_iid":8,"system":true,"internal":true,"author":{"username":"reviewer-a"},` +
 				`"created_at":"2026-02-03T09:00:00Z","updated_at":"2026-02-04T11:30:00Z"}]`,
 			call: func(c *gitlabclient.Client) (any, error) {
 				out, err := Notes(context.Background(), c, NotesInput{ProjectID: "42", Query: "changelog"})
@@ -2929,7 +3038,7 @@ func TestSearchHandlers_EveryConvertedField_ComesFromItsOwnKey(t *testing.T) {
 			want: []NoteOutput{{
 				ID: 31, Body: "needs a changelog entry", Author: "reviewer-a",
 				CreatedAt: "2026-02-03T09:00:00Z", UpdatedAt: "2026-02-04T11:30:00Z",
-				NoteableType: "MergeRequest", NoteableID: 44, NoteableIID: 8, System: true,
+				NoteableType: "MergeRequest", NoteableID: 44, NoteableIID: 8, System: true, Internal: true,
 			}},
 		},
 		{
@@ -2972,15 +3081,17 @@ func TestSearchHandlers_EveryConvertedField_ComesFromItsOwnKey(t *testing.T) {
 			name:  "wiki",
 			scope: "wiki_blobs",
 			path:  pathSearchGlobal,
-			body: `[{"slug":"runbooks/on-call","title":"On call runbook",` +
-				`"content":"page the duty engineer","format":"asciidoc"}]`,
+			body: `[{"basename":"runbooks/./on-call","data":"page the duty engineer","path":"runbooks/on-call.adoc",` +
+				`"filename":"runbooks/on-call.asciidoc","id":"0a1b2c3d","ref":"wiki-main","startline":7,` +
+				`"project_id":31,"group_id":5}]`,
 			call: func(c *gitlabclient.Client) (any, error) {
 				out, err := Wiki(context.Background(), c, WikiInput{Query: "on-call"})
 				return out.WikiBlobs, err
 			},
 			want: []WikiBlobOutput{{
-				Slug: "runbooks/on-call", Title: "On call runbook",
-				Content: "page the duty engineer", Format: "asciidoc",
+				Basename: "runbooks/./on-call", Data: "page the duty engineer", Path: "runbooks/on-call.adoc",
+				Filename: "runbooks/on-call.asciidoc", ID: "0a1b2c3d", Ref: "wiki-main", Startline: 7,
+				ProjectID: 31, GroupID: 5,
 			}},
 		},
 	}

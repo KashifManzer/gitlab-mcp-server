@@ -12,7 +12,10 @@
 package common
 
 import (
+	"crypto/sha1" //nolint:gosec // G505: git names a blob by its SHA-1, and the path match assertion computes that name.
+	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -78,8 +81,9 @@ type searchFixture struct {
 	commit fixture.Commit
 	// note is the body of the note on the issue.
 	note string
-	// wikiTitle is the page the wiki repository holds.
-	wikiTitle string
+	// wikiTitle is the page the wiki repository holds, and wikiSlug the slug
+	// GitLab gave it, which names the page's file in the wiki repository.
+	wikiTitle, wikiSlug string
 }
 
 // buildSearchFixture creates the project and every object the scopes are
@@ -104,15 +108,16 @@ func buildSearchFixture(e *harness.Env) searchFixture {
 		e.T.Fatalf("writing the note on issue #%d: %v", issue.IID, err)
 	}
 	wikiTitle := e.Name("wiki")
-	if _, _, err := e.Client().GL().Wikis.CreateWikiPage(project.ID, &gl.CreateWikiPageOptions{
+	page, _, err := e.Client().GL().Wikis.CreateWikiPage(project.ID, &gl.CreateWikiPageOptions{
 		Title: new(wikiTitle), Content: new("A wiki page mentioning " + token + ".\n"),
-	}, gl.WithContext(e.Ctx)); err != nil {
+	}, gl.WithContext(e.Ctx))
+	if err != nil {
 		e.T.Fatalf("writing the wiki page %q: %v", wikiTitle, err)
 	}
 
 	return searchFixture{
 		project: project, issue: issue, mr: mr, milestone: milestone, snippet: snippet,
-		token: token, commit: commit, note: note, wikiTitle: wikiTitle,
+		token: token, commit: commit, note: note, wikiTitle: wikiTitle, wikiSlug: page.Slug,
 	}
 }
 
@@ -137,6 +142,7 @@ func TestSearch_EveryScope_FindsTheFixtureObject(t *testing.T) {
 		if line := "The token is " + f.token + "."; !strings.Contains(said, "```\n"+line+"\n```\n") {
 			e.T.Errorf("the code search text does not fence the matched line %q:\n%s", line, said)
 		}
+		assertCodePathMatch(e, s, inProject, f)
 
 		projects := harness.Eventually(s, actionSearchProjects, map[string]any{"query": f.project.Name}, searchInterval, searchWait,
 			func(out search.ProjectsOutput) bool { return projectFound(out, f.project.ID) })
@@ -186,16 +192,75 @@ func TestSearch_EveryScope_FindsTheFixtureObject(t *testing.T) {
 			func(out search.UsersOutput) bool { return userFound(out, username) })
 		e.T.Logf("user search for %q found %d user(s)", username, len(users.Users))
 
-		// The wiki scope is held to a row and not to the page: GitLab answers
-		// this scope with blob rows (basename, path, data), and client-go
-		// decodes them into its wiki page struct, so every field the server
-		// publishes here is empty. The row's fields are logged so a run shows
-		// what the surface says, and the page-level assertion waits on that
-		// fix.
+		// GitLab answers the wiki scope with the blob entity code search
+		// answers with: the page's file in the wiki repository, which a page
+		// written in Markdown names by its slug with ".md", and the lines
+		// that matched. The token is in the page's content and not in its
+		// slug, so the row is a content match, which no backend gives a blob
+		// id.
 		wiki := harness.Eventually(s, actionSearchWiki, withParams(inProject, map[string]any{"query": f.token}), searchInterval, searchWait,
-			func(out search.WikiOutput) bool { return len(out.WikiBlobs) > 0 })
-		e.T.Logf("wiki search for %q found %d page(s); the first reads %+v (the page is %q)", f.token, len(wiki.WikiBlobs), wiki.WikiBlobs[0], f.wikiTitle)
+			func(out search.WikiOutput) bool { return wikiPageFound(out, f.wikiSlug) != nil })
+		page := wikiPageFound(wiki, f.wikiSlug)
+		if page.ProjectID != f.project.ID || page.ID != "" || page.Ref == "" || !strings.Contains(page.Data, f.token) {
+			e.T.Errorf("wiki search for %q returned %+v, want the content match of page %q (%s) in project %d, holding the token", f.token, *page, f.wikiTitle, f.wikiSlug, f.project.ID)
+		}
 	})
+}
+
+// wikiPageFound returns the result of a wiki search that is the file of the
+// Markdown page with the slug, or nil.
+func wikiPageFound(out search.WikiOutput, slug string) *search.WikiBlobOutput {
+	for i := range out.WikiBlobs {
+		if out.WikiBlobs[i].Path == slug+".md" {
+			return &out.WikiBlobs[i]
+		}
+	}
+	return nil
+}
+
+// assertCodePathMatch asks basic search for the fixture's token, which the
+// file's path carries as well as its content, and holds the result that
+// matched by the path to what GitLab marks such a result with: the blob id of
+// the file, which is the git blob of the content the fixture wrote and so is
+// computed here rather than read back, with the start of the file as its
+// snippet. The text answer says that snippet is the start of the file rather
+// than presenting it as the context of a match.
+func assertCodePathMatch(e *harness.Env, s *harness.Session, inProject map[string]any, f searchFixture) {
+	e.T.Helper()
+	content := "The token is " + f.token + ".\n"
+	basic := withParams(inProject, map[string]any{"query": f.token, "search_type": "basic"})
+	out := harness.Eventually(s, actionSearchCode, basic, searchInterval, searchWait,
+		func(out search.CodeOutput) bool { return pathMatch(out, f.commit.FilePath) != nil })
+	match := pathMatch(out, f.commit.FilePath)
+	if want := gitBlobID(content); match.ID != want {
+		e.T.Errorf("the path match of %s carries blob id %q, want %q, the blob of the content the fixture wrote", f.commit.FilePath, match.ID, want)
+	}
+	if match.Startline != 1 || match.Data != content {
+		e.T.Errorf("the path match of %s starts at line %d with %q, want the whole file from line 1, %q", f.commit.FilePath, match.Startline, match.Data, content)
+	}
+	_, said := harness.DoAnswer[search.CodeOutput](s, actionSearchCode, basic)
+	if !strings.Contains(said, f.commit.FilePath+" (project ") || !strings.Contains(said, ", path match)") ||
+		!strings.Contains(said, "matched the query by its path, so the snippet is the start of the file") {
+		e.T.Errorf("the basic code search text does not mark the path match of %s as the start of the file:\n%s", f.commit.FilePath, said)
+	}
+}
+
+// pathMatch returns the result of a code search that matched the file at path
+// by its path, which is the result GitLab gives a blob id, or nil.
+func pathMatch(out search.CodeOutput, path string) *search.BlobOutput {
+	for i := range out.Blobs {
+		if out.Blobs[i].Path == path && out.Blobs[i].ID != "" {
+			return &out.Blobs[i]
+		}
+	}
+	return nil
+}
+
+// gitBlobID is the object id git gives a blob holding content, in the SHA-1
+// object format a GitLab repository uses by default.
+func gitBlobID(content string) string {
+	sum := sha1.Sum([]byte("blob " + strconv.Itoa(len(content)) + "\x00" + content)) //nolint:gosec // G401: git names a blob by the SHA-1 of its header and content, and the test computes that name to compare it, which is no security claim.
+	return hex.EncodeToString(sum[:])
 }
 
 // blobFound reports whether a code search holds the file at the path.
