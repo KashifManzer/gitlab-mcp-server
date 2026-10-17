@@ -94,14 +94,20 @@ type Output struct {
 	DefaultBranchProtection         int64                        `json:"default_branch_protection,omitempty"`
 	// What lib/api/entities/group.rb and its EE prepend send that client-go's
 	// Group does not model, read from the captured response (ADR-0021).
-	ShowDiffPreviewInEmail                 bool                                    `json:"show_diff_preview_in_email"`
-	ResourceAccessTokenNotifyInherited     *bool                                   `json:"resource_access_token_notify_inherited"`
-	LockResourceAccessTokenNotifyInherited bool                                    `json:"lock_resource_access_token_notify_inherited"`
-	DuoCoreFeaturesEnabled                 *bool                                   `json:"duo_core_features_enabled,omitempty" tier:"premium"`
-	AutoDuoCodeReviewEnabled               *bool                                   `json:"auto_duo_code_review_enabled,omitempty" tier:"premium"`
-	BuiltInProjectTemplatesEnabled         *bool                                   `json:"built_in_project_templates_enabled,omitempty" tier:"premium"`
-	LockBuiltInProjectTemplatesEnabled     *bool                                   `json:"lock_built_in_project_templates_enabled,omitempty" tier:"premium"`
-	DuoNamespaceAccessRules                []toolutil.DuoNamespaceAccessRuleOutput `json:"duo_namespace_access_rules,omitempty" tier:"premium"`
+	ShowDiffPreviewInEmail                 bool  `json:"show_diff_preview_in_email"`
+	ResourceAccessTokenNotifyInherited     *bool `json:"resource_access_token_notify_inherited"`
+	LockResourceAccessTokenNotifyInherited bool  `json:"lock_resource_access_token_notify_inherited"`
+	DuoCoreFeaturesEnabled                 *bool `json:"duo_core_features_enabled,omitempty" tier:"premium"`
+	AutoDuoCodeReviewEnabled               *bool `json:"auto_duo_code_review_enabled,omitempty" tier:"premium"`
+	// DuoCodeReviewDecisionsEnabled is sent from 19.5 behind the
+	// duo_code_review_decisions feature flag, to a caller who may administer
+	// the group. Tagged Ultimate as projects.md documents the project key
+	// with the same predicate; groups.md does not document this one, and the
+	// auto review flag beside it, gated the same way, predates that note.
+	DuoCodeReviewDecisionsEnabled      *bool                                   `json:"duo_code_review_decisions_enabled,omitempty" tier:"ultimate"`
+	BuiltInProjectTemplatesEnabled     *bool                                   `json:"built_in_project_templates_enabled,omitempty" tier:"premium"`
+	LockBuiltInProjectTemplatesEnabled *bool                                   `json:"lock_built_in_project_templates_enabled,omitempty" tier:"premium"`
+	DuoNamespaceAccessRules            []toolutil.DuoNamespaceAccessRuleOutput `json:"duo_namespace_access_rules,omitempty" tier:"premium"`
 	// GitLab.com only: ee/lib/gitlab/saas.rb gates both on Gitlab.com?, so a
 	// self-managed instance never sends either whatever its license.
 	WebBasedCommitSigningEnabled *bool `json:"web_based_commit_signing_enabled,omitempty" tier:"premium"`
@@ -136,7 +142,11 @@ type DetailOutput struct {
 	Projects                                  []ProjectItem           `json:"projects,omitempty"`
 	SharedProjects                            []ProjectItem           `json:"shared_projects,omitempty"`
 	// What only lib/api/entities/group_detail.rb and its EE prepend add,
-	// read from the captured response (ADR-0021).
+	// read from the captured response (ADR-0021). The two SHA settings are
+	// sent on every group from 19.5, and are absent from an older instance's
+	// answer rather than reported off.
+	RequireSHAForMerge                     *bool                      `json:"require_sha_for_merge,omitempty"`
+	LockRequireSHAForMerge                 *bool                      `json:"lock_require_sha_for_merge,omitempty"`
 	StepUpAuthRequiredOAuthProvider        string                     `json:"step_up_auth_required_oauth_provider,omitempty"`
 	ServiceAccessTokensExpirationEnforced  *bool                      `json:"service_access_tokens_expiration_enforced,omitempty" tier:"premium"`
 	AISettings                             *toolutil.AISettingsOutput `json:"ai_settings,omitempty" tier:"premium"`
@@ -407,6 +417,7 @@ func ToOutput(g *gl.Group, extra toolutil.GroupExtra) Output {
 	out.LockResourceAccessTokenNotifyInherited = extra.LockResourceAccessTokenNotifyInherited
 	out.DuoCoreFeaturesEnabled = extra.DuoCoreFeaturesEnabled
 	out.AutoDuoCodeReviewEnabled = extra.AutoDuoCodeReviewEnabled
+	out.DuoCodeReviewDecisionsEnabled = extra.DuoCodeReviewDecisionsEnabled
 	out.BuiltInProjectTemplatesEnabled = extra.BuiltInProjectTemplatesEnabled
 	out.LockBuiltInProjectTemplatesEnabled = extra.LockBuiltInProjectTemplatesEnabled
 	out.DuoNamespaceAccessRules = extra.DuoNamespaceAccessRules
@@ -473,6 +484,8 @@ func ToDetailOutput(g *gl.Group, extra toolutil.GroupDetailExtra) DetailOutput {
 	out.SharedWithGroups = sharedWithGroupsOutput(g.SharedWithGroups)
 	out.Projects = projectItemsFromGroup(g.Projects, false)             //nolint:staticcheck // SA1019: mirror deprecated SDK field for 1:1 API coverage
 	out.SharedProjects = projectItemsFromGroup(g.SharedProjects, false) //nolint:staticcheck // SA1019: mirror deprecated SDK field for 1:1 API coverage
+	out.RequireSHAForMerge = extra.RequireSHAForMerge
+	out.LockRequireSHAForMerge = extra.LockRequireSHAForMerge
 	out.StepUpAuthRequiredOAuthProvider = extra.StepUpAuthRequiredOAuthProvider
 	out.ServiceAccessTokensExpirationEnforced = extra.ServiceAccessTokensExpirationEnforced
 	out.AISettings = extra.AISettings
