@@ -41,7 +41,17 @@ const (
 	hintNamespacePath        = "full_path is the group or project path such as my-group or my-group/my-project, and the namespace must already exist"
 	hintUsername             = "username is the account name without a leading @, as returned by user.list"
 	hintFeatureAvailability  = "achievements are generally available from GitLab 19.3; on an older instance an administrator must enable the achievements feature flag"
+	hintAwardMessageLength   = "award_message is limited to 200 characters, so shorten it and send the call again"
 )
+
+// awardMessageRefused reports whether GitLab refused an award write for its
+// award_message, which it does in two places: the mutation's argument
+// validator names awardMessage and the model's validation "Award message".
+// Only that refusal earns [hintAwardMessageLength]; on any other the message
+// was never the problem, and may not have been sent at all.
+func awardMessageRefused(err error) bool {
+	return toolutil.ContainsAny(err, "awardMessage", "Award message")
+}
 
 // Achievement mirrors gl.Achievement, the badge a namespace defines.
 type Achievement struct {
@@ -177,8 +187,9 @@ type RevokeInput struct {
 
 // UserAchievementUpdateInput defines the input for changing an award.
 type UserAchievementUpdateInput struct {
-	UserAchievementID int64 `json:"user_achievement_id" jsonschema:"Numeric ID of the award to change,required"`
-	ShowOnProfile     *bool `json:"show_on_profile,omitempty" jsonschema:"Whether the recipient's profile displays this award. Omit to leave the current visibility unchanged"`
+	UserAchievementID int64   `json:"user_achievement_id" jsonschema:"Numeric ID of the award to change,required"`
+	ShowOnProfile     *bool   `json:"show_on_profile,omitempty" jsonschema:"Whether the recipient's profile displays this award. Omit to leave the current visibility unchanged"`
+	AwardMessage      *string `json:"award_message,omitempty" jsonschema:"New note shown alongside the award, up to 200 characters. Pass an empty string to remove it. Omit the field to leave it untouched"`
 }
 
 // UserAchievementDeleteInput defines the input for deleting an award.
@@ -326,7 +337,10 @@ func Award(ctx context.Context, client *gitlabclient.Client, input AwardInput) (
 
 	award, resp, err := client.GL().Achievements.AwardAchievement(input.AchievementID, input.UserID, opts, gl.WithContext(ctx))
 	if err != nil {
-		return UserAchievementOutput{}, writeErr(client, resp, opAward, objectAward, err, "verify achievement_id and user_id both exist, and that award_message stays within 200 characters")
+		if awardMessageRefused(err) {
+			return UserAchievementOutput{}, writeErr(client, resp, opAward, objectAward, err, hintAwardMessageLength)
+		}
+		return UserAchievementOutput{}, writeErr(client, resp, opAward, objectAward, err, "verify achievement_id and user_id both exist")
 	}
 	return UserAchievementOutput{UserAchievement: toUserAchievement(award)}, nil
 }
@@ -351,8 +365,8 @@ func Revoke(ctx context.Context, client *gitlabclient.Client, input RevokeInput)
 	}, nil
 }
 
-// UserAchievementUpdate changes an award, which today means its profile
-// visibility.
+// UserAchievementUpdate changes an award: its profile visibility and the
+// message shown alongside it, each sent only when the caller set it.
 func UserAchievementUpdate(ctx context.Context, client *gitlabclient.Client, input UserAchievementUpdateInput) (UserAchievementOutput, error) {
 	if err := ctx.Err(); err != nil {
 		return UserAchievementOutput{}, err
@@ -361,10 +375,13 @@ func UserAchievementUpdate(ctx context.Context, client *gitlabclient.Client, inp
 		return UserAchievementOutput{}, toolutil.ErrRequiredInt64(opUserAchievementUpdate, "user_achievement_id")
 	}
 
-	opts := &gl.UpdateUserAchievementOptions{ShowOnProfile: input.ShowOnProfile}
+	opts := &gl.UpdateUserAchievementOptions{ShowOnProfile: input.ShowOnProfile, AwardMessage: input.AwardMessage}
 
 	award, resp, err := client.GL().Achievements.UpdateUserAchievement(input.UserAchievementID, opts, gl.WithContext(ctx))
 	if err != nil {
+		if awardMessageRefused(err) {
+			return UserAchievementOutput{}, writeErr(client, resp, opUserAchievementUpdate, objectAward, err, hintAwardMessageLength)
+		}
 		return UserAchievementOutput{}, writeErr(client, resp, opUserAchievementUpdate, objectAward, err, hintUserAchievementID)
 	}
 	return UserAchievementOutput{UserAchievement: toUserAchievement(award)}, nil
