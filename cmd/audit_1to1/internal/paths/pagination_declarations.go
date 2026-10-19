@@ -83,6 +83,16 @@ var declaredUnpaginatedCollections = []paginationDeclaration{
 			"the same package, GET /groups/:id/epics, which GitLab does paginate.",
 	},
 	{
+		Package:  toolsDir + "/groupmilestones",
+		Action:   "group.group_milestone_burndown",
+		Category: categoryEndpointNotPaginated,
+		Reason: "GET /groups/:id/milestones/:milestone_id/burndown_events declares no page and no per_page, and its " +
+			"handler (ee/lib/ee/api/group_milestones.rb) calls milestone_burndown_events_for, which presents " +
+			"Burndown.new(issues, start_date, due_date).as_json without paginate (ee/lib/ee/api/milestone_responses.rb): " +
+			"GitLab sends every event of the milestone in one array. The endpoints that matched are the group milestone " +
+			"list and the milestone's issues and merge requests, which the same package reads and GitLab paginates.",
+	},
+	{
 		Package:  toolsDir + "/groupsaml",
 		Action:   "group.saml_link_list",
 		Category: categoryEndpointNotPaginated,
@@ -90,6 +100,16 @@ var declaredUnpaginatedCollections = []paginationDeclaration{
 			"group.saml_group_links without paginate (ee/lib/api/saml_group_links.rb): GitLab renders every SAML " +
 			"group link of a group in one array. The endpoint that matched is GET /groups/:id/saml_users, the SAML " +
 			"user list of the same package, which is paginated.",
+	},
+	{
+		Package:  toolsDir + "/milestones",
+		Action:   "project.milestone_burndown",
+		Category: categoryEndpointNotPaginated,
+		Reason: "GET /projects/:id/milestones/:milestone_id/burndown_events declares no page and no per_page, and its " +
+			"handler presents Burndown.new(issues, start_date, due_date).as_json without paginate " +
+			"(ee/lib/ee/api/milestone_responses.rb): GitLab sends every event of the milestone in one array. The " +
+			"endpoints that matched are the milestone list and the milestone's issues and merge requests, which the " +
+			"same package reads and GitLab paginates.",
 	},
 	{
 		Package:  toolsDir + "/pipelines",
