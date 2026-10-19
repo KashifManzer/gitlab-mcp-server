@@ -24,15 +24,6 @@ func TestCapturedReaders_ReadWhatTheSDKDoesNotModel(t *testing.T) {
 		want func(any) bool
 	}{
 		{
-			name: "key",
-			read: func(c *gitlabclient.ResponseCapture) (any, error) { return CapturedKey(c) },
-			body: `{"id":1,"expires_at":"2026-05-05T00:00:00.000Z","last_used_at":"2026-04-07T00:00:00.000Z","usage_type":"auth"}`,
-			want: func(v any) bool {
-				k, _ := v.(KeyExtra)
-				return k.ExpiresAt != nil && k.ExpiresAt.Year() == 2026 && k.LastUsedAt != nil && k.LastUsedAt.Month() == 4 && k.UsageType == "auth"
-			},
-		},
-		{
 			name: "runner",
 			read: func(c *gitlabclient.ResponseCapture) (any, error) { return CapturedRunner(c) },
 			body: `{"id":1,"created_at":"2025-05-03T00:00:00.000Z","created_by":{"id":2,"username":"owner","locked":true},"job_execution_status":"idle"}`,
@@ -347,12 +338,10 @@ func tailReaderCases() []capturedReaderCase {
 		{
 			name: "todo",
 			read: func(c *gitlabclient.ResponseCapture) (any, error) { return CapturedTodo(c) },
-			body: `{"id":1,"updated_at":"2026-04-07T00:00:00.000Z","group":{"id":4,"name":"Acme","path":"acme","kind":"group","full_path":"acme"},` +
-				`"author":{"id":2,"username":"ada","locked":true,"public_email":"ada@example.com"}}`,
+			body: `{"id":1,"author":{"id":2,"username":"ada","locked":true,"public_email":"ada@example.com"}}`,
 			want: func(v any) bool {
 				e, _ := v.(TodoExtra)
-				return e.UpdatedAt != nil && e.Group != nil && e.Group.FullPath == "acme" && e.Group.Kind == "group" &&
-					e.Author.Locked && e.Author.PublicEmail == "ada@example.com"
+				return e.Author.Locked && e.Author.PublicEmail == "ada@example.com"
 			},
 		},
 		{
@@ -372,7 +361,7 @@ func tailReaderCases() []capturedReaderCase {
 			body: `{"id":1,"web_url":"https://example/m/1","project_id":9}`,
 			want: func(v any) bool {
 				e, _ := v.(MilestoneExtra)
-				return e.WebURL == "https://example/m/1" && e.ProjectID == 9
+				return e.ProjectID == 9
 			},
 		},
 		{
@@ -664,10 +653,6 @@ func TestCapturedTailListReaders_HoldTheCountToTheSDKs(t *testing.T) {
 		}},
 		{"resource milestone events", func(c *gitlabclient.ResponseCapture, n int) (int, error) {
 			x, e := CapturedResourceMilestoneEvents(c, n)
-			return len(x), e
-		}},
-		{"todos", func(c *gitlabclient.ResponseCapture, n int) (int, error) {
-			x, e := CapturedTodos(c, n)
 			return len(x), e
 		}},
 		{"boards", func(c *gitlabclient.ResponseCapture, n int) (int, error) {
@@ -1066,14 +1051,10 @@ func TestCapturedSplitReaders_ReadOneObjectEach(t *testing.T) {
 			x, e := CapturedIssue(c)
 			return x.EpicIID != nil && *x.EpicIID == 5 && x.Severity == "HIGH" && x.StartDate == "2026-01-02", e
 		}},
-		// merge_train_enforcement is the enforcement level GitLab spells as a
-		// string; a reader that typed it as a flag refused every licensed
-		// project answer, so the case pins the spelling the instance sends.
-		{"project", `{"max_pipelines_per_merge_train":4,"description_html":"<p>d</p>","merge_train_enforcement":"allow_bypass"}`, func(c *gitlabclient.ResponseCapture) (bool, error) {
+		{"project", `{"max_pipelines_per_merge_train":4,"description_html":"<p>d</p>"}`, func(c *gitlabclient.ResponseCapture) (bool, error) {
 			x, e := CapturedProject(c)
 			return x.MaxPipelinesPerMergeTrain != nil && *x.MaxPipelinesPerMergeTrain == 4 &&
-				x.DescriptionHTML != nil && *x.DescriptionHTML == "<p>d</p>" &&
-				x.MergeTrainEnforcement != nil && *x.MergeTrainEnforcement == "allow_bypass", e
+				x.DescriptionHTML != nil && *x.DescriptionHTML == "<p>d</p>", e
 		}},
 		{"group hook", `{"repository_update_events":true}`, func(c *gitlabclient.ResponseCapture) (bool, error) {
 			x, e := CapturedGroupHook(c)
@@ -1106,10 +1087,6 @@ func TestCapturedSplitListReaders_ReadAndHoldTheCount(t *testing.T) {
 		body string
 		read func(*gitlabclient.ResponseCapture, int) (bool, error)
 	}{
-		{"keys", `[{"usage_type":"auth"}]`, func(c *gitlabclient.ResponseCapture, n int) (bool, error) {
-			x, e := CapturedKeys(c, n)
-			return len(x) == 1 && x[0].UsageType == "auth", e
-		}},
 		{"groups", `[{"show_diff_preview_in_email":true}]`, func(c *gitlabclient.ResponseCapture, n int) (bool, error) {
 			x, e := CapturedGroups(c, n)
 			return len(x) == 1 && x[0].ShowDiffPreviewInEmail, e

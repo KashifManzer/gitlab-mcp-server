@@ -29,27 +29,6 @@ type UserBasicOutput struct {
 	WebURL      string `json:"web_url,omitempty"`
 }
 
-// KeyExtra is what lib/api/entities/ssh_key.rb sends on a key that
-// client-go's Key does not carry: the expiry, the last use and the usage
-// type, all sent on every key.
-type KeyExtra struct {
-	ExpiresAt  *time.Time `json:"expires_at"`
-	LastUsedAt *time.Time `json:"last_used_at"`
-	UsageType  string     `json:"usage_type"`
-}
-
-// CapturedKey reads, off the captured answer to a request for one key, the
-// fields client-go's Key does not model.
-func CapturedKey(capture *gitlabclient.ResponseCapture) (KeyExtra, error) {
-	return capturedOne[KeyExtra](capture)
-}
-
-// CapturedKeys reads the same off a list answer, one extra per key in order,
-// the count held to what the SDK decoded.
-func CapturedKeys(capture *gitlabclient.ResponseCapture, decoded int) ([]KeyExtra, error) {
-	return capturedList[KeyExtra](capture, decoded, "ssh keys")
-}
-
 // RunnerExtra is what lib/api/entities/ci/runner.rb sends on a runner that
 // client-go's Runner and RunnerDetails do not carry: when it was created,
 // who created it, sent to a caller allowed to read that user, and the job
@@ -535,7 +514,8 @@ func CapturedResourceMilestoneEvents(capture *gitlabclient.ResponseCapture, deco
 }
 
 // NamespaceBasicOutput mirrors lib/api/entities/namespace_basic.rb, the group
-// object GitLab renders on a todo raised in a group rather than a project.
+// object GitLab renders on a todo raised in a group rather than a project,
+// which client-go decodes into a ProjectNamespace.
 type NamespaceBasicOutput struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`
@@ -548,26 +528,17 @@ type NamespaceBasicOutput struct {
 }
 
 // TodoExtra is what GitLab's todo entity sends that client-go's Todo does not
-// carry: when the todo last changed, the group it belongs to, which is present
-// only on a todo raised in a group rather than a project, and the two keys of
-// its author's UserBasic that client-go's BasicUser leaves out, which
-// [UserBasicFrom] completes the author with.
+// carry: the two keys of its author's UserBasic that client-go's BasicUser
+// leaves out, which [UserBasicFrom] completes the author with. client-go's
+// Todo decodes the todo's own updated_at and group as of v3.20.0.
 type TodoExtra struct {
-	UpdatedAt *time.Time            `json:"updated_at"`
-	Group     *NamespaceBasicOutput `json:"group"`
-	Author    UserBasicExtra        `json:"author"`
+	Author UserBasicExtra `json:"author"`
 }
 
-// CapturedTodo reads them off the captured answer to a request that returned
+// CapturedTodo reads it off the captured answer to a request that returned
 // one todo.
 func CapturedTodo(capture *gitlabclient.ResponseCapture) (TodoExtra, error) {
 	return capturedOne[TodoExtra](capture)
-}
-
-// CapturedTodos reads the same off a list answer, one extra per todo in order,
-// the count held to what the SDK decoded.
-func CapturedTodos(capture *gitlabclient.ResponseCapture, decoded int) ([]TodoExtra, error) {
-	return capturedList[TodoExtra](capture, decoded, "todos")
 }
 
 // BasicGroupDetailsOutput is the group reference GitLab renders on a board,
@@ -622,15 +593,17 @@ func CapturedBridges(capture *gitlabclient.ResponseCapture, decoded int) ([]Brid
 }
 
 // MilestoneExtra is what GitLab's milestone entity sends that a group
-// milestone struct does not carry: the milestone's own page, exposed under no
-// condition, and the project a project-scoped milestone belongs to, exposed
-// only when there is one, so a group milestone leaves it zero.
+// milestone struct does not carry: the project a project-scoped milestone
+// belongs to, exposed only when there is one, so a group milestone leaves it
+// zero. A group's milestone list asked for include_descendants returns the
+// milestones of the group's projects as well, which carry it. client-go's
+// GroupMilestone decodes the milestone's own page, the other key this used
+// to read, as of v3.26.0.
 type MilestoneExtra struct {
-	WebURL    string `json:"web_url"`
-	ProjectID int64  `json:"project_id"`
+	ProjectID int64 `json:"project_id"`
 }
 
-// CapturedMilestone reads them off the captured answer to a request for one
+// CapturedMilestone reads it off the captured answer to a request for one
 // milestone.
 func CapturedMilestone(capture *gitlabclient.ResponseCapture) (MilestoneExtra, error) {
 	return capturedOne[MilestoneExtra](capture)
@@ -1398,23 +1371,16 @@ type ProjectExtra struct {
 	WarnAboutPotentiallyUnwantedCharacters *bool   `json:"warn_about_potentially_unwanted_characters"`
 	SecretPushProtectionEnabled            *bool   `json:"secret_push_protection_enabled"`
 	WebBasedCommitSigningEnabled           *bool   `json:"web_based_commit_signing_enabled"`
-	// MergeTrainEnforcement is a string and not a flag: GitLab sends one of
-	// allow_bypass, enforce_for_all_users and enforce_with_owner_override
-	// (the live API record types the route's parameter as String). It was
-	// declared a bool at first, and on a licensed instance every project
-	// answer that carried the key failed to decode, which took project.create
-	// down with it on the meta and dynamic surfaces.
-	MergeTrainEnforcement                 *string `json:"merge_train_enforcement"`
-	MaxPipelinesPerMergeTrain             *int64  `json:"max_pipelines_per_merge_train"`
-	DuoRemoteFlowsEnabled                 *bool   `json:"duo_remote_flows_enabled"`
-	DuoFoundationalFlowsEnabled           *bool   `json:"duo_foundational_flows_enabled"`
-	OnlyAllowMergeIfAllStatusChecksPassed *bool   `json:"only_allow_merge_if_all_status_checks_passed"`
-	DuoSastFPDetectionEnabled             *bool   `json:"duo_sast_fp_detection_enabled"`
-	DuoSastVRWorkflowEnabled              *bool   `json:"duo_sast_vr_workflow_enabled"`
-	DuoSecretDetectionFPEnabled           *bool   `json:"duo_secret_detection_fp_enabled"`
-	DuoDependencyBumpBreakingChanges      *bool   `json:"duo_dependency_bump_breaking_changes_enabled"`
-	SecurityPolicyPipelineMustSucceed     *bool   `json:"security_policy_pipeline_must_succeed"`
-	SPPRepositoryPipelineAccess           *bool   `json:"spp_repository_pipeline_access"`
+	MaxPipelinesPerMergeTrain              *int64  `json:"max_pipelines_per_merge_train"`
+	DuoRemoteFlowsEnabled                  *bool   `json:"duo_remote_flows_enabled"`
+	DuoFoundationalFlowsEnabled            *bool   `json:"duo_foundational_flows_enabled"`
+	OnlyAllowMergeIfAllStatusChecksPassed  *bool   `json:"only_allow_merge_if_all_status_checks_passed"`
+	DuoSastFPDetectionEnabled              *bool   `json:"duo_sast_fp_detection_enabled"`
+	DuoSastVRWorkflowEnabled               *bool   `json:"duo_sast_vr_workflow_enabled"`
+	DuoSecretDetectionFPEnabled            *bool   `json:"duo_secret_detection_fp_enabled"`
+	DuoDependencyBumpBreakingChanges       *bool   `json:"duo_dependency_bump_breaking_changes_enabled"`
+	SecurityPolicyPipelineMustSucceed      *bool   `json:"security_policy_pipeline_must_succeed"`
+	SPPRepositoryPipelineAccess            *bool   `json:"spp_repository_pipeline_access"`
 	// CISkipBranchPipelinesForMRs is one of the CI/CD settings
 	// lib/api/entities/project.rb sends only to a caller holding admin_project
 	// on the project, and GitLab sends it from 19.4 (projects.md).
