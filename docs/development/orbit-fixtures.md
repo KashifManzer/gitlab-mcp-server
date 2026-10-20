@@ -9,14 +9,16 @@ the `plens1` group on gitlab.com. Those tests are gated behind the
 This document explains the data they expect and how to re-provision
 it.
 
+The file holds 10 tests and 66 subtests, and every query they send but one is written in GQL, the only query language GitLab.com has accepted since 2026-10-15 (issue 1414). One subtest checks that the query language GitLab.com describes is the GQL `orbit.query` teaches, and another sends the one exception, a query written as a JSON object, and checks what the caller is told when GitLab.com refuses it. One test holds the licensing tier the server detects for a token GitLab.com serves Orbit to at Premium or higher (issue 1224). One holds the release GitLab.com reports to the fine-grained action table's own release or the prerelease right after it (issue 1023), so GitLab.com moving past the table fails a run, and another holds that rule against a stand-in table with no network. One measures the query route against a token carrying `read_api` alone and runs only with `GITLAB_COM_READ_API_TOKEN`, and another holds that measurement's reading of GitLab's refusal against a stand-in, with no network.
+
 ## What the tests need
 
-Every query the tests send is written in GQL, the read-only language
-based on openCypher 9 that GitLab.com compiles every query in since
-2026-10-15, and each was answered `200` against this namespace on
-2026-10-17. A query written as a JSON object, the query DSL the suite
-used before, is refused by GitLab.com now, and one subtest holds what a
-caller is told about it.
+Every query the tests send but one is written in GQL, the read-only
+language based on openCypher 9 that GitLab.com compiles every query in
+since 2026-10-15, and each of those was answered `200` against this
+namespace on 2026-10-17. The one that is not is written as a JSON object,
+the query DSL the suite used before, which GitLab.com refuses now, and the
+subtest that sends it holds what a caller is told about it.
 
 `TestOrbitLiveGitLabCom` and `TestOrbitLiveGitLabCom_ShapeDiscovery`
 are self-contained: they bound their projects by path
@@ -69,7 +71,7 @@ is a no-op.
 | `<ns>/security-fixtures` | Intentionally vulnerable code (hard-coded AWS keys, SQL injection, weak MD5 hashing, `eval()`) + 4 GitLab-managed security scanning templates                                                       | Populates Vulnerability, Finding, SecurityScan, VulnerabilityIdentifier, VulnerabilityOccurrence, VulnerabilityScanner                                                                   |
 
 The script provisions everything from `test/fixtures/orbit/{kg,security}-fixtures/`
-in this repo. The fixture content is committed and reproducible —
+in this repo. The fixture content is committed and reproducible, so
 no external state is needed.
 
 ### Fixture reproduction flow
@@ -108,7 +110,7 @@ skips if already present.
 
 The Orbit indexer is eventually consistent. After a fresh push:
 
-1. The indexer picks up the new content within 1–5 minutes.
+1. The indexer picks up the new content within 1 to 5 minutes.
 2. `indexing.state` may transiently report `"error"` even while
    `last_completed_at` advances and row counts keep growing. This is
    a GitLab-side artifact, not a fixture issue.
@@ -212,7 +214,9 @@ The record holds, per call, the action and variant, the output type the handler 
 
 A recording refuses to write anything when the fixture namespace is not indexed: a traversal of the fixture project that finds no row, or an indexing status that counts no indexed project, would record a tree without the paths the rows and counts carry. `orbit-wait-indexer` proceeds with a warning when it times out, so on a slow indexer the chain fails here, and the fix is to wait and run `make gen-orbit-record` again.
 
-A re-recording prints every key GitLab.com added, dropped or changed against the record committed at HEAD, which it reads through git rather than from the file it has just rewritten. When the key tree differs it writes the new record and exits 1, and every later run does the same until the record is committed, so `make test-e2e-gitlab-com` stays red until somebody has read the change, run the audit and committed the record. `make check-orbit-record` is the offline gate CI runs on the committed file, and it fails every branch once the record is older than the shared staleness window in `cmd/internal/provenance`. Only somebody holding a GitLab.com token entitled to Orbit and this fixture namespace can refresh it, unlike the Docker-regenerated records, so plan the refresh before the window closes.
+A re-recording prints every key GitLab.com added, dropped or changed against the record committed at HEAD, which it reads through git rather than from the file it has just rewritten. When the key tree differs it writes the new record and exits 1, and every later run does the same until the record is committed, so `make test-e2e-gitlab-com` stays red until somebody has read the change, run the audit and committed the record. `make check-orbit-record` is the offline gate CI runs on the committed file, and it fails every branch once the record is older than the shared staleness window in `cmd/internal/provenance`. Only somebody holding a GitLab.com token entitled to Orbit and this fixture namespace can refresh it, unlike the Docker-regenerated records, so plan the refresh before the window closes. The same gate is step 24 of `make analyze` and a step of CI's generated-artifacts job.
+
+The recording is what found that `orbit.schema` sent its format as `format`, which Grape reserves and GitLab.com answers 406 to, that every Orbit route taking a response format refuses `json` (`/orbit/tools` takes none), and that the llm DSL grammar arrived as a JSON string, which `orbit.dsl` published as its text until GitLab.com moved to GQL. Since then (issue 1414) `orbit.query` sends GQL text as the body's query string, takes `gql` as a response format beside `raw` and `llm`, forwards a JSON object, or JSON text, as written and answers GitLab.com's refusal of one with a hint that it reads GQL, and `orbit.dsl` reads `GET /orbit/agent/commands?command_names=query_graph`, since `GET /orbit/schema/dsl` answers 404.
 
 ```bash
 make gen-orbit-record                                   # record, GITLAB_COM_TOKEN from .env
