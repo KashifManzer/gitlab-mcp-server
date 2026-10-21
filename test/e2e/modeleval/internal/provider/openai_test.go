@@ -4,6 +4,7 @@ package provider
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil/modelrecord"
@@ -151,6 +152,7 @@ func TestOpenAI_MalformedArgumentsAreKeptAsTheyArrivedAndNotRepaired(t *testing.
 		{"a fragment with no braces", `\"action\": \"issue.list\"`},
 		{"nothing at all", ``},
 		{"a value that is not an object", `[1,2]`},
+		{"a null that decodes to no object", `null`},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			backend := newRecorder(`{"choices":[{"message":{"role":"assistant","tool_calls":[
@@ -219,6 +221,26 @@ func TestOpenAI_SendsAReasoningEffortWithoutATemperature(t *testing.T) {
 	}
 }
 
+// TestOpenAI_ReportsAnAnswerThatIsNotJSON verifies a body that is not JSON
+// is the provider's failure, and is not kept in a field the record encodes as
+// JSON.
+func TestOpenAI_ReportsAnAnswerThatIsNotJSON(t *testing.T) {
+	backend := newRecorder(`<html>maintenance</html>`)
+	adapter := adapterFor(t, "openai:gpt-5.4-nano", backend.server(t))
+
+	answer, err := adapter.Call(t.Context(), Request{})
+	if err == nil {
+		t.Fatal("a body that is not JSON was read as an answer")
+	}
+	if answer.Status != modelrecord.TurnServerError || !strings.Contains(answer.Detail, "not JSON") {
+		t.Errorf("Status = %q, Detail = %q, want %q saying the answer is not JSON",
+			answer.Status, answer.Detail, modelrecord.TurnServerError)
+	}
+	if len(answer.ResponseBody) != 0 {
+		t.Error("a body that is not JSON was kept in a field the record encodes as JSON")
+	}
+}
+
 func TestOpenAI_ReportsAnAnswerWithNoChoices(t *testing.T) {
 	backend := newRecorder(`{"choices":[],"usage":{}}`)
 	adapter := adapterFor(t, "openai:gpt-5.4-nano", backend.server(t))
@@ -281,6 +303,9 @@ func TestOpenAIMessages_RebuildsATurnWhenThereIsNoEchoToHandBack(t *testing.T) {
 		Text: "first",
 		Blocks: []modelrecord.Block{
 			{Kind: modelrecord.BlockText, Text: "second"},
+			// A thinking block is neither prose this API takes back nor a
+			// call, and goes back as nothing.
+			{Kind: modelrecord.BlockThinking, Text: "pondering"},
 			{Kind: modelrecord.BlockToolCall, Tool: "t", CallID: "c1", Arguments: json.RawMessage(`{"a":1}`)},
 		},
 	})
@@ -300,6 +325,31 @@ func TestOpenAIMessages_RebuildsATurnWhenThereIsNoEchoToHandBack(t *testing.T) {
 	fallback := openAIMessages(Message{Role: RoleAssistant, Echo: json.RawMessage(`"not a message"`)})
 	if len(fallback) != 1 || openAIBuiltMessage(t, fallback[0]).Role != RoleAssistant {
 		t.Errorf("an undecodable echo produced %+v", fallback)
+	}
+}
+
+// TestOpenAIEchoed_HandsBackOnlyAnAssistantsMessage holds the check an echo
+// passes before its bytes go back unread: it is an assistant turn's, and it is
+// a message that names its role.
+func TestOpenAIEchoed_HandsBackOnlyAnAssistantsMessage(t *testing.T) {
+	message := json.RawMessage(`{"role":"assistant","content":"hello"}`)
+	for _, one := range []struct {
+		name    string
+		message Message
+		want    bool
+	}{
+		{"an assistant's message", Message{Role: RoleAssistant, Echo: message}, true},
+		{"a user's message", Message{Role: RoleUser, Echo: message}, false},
+		{"an assistant with no echo", Message{Role: RoleAssistant}, false},
+		{"a message naming no role", Message{Role: RoleAssistant, Echo: json.RawMessage(`{"content":"hello"}`)}, false},
+		{"not a message", Message{Role: RoleAssistant, Echo: json.RawMessage(`["hello"]`)}, false},
+	} {
+		t.Run(one.name, func(t *testing.T) {
+			echoed, ok := openAIEchoed(one.message)
+			if ok != one.want || (ok && string(echoed) != string(one.message.Echo)) {
+				t.Errorf("openAIEchoed = %s, %v, want the echo handed back: %v", echoed, ok, one.want)
+			}
+		})
 	}
 }
 

@@ -3,14 +3,20 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/config"
+	gitlabclient "github.com/jmrplens/gitlab-mcp-server/v3/internal/gitlab"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil/modelcorpus"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil/modelrecord"
+	gitlabtools "github.com/jmrplens/gitlab-mcp-server/v3/internal/tools"
+	"github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/actioncatalog"
 	dynamictools "github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/dynamic"
+	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
 )
 
 // fakeFor builds one variant.
@@ -288,6 +294,11 @@ func TestFake_NoConfirmOmitsTheApprovalThatPerfectCarries(t *testing.T) {
 	if params["confirm"] != true {
 		t.Errorf("the meta call's approval is not inside params: %v", meta)
 	}
+	individual := argumentsOf(t, callOf(t, callFake(t, FakePerfect,
+		Replay{Case: id, Surface: config.ToolSurfaceIndividual, Facts: replay.Facts})))
+	if individual["confirm"] != true {
+		t.Errorf("the individual call's approval is not among its arguments: %v", individual)
+	}
 }
 
 func TestFake_DeclinesAnswersInTextAndCallsNothing(t *testing.T) {
@@ -328,6 +339,11 @@ func TestFake_BindsAnArgumentToAnEarlierStepsResult(t *testing.T) {
 		from []json.RawMessage
 	}{
 		{"a step that has not run", modelcorpus.Ref{Step: 2, Field: "a"}, nil},
+		{
+			"a result that is not JSON",
+			modelcorpus.Ref{Step: 1, Field: "a"},
+			[]json.RawMessage{json.RawMessage(`not json`)},
+		},
 		{
 			"a field the result does not have",
 			modelcorpus.Ref{Step: 1, Field: "b"},
@@ -376,7 +392,10 @@ func TestFake_GivesAFactTheTypeAModelWouldHaveWritten(t *testing.T) {
 }
 
 func TestFake_ResolvesEachOfTheFourTruthsOrOmitsTheArgument(t *testing.T) {
-	replay := Replay{Facts: map[string]string{"project_id": "42"}}
+	replay := Replay{
+		Facts:    map[string]string{"project_id": "42"},
+		Produced: []json.RawMessage{json.RawMessage(`{"iid":7}`)},
+	}
 	for _, one := range []struct {
 		name  string
 		truth modelcorpus.Truth
@@ -387,12 +406,144 @@ func TestFake_ResolvesEachOfTheFourTruthsOrOmitsTheArgument(t *testing.T) {
 		{"a fact it did not", modelcorpus.Truth{Fact: "group_id"}, nil, false},
 		{"a literal the prompt states", modelcorpus.Truth{Literal: "closed"}, "closed", true},
 		{"a value the model authors", modelcorpus.Truth{Authored: true}, authoredValue, true},
+		{
+			"a field an earlier step produced",
+			modelcorpus.Truth{Produced: modelcorpus.Ref{Step: 1, Field: "iid"}},
+			float64(7), true,
+		},
+		{
+			"a step before the first",
+			modelcorpus.Truth{Produced: modelcorpus.Ref{Step: 0, Field: "iid"}},
+			nil, false,
+		},
+		{
+			"a step the replay has not reached",
+			modelcorpus.Truth{Produced: modelcorpus.Ref{Step: 2, Field: "iid"}},
+			nil, false,
+		},
 		{"nothing at all", modelcorpus.Truth{}, nil, false},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			value, found := resolveTruth(one.truth, replay)
 			if found != one.found || (found && value != one.want) {
 				t.Errorf("resolveTruth = %#v, %v, want %#v, %v", value, found, one.want, one.found)
+			}
+		})
+	}
+}
+
+// TestFakeArguments_PlantsOneFactAndLeavesEveryOtherValue holds what each
+// variant writes for every argument of one step: the perfect replay the right
+// value of each, and the wrong-args replay the planted value in place of the
+// first fact alone, after a literal it leaves as it is and before a second
+// fact it leaves right.
+func TestFakeArguments_PlantsOneFactAndLeavesEveryOtherValue(t *testing.T) {
+	step := modelcorpus.Step{Args: []modelcorpus.Arg{
+		{Name: "state", Truth: modelcorpus.Truth{Literal: "closed"}},
+		{Name: "project_id", Truth: modelcorpus.Truth{Fact: "project_id"}},
+		{Name: "group_id", Truth: modelcorpus.Truth{Fact: "group_id"}},
+	}}
+	replay := Replay{Facts: map[string]string{"project_id": "42", "group_id": "7"}}
+	for _, one := range []struct {
+		variant string
+		want    map[string]any
+	}{
+		{FakePerfect, map[string]any{"state": "closed", "project_id": int64(42), "group_id": int64(7)}},
+		{FakeWrongArgs, map[string]any{"state": "closed", "project_id": plantedValue, "group_id": int64(7)}},
+	} {
+		t.Run(one.variant, func(t *testing.T) {
+			got := fakeAdapter{variant: one.variant}.arguments(step, replay)
+			if len(got) != len(one.want) {
+				t.Fatalf("arguments = %#v, want %#v", got, one.want)
+			}
+			for name, want := range one.want {
+				if got[name] != want {
+					t.Errorf("argument %q = %#v, want %#v", name, got[name], want)
+				}
+			}
+		})
+	}
+}
+
+// TestFake_NamesEachCallForTheStepItReplays verifies the first step's call is
+// named for its position, counted from one, which is the name its result
+// answers it by.
+func TestFake_NamesEachCallForTheStepItReplays(t *testing.T) {
+	id, step := aCase(t)
+	call := callOf(t, callFake(t, FakePerfect, Replay{Case: id, Surface: config.ToolSurfaceDynamic, Facts: factsFor(step)}))
+	if call.CallID != "fake-call-1" {
+		t.Errorf("the first call is named %q, want fake-call-1", call.CallID)
+	}
+}
+
+// TestFake_AMetaCallWithNoArgumentsCarriesNoParams verifies a meta-tool call
+// whose step has no argument is the action alone, with no empty params beside
+// it.
+func TestFake_AMetaCallWithNoArgumentsCarriesNoParams(t *testing.T) {
+	adapter, _ := fakeFor(t, FakePerfect).(fakeAdapter)
+	_, payload, err := adapter.project(modelcorpus.Step{Action: "issue.list"}, config.ToolSurfaceMeta, map[string]any{})
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	if _, present := payload["params"]; present || payload["action"] != "list" {
+		t.Errorf("payload = %#v, want the action list and no params", payload)
+	}
+}
+
+// TestBuildFakeCatalog_NamesAnIndividualToolOnlyForTheActionItIsRegisteredFor
+// verifies the individual tool name an action declares is kept only when the
+// call identifier resolves that name to the action itself: a name a sibling
+// registered first, and a name the individual surface does not register at
+// all, leave the action with no individual tool rather than calling somebody
+// else's handler or a tool that does not exist.
+func TestBuildFakeCatalog_NamesAnIndividualToolOnlyForTheActionItIsRegisteredFor(t *testing.T) {
+	catalog := actioncatalog.NewCatalog()
+	// sequential: each group is added to the one catalog the test reads after the loop
+	for _, declared := range []struct {
+		toolName, domain, individual string
+		kind                         actioncatalog.SurfaceKind
+	}{
+		{"gitlab_fake_first", "first", "gitlab_fake_shared", actioncatalog.SurfaceKindMetaGroup},
+		{"gitlab_fake_second", "second", "gitlab_fake_shared", actioncatalog.SurfaceKindMetaGroup},
+		{"gitlab_fake_hidden", "hidden", "gitlab_fake_hidden_list", actioncatalog.SurfaceKindDynamicController},
+	} {
+		spec := toolutil.NewActionSpec("list", toolutil.RouteAction(nil,
+			func(context.Context, *gitlabclient.Client, struct{}) (struct{}, error) { return struct{}{}, nil }),
+			toolutil.ActionSpecOptions{
+				ReadOnly:       true,
+				OwnerPackage:   "provider",
+				IndividualTool: toolutil.IndividualToolSpec{Name: declared.individual, Title: "Probe", Description: "Probe."},
+			})
+		group, err := actioncatalog.GroupFromSpecs(actioncatalog.GroupOptions{
+			ToolName:     declared.toolName,
+			BaseDomain:   declared.domain,
+			Title:        "Probe",
+			Description:  "Probe group.",
+			OwnerPackage: "provider",
+			SurfaceKind:  declared.kind,
+		}, []toolutil.ActionSpec{spec})
+		if err != nil {
+			t.Fatalf("GroupFromSpecs(%s): %v", declared.toolName, err)
+		}
+		if addErr := catalog.AddGroup(group); addErr != nil {
+			t.Fatalf("AddGroup(%s): %v", declared.toolName, addErr)
+		}
+	}
+
+	actions, err := buildFakeCatalog(func(bool, gitlabtools.ActionCatalogOptions) (*actioncatalog.Catalog, error) {
+		return catalog, nil
+	})
+	if err != nil {
+		t.Fatalf("buildFakeCatalog: %v", err)
+	}
+	for id, want := range map[string]string{
+		"first.list":  "gitlab_fake_shared",
+		"second.list": "",
+		"hidden.list": "",
+	} {
+		t.Run(id, func(t *testing.T) {
+			if got := actions[id].individualTool; got != want {
+				t.Errorf("%s has individual tool %q, want %q", id, got, want)
 			}
 		})
 	}
@@ -492,6 +643,59 @@ func unservableOnIndividual(t *testing.T) string {
 		}
 	}
 	return ""
+}
+
+// TestFake_ACatalogThatCouldNotBeBuilt_RefusesEveryActionStep verifies a
+// catalog the fake could not read is the answer to every step that names an
+// action, rather than a call spelled without it. It replaces the error the
+// catalog was read with, so it does not run in parallel.
+func TestFake_ACatalogThatCouldNotBeBuilt_RefusesEveryActionStep(t *testing.T) {
+	if _, _, err := lookupAction("issue.list"); err != nil {
+		t.Fatalf("reading the catalog: %v", err)
+	}
+	broken := errors.New("no catalog")
+	saved := errFakeCatalog
+	errFakeCatalog = broken
+	t.Cleanup(func() { errFakeCatalog = saved })
+
+	adapter, _ := fakeFor(t, FakePerfect).(fakeAdapter)
+	if _, _, err := adapter.project(modelcorpus.Step{Action: "issue.list"}, config.ToolSurfaceDynamic, nil); !errors.Is(err, broken) {
+		t.Errorf("project = %v, want the catalog's own error", err)
+	}
+}
+
+// TestFake_ACallThatDoesNotEncode_FailsTheTurn verifies a payload that could
+// not be encoded ends the turn as a request error naming the step, rather
+// than a call sent without its arguments. It replaces the encoder, so it does
+// not run in parallel.
+func TestFake_ACallThatDoesNotEncode_FailsTheTurn(t *testing.T) {
+	broken := errors.New("no encoding")
+	saved := encodeCall
+	encodeCall = func(any) ([]byte, error) { return nil, broken }
+	t.Cleanup(func() { encodeCall = saved })
+
+	id, step := aCase(t)
+	answer, err := fakeFor(t, FakePerfect).Call(t.Context(), Request{
+		Replay: Replay{Case: id, Surface: config.ToolSurfaceDynamic, Facts: factsFor(step)},
+	})
+	if !errors.Is(err, broken) || !strings.Contains(err.Error(), "fake: encode the call for step 1") {
+		t.Fatalf("Call = %v, want the encoding failure of step 1", err)
+	}
+	if answer.Status != modelrecord.TurnRequestError {
+		t.Errorf("Status = %q, want %q", answer.Status, modelrecord.TurnRequestError)
+	}
+}
+
+// TestBuildFakeCatalog_ABuilderThatFails_SaysSo verifies a catalog that could
+// not be built is reported as that, wrapping the builder's own error.
+func TestBuildFakeCatalog_ABuilderThatFails_SaysSo(t *testing.T) {
+	broken := errors.New("no tools")
+	_, err := buildFakeCatalog(func(bool, gitlabtools.ActionCatalogOptions) (*actioncatalog.Catalog, error) {
+		return nil, broken
+	})
+	if !errors.Is(err, broken) || !strings.Contains(err.Error(), "fake: build the action catalog") {
+		t.Errorf("buildFakeCatalog = %v, want it to say the catalog could not be built and why", err)
+	}
 }
 
 func TestFake_HashesTheToolListItWasGiven(t *testing.T) {

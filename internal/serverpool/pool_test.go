@@ -31,6 +31,7 @@ import (
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/telemetry"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/tenancy"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil"
+	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil/netfixture"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/actiongrants"
 )
 
@@ -74,6 +75,8 @@ func testConfig(baseURL string) *config.Config {
 // the probe passes verdict-free the way an unreachable port used to.
 var stubGitLabBase string
 
+// TestMain starts the loopback GitLab stub stubGitLabBase names before any
+// test runs, and closes it once all of them have.
 func TestMain(m *testing.M) {
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -4080,14 +4083,17 @@ func TestRevalidateAll_EvictsOnlyOnCredentialVerdict(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewServer(revalidationAnswer(tt.status, tt.body))
-			baseURL := srv.URL
+			var baseURL string
 			if tt.unreachable {
-				// Closing it first leaves a port nothing answers on, which is
-				// a dial error rather than any HTTP status.
-				srv.Close()
+				// A dead endpoint hangs up on every connection before any
+				// response and keeps its port, so what the probe meets is a
+				// transport error rather than any HTTP status, and no other
+				// listener can be given the address and answer instead.
+				baseURL = netfixture.DeadEndpoint(t)
 			} else {
+				srv := httptest.NewServer(revalidationAnswer(tt.status, tt.body))
 				t.Cleanup(srv.Close)
+				baseURL = srv.URL
 			}
 
 			pool := New(testConfig(stubGitLabBase), testFactory())
@@ -5392,6 +5398,10 @@ func awaitSweepTicks(t *testing.T, ticks <-chan struct{}, never, stopped string)
 	}
 }
 
+// TestBackgroundSweeps_SurviveAPanickingCallback verifies that a panic in a
+// callback the idle sweep makes costs that tick and not the sweep, which
+// goes on ticking, and that the recovery the sweeps defer logs the sweep and
+// the panic and lets an ordinary return through.
 func TestBackgroundSweeps_SurviveAPanickingCallback(t *testing.T) {
 	t.Run("the idle sweep", func(t *testing.T) {
 		// Two, not one: surviving the panic is the point, and a sweep that

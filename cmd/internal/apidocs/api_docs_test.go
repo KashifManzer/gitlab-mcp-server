@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil/netfixture"
 )
 
 // realSleepCtx keeps the production sleep so TestSleepCtx can exercise it
@@ -53,6 +55,9 @@ func newStatusServer(t *testing.T, status int) (*httptest.Server, *int32) {
 	return srv, &hits
 }
 
+// TestFetch_DownloadsThenServesFreshCache verifies that the first fetch of an
+// area downloads it and the second is answered from the cache it wrote,
+// without another request.
 func TestFetch_DownloadsThenServesFreshCache(t *testing.T) {
 	dir := t.TempDir()
 	srv, hits := newServer(t, "# branches doc")
@@ -79,6 +84,8 @@ func TestFetch_DownloadsThenServesFreshCache(t *testing.T) {
 	}
 }
 
+// TestFetch_StaleCacheTriggersRedownload verifies that a cached copy older
+// than MaxAge is downloaded again and the fresh body returned.
 func TestFetch_StaleCacheTriggersRedownload(t *testing.T) {
 	dir := t.TempDir()
 	srv, hits := newServer(t, "fresh")
@@ -104,6 +111,8 @@ func TestFetch_StaleCacheTriggersRedownload(t *testing.T) {
 	}
 }
 
+// TestFetch_RefreshForcesDownload verifies that Refresh downloads the area
+// even when a cached copy exists.
 func TestFetch_RefreshForcesDownload(t *testing.T) {
 	dir := t.TempDir()
 	srv, hits := newServer(t, "v2")
@@ -123,6 +132,9 @@ func TestFetch_RefreshForcesDownload(t *testing.T) {
 	}
 }
 
+// TestFetch_OfflineServesCachedAnyAgeAndErrorsOnMiss verifies that Offline
+// serves a cached copy however old it is, fails on an area it has no copy
+// of, and sends no request either way.
 func TestFetch_OfflineServesCachedAnyAgeAndErrorsOnMiss(t *testing.T) {
 	dir := t.TempDir()
 	srv, hits := newServer(t, "should-not-be-fetched")
@@ -150,6 +162,8 @@ func TestFetch_OfflineServesCachedAnyAgeAndErrorsOnMiss(t *testing.T) {
 	}
 }
 
+// TestFetch_RetriesOn429ThenSucceeds verifies that a 429 is retried and the
+// body of the attempt that succeeds is returned.
 func TestFetch_RetriesOn429ThenSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	var hits int32
@@ -174,12 +188,14 @@ func TestFetch_RetriesOn429ThenSucceeds(t *testing.T) {
 	}
 }
 
+// TestFetch_NetworkErrorFallsBackToStaleCache verifies that when every
+// attempt to download a stale area fails without an answer, the stale cached
+// copy is returned rather than an error.
 func TestFetch_NetworkErrorFallsBackToStaleCache(t *testing.T) {
 	dir := t.TempDir()
-	// Closed server -> connection refused.
-	srv := httptest.NewServer(http.NotFoundHandler())
-	base := srv.URL + "/"
-	srv.Close()
+	// A dead endpoint hangs up before any answer, which is a network error
+	// rather than an HTTP status, and keeps its port for the whole test.
+	base := netfixture.DeadEndpoint(t) + "/"
 
 	cachePath := filepath.Join(dir, "branches.md")
 	if err := os.WriteFile(cachePath, []byte("stale-but-usable"), 0o600); err != nil {
@@ -197,6 +213,9 @@ func TestFetch_NetworkErrorFallsBackToStaleCache(t *testing.T) {
 	}
 }
 
+// TestFetch_StrictVsLenientOn404WithStaleCache verifies what a 404 for an
+// area with a stale cached copy gives: the cached body by default, and an
+// error under Strict, so a page removed upstream is not masked.
 func TestFetch_StrictVsLenientOn404WithStaleCache(t *testing.T) {
 	// Server always 404s (doc removed upstream).
 	srv := httptest.NewServer(http.NotFoundHandler())
@@ -228,6 +247,8 @@ func TestFetch_StrictVsLenientOn404WithStaleCache(t *testing.T) {
 	}
 }
 
+// TestJitter_RangeAndNonPositive verifies that jitter is zero for a span that
+// is not positive and otherwise falls in [0, span).
 func TestJitter_RangeAndNonPositive(t *testing.T) {
 	if got := jitter(0); got != 0 {
 		t.Errorf("jitter(0) = %v, want 0", got)
@@ -243,6 +264,8 @@ func TestJitter_RangeAndNonPositive(t *testing.T) {
 	}
 }
 
+// TestCacheDir_UnderRepoRoot verifies that the cache lives in
+// .cache/gitlab-api-docs below the repository root it is given.
 func TestCacheDir_UnderRepoRoot(t *testing.T) {
 	got := CacheDir(filepath.Join("repo", "root"))
 	want := filepath.Join("repo", "root", ".cache", "gitlab-api-docs")
@@ -251,6 +274,9 @@ func TestCacheDir_UnderRepoRoot(t *testing.T) {
 	}
 }
 
+// TestParseRetryAfter verifies both forms of Retry-After: delta-seconds,
+// padded or not, and an HTTP date, with zero for an empty, zero, negative or
+// unreadable value and for a date already past.
 func TestParseRetryAfter(t *testing.T) {
 	if got := parseRetryAfter("5"); got != 5*time.Second {
 		t.Errorf("delta-seconds: got %v, want 5s", got)
@@ -275,6 +301,10 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+// TestBackoffDelay verifies the wait before a retry: a Retry-After the server
+// sent, capped at maxBackoff, plus at most baseSpacing of jitter, and
+// otherwise an exponential backoff by attempt with up to half of it again as
+// jitter.
 func TestBackoffDelay(t *testing.T) {
 	if got := backoffDelay(1, 3*time.Second); got < 3*time.Second || got > 3*time.Second+baseSpacing {
 		t.Errorf("retry-after honored: got %v", got)
