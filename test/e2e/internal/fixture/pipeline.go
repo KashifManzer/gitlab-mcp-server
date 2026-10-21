@@ -41,6 +41,29 @@ fast-pass:
 // CIFilePath is where GitLab looks for the pipeline configuration.
 const CIFilePath = ".gitlab-ci.yml"
 
+// SkipCIMarker is what a commit message carries to keep GitLab from running
+// the pipeline of the push the commit arrives on.
+//
+// Every commit of a pipeline configuration that a scenario or a builder
+// follows with a pipeline of its own, on any branch, carries it. The
+// push's pipeline would otherwise run every job once more on the one runner
+// the Docker stack registers, beside the pipeline the scenario reads, and
+// GitLab creates it in a background job that finishes when it finishes, so it
+// can still be running when the next scenario holding the runner starts. The
+// pipeline the scenario creates still runs: GitLab ignores the marker for a
+// pipeline created through the pipelines API, a trigger token or a bridge
+// (each passes ignore_skip_ci, in lib/api/ci/pipelines.rb,
+// app/services/ci/pipeline_trigger_service.rb and app/models/ci/bridge.rb).
+// The push still records a pipeline, skipped and with no job, so a read of a
+// branch's latest pipeline can see that one land after the scenario's.
+//
+// A commit goes without it only where the marker would skip the pipeline a
+// scenario reads, or would create one where there is none, and it says why
+// beside the commit, with a //gitlab:allow-push-pipeline line directly above
+// it: TestCICommits_EveryOne_SkipsThePushPipelineOrSaysWhy in sources_test.go
+// fails on a commit of the configuration that has neither.
+const SkipCIMarker = "[skip ci]"
+
 // ManualJobName is what ManualJobCIYAML calls the job a case plays.
 const ManualJobName = "manual-deploy"
 
@@ -83,23 +106,28 @@ type Pipeline struct {
 }
 
 // CIFile commits CIYAML to the project's default branch and returns the
-// commit, so that a pipeline created next has a configuration to run.
+// commit, so that a pipeline created next has a configuration to run. The
+// commit carries SkipCIMarker, so the pipeline the caller creates is the only
+// one that runs.
 func CIFile(e *harness.Env, project Project) Commit {
 	e.T.Helper()
-	return CommitFile(e, project, project.DefaultBranch, CIFilePath, CIYAML, "ci: add the e2e pipeline configuration")
+	return CommitFile(e, project, project.DefaultBranch, CIFilePath, CIYAML, "ci: add the e2e pipeline configuration "+SkipCIMarker)
 }
 
-// The pipeline wait's bounds: generous, because an ephemeral runner in a
-// container pulls its image on the first job, and tolerant of a run of API
-// errors, because a GitLab under load answers some polls with nothing.
-const (
-	pipelineWait                 = 15 * time.Minute
-	pipelineMaxConsecutiveErrors = 10
-)
+// pipelineMaxConsecutiveErrors is how many failed polls in a row the pipeline
+// wait sits through, because a GitLab under load answers some polls with
+// nothing.
+const pipelineMaxConsecutiveErrors = 10
 
-// pipelinePollInterval is how often the wait asks; a variable so the
-// package's own tests can ask faster than a real runner answers.
-var pipelinePollInterval = 5 * time.Second
+// The pipeline wait's default budget, generous because an ephemeral runner in
+// a container pulls its image on the first job, and how often the wait asks.
+// Variables so the package's own tests can ask faster than a real runner
+// answers and bound a wait that never ends, which no stub answer can do for
+// them.
+var (
+	pipelineWait         = 15 * time.Minute
+	pipelinePollInterval = 5 * time.Second
+)
 
 // NewPipeline creates a pipeline on ref and waits until it reaches a
 // terminal status, failing the test if it does not within the budget. The

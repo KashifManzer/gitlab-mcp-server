@@ -199,7 +199,7 @@ func groupFacts(group fixture.Group) map[string][]string {
 // last write wins and the run-time comparison in BuildWorld is what catches a
 // key that should not be there at all.
 func with(base, extra map[string][]string) map[string][]string {
-	merged := make(map[string][]string, len(base)+len(extra))
+	merged := make(map[string][]string)
 	maps.Copy(merged, base)
 	maps.Copy(merged, extra)
 	return merged
@@ -1291,7 +1291,7 @@ func manualJobConfiguration(e *harness.Env, project fixture.Project) {
 func commitCIConfiguration(e *harness.Env, project fixture.Project, yaml string) {
 	e.T.Helper()
 	fixture.CommitFile(e, project, project.DefaultBranch, fixture.CIFilePath, yaml,
-		"ci: add the e2e pipeline configuration [skip ci]")
+		"ci: add the e2e pipeline configuration "+fixture.SkipCIMarker)
 }
 
 // newMergeRequestWorld raises the project, the branch ahead of its default

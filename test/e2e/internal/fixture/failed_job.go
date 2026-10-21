@@ -70,16 +70,19 @@ type FailedJob struct {
 	ArtifactPath string
 }
 
-// failedJobWait is the wait's budget: as generous as the pipeline wait,
-// because the first job of a run pulls the runner's image.
-const failedJobWait = 10 * time.Minute
+// failedJobWait is the wait's budget, ten minutes, because the first job of a
+// run pulls the runner's image. A variable so the package's own tests can
+// watch a builder's wait run out, which no stub answer can make it do sooner.
+var failedJobWait = 10 * time.Minute
 
 // failedJobPollInterval is how often the wait asks; a variable so the
 // package's own tests can ask faster than a runner answers.
 var failedJobPollInterval = 5 * time.Second
 
 // NewFailedJob commits the failing configuration to the project's default
-// branch, creates a pipeline on it and waits for the job to fail.
+// branch, creates a pipeline on it and waits for the job to fail. The commit
+// carries SkipCIMarker, so the push does not run the failing job a second
+// time beside the pipeline the builder creates.
 //
 // The test is skipped when no runner is registered: without one the job never
 // starts, and a fixture that waited would spend ten minutes proving it.
@@ -87,7 +90,7 @@ func NewFailedJob(e *harness.Env, project Project) FailedJob {
 	e.T.Helper()
 	requireRunner(e)
 
-	CommitFile(e, project, project.DefaultBranch, CIFilePath, FailingCIYAML, "ci: add the failing e2e pipeline configuration")
+	CommitFile(e, project, project.DefaultBranch, CIFilePath, FailingCIYAML, "ci: add the failing e2e pipeline configuration "+SkipCIMarker)
 
 	pipeline, err := retryTransient(e, "create failing pipeline", createRetries, func() (Pipeline, error) {
 		created, _, createErr := e.Client().GL().Pipelines.CreatePipeline(project.ID,

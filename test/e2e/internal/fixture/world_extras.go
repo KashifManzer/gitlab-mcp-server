@@ -135,6 +135,15 @@ stages:
 `
 
 // worldCIMessage is the message of the commit that adds worldCIYAML.
+//
+// It carries no SkipCIMarker, unlike the other configurations committed to a
+// default branch, and must not. The workflow rule already keeps the push from
+// creating any pipeline, and GitLab judges the marker before the workflow
+// rules: a marked push would record a skipped pipeline beside the World's
+// own, in a background job that can land after it, and the World would have
+// two. The source gate reads a message where the commit is made and does not
+// follow it to this constant, so the World pipeline's test holds the message
+// to carrying no marker.
 const worldCIMessage = "ci: add the World's pipeline configuration"
 
 // worldExtra is one object the World makes beyond its core.
@@ -413,8 +422,10 @@ func createWorldPipeline(ctx context.Context, tb testing.TB, client *gitlabclien
 	return nil
 }
 
-// commitWorldCIFile adds worldCIYAML to the project's default branch.
+// commitWorldCIFile adds worldCIYAML to the project's default branch, with a
+// message that carries no SkipCIMarker for the reason worldCIMessage gives.
 func commitWorldCIFile(ctx context.Context, client *gitlabclient.Client, project Project) (Commit, error) {
+	//gitlab:allow-push-pipeline the workflow rule already refuses a push pipeline
 	created, _, err := client.GL().Commits.CreateCommit(project.ID, &gl.CreateCommitOptions{
 		Branch:        new(project.DefaultBranch),
 		CommitMessage: new(worldCIMessage),

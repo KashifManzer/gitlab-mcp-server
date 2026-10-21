@@ -1,7 +1,8 @@
 //go:build e2e
 
-// pipeline_test.go drives the pipeline builders, the pipeline and job waits
-// and the runner lookup against the stub.
+// pipeline_test.go drives the pipeline builders, the configuration commit
+// they stand on, the pipeline and job waits and the runner lookup against the
+// stub.
 
 package fixture
 
@@ -9,7 +10,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +29,19 @@ func shortPipelinePolls(t *testing.T) {
 	saved := pipelinePollInterval
 	pipelinePollInterval = 10 * time.Millisecond
 	t.Cleanup(func() { pipelinePollInterval = saved })
+}
+
+// shortPipelineWait gives the pipeline wait's default budget the bound a test
+// needs, polling as fast as shortPipelinePolls does, and restores both
+// afterwards. A test that drives a builder through NewPipeline sets one, so a
+// defect that keeps the wait from ending fails the test at that bound rather
+// than holding it for the fifteen minutes a runner is given.
+func shortPipelineWait(t *testing.T, wait time.Duration) {
+	t.Helper()
+	shortPipelinePolls(t)
+	saved := pipelineWait
+	pipelineWait = wait
+	t.Cleanup(func() { pipelineWait = saved })
 }
 
 // TestWaitForPipelineStatus_Running_ReturnsTheTerminalStatus checks that the
@@ -139,6 +155,23 @@ func TestFindRunner_Description_ReturnsTheDockerRunner(t *testing.T) {
 	}
 }
 
+// TestDockerRunnerID_Detached_FindsTheStacksRunner checks the lookup the
+// runner actions stand on whole: the runner register-runner.sh described is
+// handed back by its ID, whatever else the listing holds.
+func TestDockerRunnerID_Detached_FindsTheStacksRunner(t *testing.T) {
+	stub, e := detachedStub(t)
+	stub.configure(func() {
+		stub.runners = []*gl.Runner{
+			{ID: 11, Description: "somebody-else"},
+			{ID: 12, Description: DockerRunnerDescription},
+		}
+	})
+
+	if got := DockerRunnerID(e); got != 12 {
+		t.Errorf("DockerRunnerID() = %d, want the runner described %q, 12", got, DockerRunnerDescription)
+	}
+}
+
 // TestCIYAML_Shape_RunsOnAnyRunner pins the two properties the pipeline
 // fixture relies on: one stage with one job, and no runner tags, so it is
 // picked up by whatever runner the instance has.
@@ -209,6 +242,11 @@ func TestFindPipelineJob_Answers(t *testing.T) {
 		{
 			name:   "the first job",
 			answer: stubOK([]map[string]any{{"id": 10, "name": "fast-pass", "status": "running"}}),
+			accept: anyJob, want: 10,
+		},
+		{
+			name:   "past a null row",
+			answer: stubOK([]any{nil, map[string]any{"id": 10, "name": "fast-pass", "status": "running"}}),
 			accept: anyJob, want: 10,
 		},
 		{
@@ -334,12 +372,110 @@ func TestAwaitPipelineJob_Answers_WaitsForTheJobItWants(t *testing.T) {
 // what the pipeline builder asks before it creates anything.
 var oneRunner = stubOK([]map[string]any{{"id": 1, "description": DockerRunnerDescription}})
 
+// gitLabSkipCIPattern is how GitLab reads a commit message as asking it not
+// to run the pipeline of the push the commit arrives on: SKIP_PATTERN in
+// lib/gitlab/ci/pipeline/chain/skip.rb, matched without regard to case. The
+// tests hold a message to GitLab's own reading rather than to one spelling,
+// since the reading is what decides whether the push's pipeline runs.
+var gitLabSkipCIPattern = regexp.MustCompile(`(?i)\[(ci[ _-]skip|skip[ _-]ci)\]`)
+
+// sentCICommit is the one commit a builder sent that writes the pipeline
+// configuration, as the commits endpoint received it.
+type sentCICommit struct {
+	branch  string
+	message string
+	content string
+}
+
+// ciCommitTo returns the commit a builder sent to the project that writes the
+// pipeline configuration, failing the test unless it sent exactly one.
+func ciCommitTo(t *testing.T, stub *stubGitLab, projectID int64) sentCICommit {
+	t.Helper()
+
+	path := "/api/v4/projects/" + strconv.FormatInt(projectID, 10) + "/repository/commits"
+	var found []sentCICommit
+	for _, request := range stub.recordedRequests() {
+		if request.Method != http.MethodPost || request.Path != path {
+			continue
+		}
+		actions, _ := request.Body["actions"].([]any)
+		for _, raw := range actions {
+			action, _ := raw.(map[string]any)
+			if action["file_path"] != CIFilePath {
+				continue
+			}
+			branch, _ := request.Body["branch"].(string)
+			message, _ := request.Body["commit_message"].(string)
+			content, _ := action["content"].(string)
+			found = append(found, sentCICommit{branch: branch, message: message, content: content})
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("the builder sent %d commit(s) of %s to project %d, want one; sent: %v", len(found), CIFilePath, projectID, sentPaths(stub))
+	}
+	return found[0]
+}
+
+// assertSkipsThePushPipeline holds a configuration commit to the rule every
+// one a pipeline of the builder's own follows keeps: it lands on the default
+// branch with a message GitLab reads as skipping the push's pipeline, so the
+// pipeline the builder creates next is the only one that runs.
+func assertSkipsThePushPipeline(t *testing.T, commit sentCICommit, wantBranch, wantContent string) {
+	t.Helper()
+	if commit.branch != wantBranch {
+		t.Errorf("the configuration was committed to %q, want the default branch %q", commit.branch, wantBranch)
+	}
+	if commit.content != wantContent {
+		t.Errorf("the configuration committed is\n%s\nwant\n%s", commit.content, wantContent)
+	}
+	if !gitLabSkipCIPattern.MatchString(commit.message) {
+		t.Errorf("the configuration was committed as %q, which GitLab does not read as skipping the push's pipeline, "+
+			"so the push runs every job once more beside the pipeline the builder creates", commit.message)
+	}
+}
+
+// TestSkipCIMarker_Spelling_IsReadByGitLabAsSkippingThePush pins the marker
+// to GitLab's own reading of a commit message, alone and in the middle of one,
+// since a spelling GitLab does not recognize skips nothing and fails nothing.
+func TestSkipCIMarker_Spelling_IsReadByGitLabAsSkippingThePush(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+	}{
+		{name: "alone", message: SkipCIMarker},
+		{name: "in a subject with a body", message: "ci: add a configuration " + SkipCIMarker + "\n\nWith a body."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !gitLabSkipCIPattern.MatchString(tc.message) {
+				t.Errorf("GitLab does not read %q as skipping the push's pipeline", tc.message)
+			}
+		})
+	}
+}
+
+// TestCIFile_Detached_CommitsWithoutAPushPipeline checks the configuration
+// commit the pipeline scenarios stand on: CIYAML on the default branch, with
+// a message that keeps the push from running a pipeline beside the one each
+// scenario creates through the API.
+func TestCIFile_Detached_CommitsWithoutAPushPipeline(t *testing.T) {
+	stub, e := detachedStub(t)
+	stub.answers(http.MethodPost, "/api/v4/projects/2/repository/commits", stubCreated(map[string]any{"id": "ci-sha", "short_id": "ci-sha"}))
+
+	got := CIFile(e, Project{ID: 2, DefaultBranch: "trunk"})
+
+	if want := (Commit{SHA: "ci-sha", ShortID: "ci-sha", Branch: "trunk", FilePath: CIFilePath}); got != want {
+		t.Errorf("CIFile() = %+v, want %+v", got, want)
+	}
+	assertSkipsThePushPipeline(t, ciCommitTo(t, stub, 2), "trunk", CIYAML)
+}
+
 // TestNewPipeline_Detached_CreatesOnTheRefAndWaitsForItToFinish checks the
 // pipeline builder whole on a run with a runner: the pipeline asked for on
 // the ref it was given, and handed back once it reached a terminal status,
 // carrying that status rather than the one it was created in.
 func TestNewPipeline_Detached_CreatesOnTheRefAndWaitsForItToFinish(t *testing.T) {
-	shortPipelinePolls(t)
+	shortPipelineWait(t, 10*time.Second)
 	stub, e := detachedStub(t)
 	stub.answers(http.MethodGet, "/api/v4/runners", oneRunner)
 	stub.answers(http.MethodPost, "/api/v4/projects/2/pipeline", stubCreated(map[string]any{"id": 77, "ref": "trunk", "sha": "abc", "status": "created"}))
@@ -352,6 +488,22 @@ func TestNewPipeline_Detached_CreatesOnTheRefAndWaitsForItToFinish(t *testing.T)
 	}
 	if sent := requestTo(t, stub, http.MethodPost, "/api/v4/projects/2/pipeline").Body["ref"]; sent != "trunk" {
 		t.Errorf("NewPipeline() asked for a pipeline on %v, want trunk", sent)
+	}
+}
+
+// TestWaitForPipeline_ZeroTimeout_TakesTheDefaultBudget checks the wait a
+// scenario calls with no budget of its own, which is how the pipeline
+// creation scenario reads the pipeline the server created: it waits on the
+// default budget and hands back the terminal status. That the budget is the
+// default one shows where it runs out, in the fatal case "pipeline default
+// wait".
+func TestWaitForPipeline_ZeroTimeout_TakesTheDefaultBudget(t *testing.T) {
+	shortPipelineWait(t, 10*time.Second)
+	stub, e := detachedStub(t)
+	stub.configure(func() { stub.pipelineStatuses = []string{"running", "failed"} })
+
+	if got := WaitForPipeline(e, Project{ID: 2}, 77, 0); got != "failed" {
+		t.Errorf("WaitForPipeline() = %q, want the terminal status failed", got)
 	}
 }
 
