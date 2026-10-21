@@ -37,9 +37,14 @@ var searchStopWordsMap = map[string]struct{}{
 // drops a request header its preflight did not authorize, and the server then
 // rejects the call for that header's absence, so the two must be derived from
 // one another rather than maintained in parallel. Declared on its own so it
-// carries its own documentation; the suffix it is built from lives in the
-// block below.
-const ExecuteActionHeaderName = "Mcp-Param-" + executeActionHeaderSuffix
+// carries its own documentation; the suffix it is the prefixed form of lives
+// in the block below.
+//
+// It is written out rather than concatenated from that suffix because the
+// mutation gate cannot see an operator in a constant, and
+// TestExecuteActionSchema_XMCPHeader_AnnotatesActionParam holds the two to
+// "Mcp-Param-" plus the suffix, so neither can drift from the other.
+const ExecuteActionHeaderName = "Mcp-Param-Action"
 
 const (
 	aliasProtectedEnvironment  = "protected environment"
@@ -198,10 +203,15 @@ type DescribeOutput struct {
 // bounded the query, and a request body may be 4 MiB, which is hundreds of
 // thousands of words.
 //
-// Measured by BenchmarkFind_PathologicalQuery against the Free catalog, with
-// words that match nothing: two words cost 14 ms and 1.7 MB, eight words
-// 229 ms and 6.8 MB, and a query filling this bound 0.8 s and 20 MB. So the
-// bound is what makes one call's cost a number at all.
+// Measured by BenchmarkFind_PathologicalQuery against the Free catalog, on
+// five cores of a shared machine in October 2026. Words that match nothing
+// cost 6 ms and 2.8 MB for two words, 70 ms and 11 MB for eight, and 0.3 s
+// and 33 MB for a query filling this bound. Plurals of words the catalog
+// spells cost less than that for two words, 2 ms and 1.4 MB, as much time
+// and more memory for eight, 70 ms and 17 MB, and the most of all filling
+// the bound, 0.7 s and 152 MB, since each reaches the actions its singular
+// names and every pass scores a larger candidate set. So the bound is what
+// makes one call's cost a number at all.
 //
 // 256 characters is around forty words, comfortably above every query the
 // tool's own description suggests and above anything a model has been
@@ -1430,6 +1440,31 @@ func appendSchemaEnumValue(values []string, value any) []string {
 type searchTerm struct {
 	Raw          string
 	Alternatives []string
+	// Singular is the singular of Raw that the catalog spells in an action
+	// ID when Raw is its plural, and empty otherwise. It is not one of the
+	// Alternatives: it is matched against the action ID alone, below the
+	// plural's own spelling ([singularMatch]), it counts as spelling a word of
+	// the action name ([scoreActionSpecificity]), and it tells that the query
+	// asks for many of what it names ([scorePluralListIntent]).
+	Singular string
+	// Noun reports that Raw is a verb by spelling and here the first word of
+	// a domain name the next term completes, as merge is in "merge request"
+	// and "merge requests". It is then no verb of the query
+	// ([queryVerbIntent]), and it scores at most as a word of a domain, never
+	// as the action it also spells ([scoreTermValue]).
+	Noun bool
+	// Domain is the domain name this term spells with its neighbor when the
+	// neighbor completes it through its singular, as merge and requests spell
+	// merge_request, and empty otherwise. Both words then score as that
+	// domain on its actions ([domainPairScore]): written in the singular, the
+	// pair matches the domain's words and the compound tag that spells them,
+	// and a derived singular forms no compound tag.
+	Domain string
+	// RefResource reports that Raw, or its singular, is a branch, a tag or a
+	// commit in a query that says what to do, which names the point an
+	// action whose ref is required starts from ([markRefResources],
+	// [refResourceMatch]).
+	RefResource bool
 }
 
 func normalizeSearchTerms(query string) []searchTerm {
@@ -1536,6 +1571,16 @@ func dedupeSortedStrings(values []string) []string {
 	return out
 }
 
+// searchSynonymsMap holds the other words a query term also matches as.
+//
+// A plural needs no entry of its own to reach the action ID through its
+// singular: the search derives the singular the catalog spells for every
+// plural term ([searchIndex.searchTerms]) and matches it there. That derived
+// singular reaches nothing else, so an entry keyed by a plural is here for
+// what it adds beyond it: other words, such as list for jobs and releases or
+// refs for tags, or the singular itself as a full alternative, which tokens
+// keeps so that "list deploy tokens" still matches the tags deploy token and
+// token list.
 var searchSynonymsMap = map[string][]string{
 	"access":        {"token"},
 	"alias":         {"name", "project_alias", "redirect"},
@@ -2145,14 +2190,70 @@ func addSchemaPropertyTags(add tagCollector, schema map[string]any) {
 		switch name {
 		case "state_event":
 			add("close", "reopen", "state")
-		case "ref":
-			add("branch", "tag", "commit")
 		case "file_path":
 			add("repository file", "path")
 		case "url":
 			add("url")
 		}
 	}
+}
+
+// markRefResources marks the terms of a query that name the point an action
+// whose ref is required starts from: a branch, a tag or a commit, as written
+// or in the plural ([refResourceMatch]).
+//
+// It marks them only when the query says what to do. A query with no verb
+// names what it is about, and a branch there is that resource rather than a
+// place to start from: "pipeline for branch" asks for the pipeline of a
+// branch, and pipeline.create, whose ref is required, is not its answer.
+func markRefResources(terms []searchTerm) {
+	if queryVerbIntent(terms) == "" {
+		return
+	}
+	for position := range terms {
+		terms[position].RefResource = isRefResource(terms[position].Raw) || isRefResource(terms[position].Singular)
+	}
+}
+
+// isRefResource reports whether word is one of the three things a ref
+// parameter names.
+func isRefResource(word string) bool {
+	return word == "branch" || word == "tag" || word == "commit"
+}
+
+// refResourceMatch scores a term that names a branch, tag or commit
+// ([searchTerm.RefResource]) against an action whose ref is required, and
+// returns 0 for every other action.
+//
+// A required ref is the point the action works from: the commit a branch or a
+// tag is created from, the branch a pipeline runs on, the ref a file is read
+// at. So "create branch from commit" names branch.create twice, as the
+// resource it creates and as the point it creates it from, and
+// repository.commit_create, which takes the branch to commit to, does not
+// answer it. The word scores as a word of a domain, a step below the action's
+// own domain, so the resource the query acts on ranks first: "create tag from
+// commit" is tag.create before branch.create.
+//
+// Written in the plural, the word scores a step lower again, as a singular
+// does on the action ID ([singularMatch]). Otherwise "create branches from
+// commits", whose branches reaches the domain of branch.create only through
+// its singular, a step below the domain, would claim that domain no more
+// than the ref of pipeline.create and tag.create claims it, and the three
+// would tie.
+//
+// An optional ref names nothing. It filters what its action lists or reads:
+// pipeline.list takes one to filter its pipelines, and when every ref tagged
+// its action with branch, tag and commit at the weight of a tag, above an
+// action's own domain, "list branch" tied it with branch.list and "list
+// commit" put it ahead of repository.commit_list (issue 1121).
+func refResourceMatch(document searchDocument, term searchTerm) int {
+	if !term.RefResource || !slices.Contains(document.RequiredParams, "ref") {
+		return 0
+	}
+	if isRefResource(term.Raw) {
+		return scoreRefResource
+	}
+	return scoreRefResourcePlural
 }
 
 // searchMatches scores the catalog against one query.
@@ -2164,7 +2265,7 @@ func addSchemaPropertyTags(add tagCollector, schema map[string]any) {
 // did the action deadline, which could not end one.
 func (r *Registry) searchMatches(ctx context.Context, query string, limit int, explain bool) ([]scoredActionEntry, error) {
 	limit = normalizedLimit(limit)
-	terms := normalizeSearchTerms(query)
+	terms := r.SearchIndex.searchTerms(query)
 	searchScorer := scoreEntryWithoutExplanation
 	fuzzyScorer := fuzzyScoreEntryWithoutExplanation
 	if explain {
@@ -3068,7 +3169,7 @@ func (r *Registry) ambiguousAliasTargets(action string) []string {
 }
 
 func (r *Registry) suggestActionIDs(query string, limit int) []string {
-	terms := normalizeSearchTerms(query)
+	terms := r.SearchIndex.searchTerms(query)
 	if len(terms) == 0 {
 		return nil
 	}
@@ -3081,11 +3182,7 @@ func (r *Registry) suggestActionIDs(query string, limit int) []string {
 	for _, entry := range r.entries {
 		score := 0
 		for _, term := range terms {
-			best := 0
-			for _, alternative := range term.Alternatives {
-				best = max(best, scoreSearchAlternative(entry, term.Raw, alternative))
-			}
-			score += best
+			score += scoreTermValue(entry, term)
 		}
 		if isNounVerb && namesNounVerb(entry.ID, nounVerb) {
 			score += scoreCanonicalExact
@@ -3282,11 +3379,7 @@ func scoreEntry(entry actionEntry, terms []searchTerm) int {
 	totalScore := 0
 	matchedCount := 0
 	for _, term := range terms {
-		best := 0
-		for _, alternative := range term.Alternatives {
-			best = max(best, scoreSearchAlternative(entry, term.Raw, alternative))
-		}
-		if best > 0 {
+		if best := scoreTermValue(entry, term); best > 0 {
 			matchedCount++
 			totalScore += best
 		}
@@ -3311,7 +3404,7 @@ func scoreEntry(entry actionEntry, terms []searchTerm) int {
 	score += scoreServiceAccountIntentValue(entry, terms)
 	score += scoreScopeIntentValue(entry, terms)
 	score += scoreCompareRefsIntentValue(entry, terms)
-	score += scoreReleaseListIntentValue(entry, terms)
+	score += scorePluralListIntentValue(entry, terms)
 	score += scoreDiscoverProjectIntentValue(entry, terms)
 	score += scoreProjectGetIntentValue(entry, terms)
 	score += scoreSearchProjectsIntentValue(entry, terms)
@@ -3331,16 +3424,7 @@ func scoreEntryWithExplanation(entry actionEntry, terms []searchTerm) (int, Scor
 	matchedCount := 0
 	reasons := make([]MatchReason, 0, len(terms))
 	for _, term := range terms {
-		best := 0
-		var bestReason MatchReason
-		for _, alternative := range term.Alternatives {
-			candidateScore, reason := scoreSearchAlternativeWithReason(entry, term.Raw, alternative)
-			if candidateScore > best {
-				best = candidateScore
-				bestReason = reason
-			}
-		}
-		if best > 0 {
+		if best, bestReason := scoreTermWithReason(entry, term); best > 0 {
 			matchedCount++
 			totalScore += best
 			reasons = append(reasons, bestReason)
@@ -3384,7 +3468,7 @@ func applyIntentAdjustments(entry actionEntry, terms []searchTerm, score int, re
 		scoreServiceAccountIntent,
 		scoreScopeIntent,
 		scoreCompareRefsIntent,
-		scoreReleaseListIntent,
+		scorePluralListIntent,
 		scoreDiscoverProjectIntent,
 		scoreProjectGetIntent,
 		scoreSearchProjectsIntent,
@@ -3465,9 +3549,9 @@ func scoreVerbIntentFor(entry actionEntry, intent verbIntent, terms []searchTerm
 	case verbIntentRead:
 		switch {
 		case entry.Destructive:
-			adjustment = scoreVerbIntentPenalty
+			adjustment = -scoreVerbIntentPenalty
 		case isWriteAction(document.Action):
-			adjustment = scoreVerbIntentPenalty / 2
+			adjustment = -scoreVerbIntentPenalty / 2
 		case isReadAction(document.Action):
 			adjustment = scoreVerbIntentBoost
 		}
@@ -3505,7 +3589,7 @@ func scoreDestructiveVerbAdjustment(entry actionEntry, terms []searchTerm, docum
 		return 0
 	}
 	if !queryHasResourceSignal(terms, document) {
-		return scoreVerbIntentPenalty
+		return -scoreVerbIntentPenalty
 	}
 	if document.Action == "delete" || document.Action == "remove" || document.Action == "revoke" {
 		return scoreVerbIntentBoost * 3
@@ -3727,27 +3811,121 @@ func scoreCompareRefsIntentValue(entry actionEntry, terms []searchTerm) int {
 	return scoreCompareRefsIntentBoost
 }
 
-func scoreReleaseListIntent(entry actionEntry, terms []searchTerm) (int, MatchReason) {
-	score := scoreReleaseListIntentValue(entry, terms)
-	if score == 0 {
+// scorePluralListIntent rewards a list action when the query names its
+// resource in the plural and asks to read it, or asks nothing.
+//
+// The singular a plural is matched through ([searchIndex.searchTerms]) makes
+// "show issues" read as "show issue", and the two reads of the issue domain
+// then score alike, issue.get and issue.list, so the action ID broke the tie.
+// A plural asks for many of the thing it names, which a list returns and a
+// get does not, so that is the reading kept. It is one rule for every domain,
+// and it asks that the action's own ID spell the resource, so a list action
+// of another domain that only mentions the plural gains nothing: "list tags"
+// lifts tag.list and not release.list, which carries tag among its tags.
+//
+// It replaces the intent boost that release.list used to have to itself,
+// which answered "list releases" and nothing else, the way the synonym table
+// answered a few plurals one at a time (issue 1121). The regression corpus and
+// the pinned list queries rank release.list first with confidence without it.
+//
+// Only an action that reads gains it ([pluralNamingListAction]), and only from
+// a query that reads or names nothing but what it lists: "delete merged
+// branches" keeps branch.delete_merged first, "artifacts" does not lift
+// job.delete_artifacts, which the plural names too, and "assign issues", whose
+// verb the verb intent does not know, does not lift issue.list.
+func scorePluralListIntent(entry actionEntry, terms []searchTerm) (int, MatchReason) {
+	plural, found := pluralNamingListAction(entry, terms)
+	if !found {
 		return 0, MatchReason{}
 	}
 	document := documentForEntry(entry)
-	return score, MatchReason{Field: searchFieldReleaseIntent, QueryTerm: "list releases", MatchedValue: document.CanonicalID, Score: score}
+	return scorePluralListIntentBoost, MatchReason{Field: searchFieldPluralList, QueryTerm: plural.Raw, Alternative: plural.Singular, MatchedValue: document.CanonicalID, Score: scorePluralListIntentBoost}
 }
 
-func scoreReleaseListIntentValue(entry actionEntry, terms []searchTerm) int {
+func scorePluralListIntentValue(entry actionEntry, terms []searchTerm) int {
+	if pluralAsksForList(entry, terms) {
+		return scorePluralListIntentBoost
+	}
+	return 0
+}
+
+// pluralAsksForList reports whether a plural term of the query asks for the
+// list entry returns ([pluralNamingListAction]).
+func pluralAsksForList(entry actionEntry, terms []searchTerm) bool {
+	_, found := pluralNamingListAction(entry, terms)
+	return found
+}
+
+// pluralNamingListAction returns the first plural term of a read or verbless
+// query that names entry as a list of its resource, and true; otherwise false.
+//
+// An entry lists what a plural names in two spellings: a list action whose
+// domain is the singular or whose action name holds it (issue.list,
+// environment.deployment_list), and an action named by the plural itself
+// (runner.jobs, group.issues), which lists that resource of its own domain.
+// A singular that is only one word of a domain of two names that domain no
+// more than "access requests" names merge requests, so merge_request.list is
+// lifted by a plural that completes its name with the word before it
+// ([searchTerm.Domain]) and not by requests alone. Either spelling has to be
+// read-only: an action the plural names can also delete or change what it
+// names (job.delete_artifacts, merge_request.context_commits_create), and a
+// plural asks to read them.
+//
+// A query with no verb the verb intent knows asks for the list only when
+// every other word describes it ([termsDescribeList]): a word the verb intent
+// does not classify may still be a verb, as assign is in "assign issues".
+func pluralNamingListAction(entry actionEntry, terms []searchTerm) (searchTerm, bool) {
+	if !entry.ReadOnly {
+		return searchTerm{}, false
+	}
+	intent := queryVerbIntent(terms)
+	if intent != "" && intent != verbIntentRead {
+		return searchTerm{}, false
+	}
 	document := documentForEntry(entry)
-	if document.Domain != "release" || document.Action != "list" {
-		return 0
+	if intent == "" && !termsDescribeList(document, terms) {
+		return searchTerm{}, false
 	}
-	if !searchTermsContainWord(terms, "list") {
-		return 0
+	lists := slices.Contains(document.ActionWords, "list")
+	for _, term := range terms {
+		if term.Singular == "" {
+			continue
+		}
+		if slices.Contains(document.ActionWords, term.Raw) || lists && listsResourceOf(document, term) {
+			return term, true
+		}
 	}
-	if !searchTermsContainWord(terms, "release") && !searchTermsContainWord(terms, "releases") {
-		return 0
+	return searchTerm{}, false
+}
+
+// listsResourceOf reports whether the list action document lists what the
+// plural term names: its domain is the singular, or the domain the term
+// completes with the word before it, or its action name holds the singular.
+func listsResourceOf(document searchDocument, term searchTerm) bool {
+	return document.Domain == term.Singular || term.Domain != "" && document.Domain == term.Domain || slices.Contains(document.ActionWords, term.Singular)
+}
+
+// termsDescribeList reports whether every term of a verbless query, other
+// than its plurals, describes the list document would return: a word of its
+// ID as the query wrote it (ssh in "my ssh keys", merge in "merge requests"),
+// the scope it lists in (project in "project merge requests"), or a filter
+// the synonym table reads as a list (open, my, merged).
+//
+// A word that is none of these is a verb the verb intent does not know, such
+// as assign, approve or star, and the query is then no request for the list.
+// The ID is read for the word itself and not for its synonyms, which name
+// what a verb does to a thing rather than the thing: close is a synonym of
+// closed, and "close issues" asks nothing of merge_request.issues_closed.
+func termsDescribeList(document searchDocument, terms []searchTerm) bool {
+	for _, term := range terms {
+		if term.Singular != "" || term.Raw == document.Scope || slices.Contains(document.IDWords, term.Raw) {
+			continue
+		}
+		if !slices.Contains(term.Alternatives, "list") {
+			return false
+		}
 	}
-	return scoreReleaseListIntentBoost
+	return true
 }
 
 func scoreDiscoverProjectIntent(entry actionEntry, terms []searchTerm) (int, MatchReason) {
@@ -3943,6 +4121,16 @@ func scoreActionSpecificity(entry actionEntry, terms []searchTerm) (int, MatchRe
 		return 0, MatchReason{}
 	}
 	termSet := searchTermAlternativeSet(terms)
+	// A word of the action name a query spells in the plural is spelled all
+	// the same: "list deployments" names every word of deployment_list. And a
+	// plural that asks for the list of what it names spells the list:
+	// "group merge requests" names every word of merge_request.list_group.
+	for _, term := range terms {
+		termSet[term.Singular] = struct{}{}
+	}
+	if pluralAsksForList(entry, terms) {
+		termSet["list"] = struct{}{}
+	}
 	unmatched := 0
 	for _, word := range document.ActionWords {
 		if _, ok := termSet[word]; ok {
@@ -3953,7 +4141,7 @@ func scoreActionSpecificity(entry actionEntry, terms []searchTerm) (int, MatchRe
 	if unmatched == 0 {
 		return 0, MatchReason{}
 	}
-	adjustment := unmatched * scoreUnmatchedActionWord
+	adjustment := -unmatched * scoreUnmatchedActionWordPenalty
 	return adjustment, MatchReason{Field: searchFieldSpecificity, QueryTerm: "action_words", MatchedValue: document.Action, Score: adjustment}
 }
 
@@ -3962,9 +4150,10 @@ func scoreActionSpecificityValue(entry actionEntry, terms []searchTerm) int {
 	if len(document.ActionWords) <= 1 {
 		return 0
 	}
+	listed := pluralAsksForList(entry, terms)
 	unmatched := 0
 	for _, word := range document.ActionWords {
-		if searchTermsContainWord(terms, word) {
+		if searchTermsContainWord(terms, word) || searchTermsHaveSingular(terms, word) || listed && word == "list" {
 			continue
 		}
 		unmatched++
@@ -3973,7 +4162,7 @@ func scoreActionSpecificityValue(entry actionEntry, terms []searchTerm) int {
 	// guard here would be a branch no input could distinguish. The sibling
 	// scoreActionSpecificity keeps its guard because there it decides whether a
 	// MatchReason is emitted at all, which is observable.
-	return unmatched * scoreUnmatchedActionWord
+	return -unmatched * scoreUnmatchedActionWordPenalty
 }
 
 func searchTermsContainWord(terms []searchTerm, word string) bool {
@@ -3988,6 +4177,17 @@ func searchTermsContainWord(terms []searchTerm, word string) bool {
 			if slices.Contains(splitSearchFieldWords(alternative), word) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// searchTermsHaveSingular reports whether word is the singular of a plural
+// term of terms.
+func searchTermsHaveSingular(terms []searchTerm, word string) bool {
+	for _, term := range terms {
+		if term.Singular == word {
+			return true
 		}
 	}
 	return false
@@ -4018,7 +4218,9 @@ var verbIntentPrecedence = []verbIntent{
 }
 
 // queryVerbIntent returns the intent of the query's verbs that comes first in
-// [verbIntentPrecedence], or none when no term is a verb.
+// [verbIntentPrecedence], or none when no term is a verb. A verb that is the
+// first word of a domain name ([searchTerm.Noun]) is no verb, so "show merge
+// requests" reads rather than merges.
 //
 // It looks the intents up in their order rather than comparing ranks as it
 // meets them: every intent has its own rank, so a strict and a loose
@@ -4027,6 +4229,9 @@ var verbIntentPrecedence = []verbIntent{
 func queryVerbIntent(terms []searchTerm) verbIntent {
 	present := make(map[verbIntent]bool, len(terms))
 	for _, term := range terms {
+		if term.Noun {
+			continue
+		}
 		present[classifyVerbIntent(term.Raw)] = true
 	}
 	for _, intent := range verbIntentPrecedence {
@@ -4081,6 +4286,117 @@ func isWorkflowAction(action string) bool {
 
 func isDiagnosticAction(action string) bool {
 	return strings.Contains(action, "status") || strings.Contains(action, "log") || strings.Contains(action, "trace") || strings.Contains(action, "lint") || strings.Contains(action, "test") || strings.Contains(action, "health")
+}
+
+// scoreTermValue returns what term scores against entry: its best spelling,
+// the raw word or a synonym, or the singular of a plural when that scores
+// more; for a pair written in the plural that names entry's domain, that
+// domain ([domainPairScore]); and for a verb that is the first word of a
+// domain name, no more than a word of a domain.
+//
+// The Noun cap is what keeps merge_request.merge from being the answer to
+// every query about merge requests: merge is a word of the domain every
+// merge request action shares, and the action gains nothing from also being
+// called merge.
+func scoreTermValue(entry actionEntry, term searchTerm) int {
+	document := documentForEntry(entry)
+	if term.Domain != "" && document.Domain == term.Domain {
+		return domainPairScore(term)
+	}
+	best := 0
+	for _, alternative := range term.Alternatives {
+		best = max(best, scoreSearchAlternative(entry, term.Raw, alternative))
+	}
+	singular, _ := singularMatch(document, term.Singular)
+	best = max(best, singular, refResourceMatch(document, term))
+	if term.Noun {
+		best = min(best, scoreDomainActionWord)
+	}
+	return best
+}
+
+// scoreTermWithReason is scoreTermValue with the reason that explains the
+// score: the spelling that decided it, and its field.
+func scoreTermWithReason(entry actionEntry, term searchTerm) (int, MatchReason) {
+	document := documentForEntry(entry)
+	if term.Domain != "" && document.Domain == term.Domain {
+		score := domainPairScore(term)
+		return score, MatchReason{Field: searchFieldDomain, QueryTerm: term.Raw, Alternative: term.Singular, MatchedValue: term.Domain, Score: score}
+	}
+	best := 0
+	var bestReason MatchReason
+	for _, alternative := range term.Alternatives {
+		candidateScore, reason := scoreSearchAlternativeWithReason(entry, term.Raw, alternative)
+		if candidateScore > best {
+			best = candidateScore
+			bestReason = reason
+		}
+	}
+	if singular, field := singularMatch(document, term.Singular); singular > best {
+		best = singular
+		bestReason = MatchReason{Field: field, QueryTerm: term.Raw, Alternative: term.Singular, MatchedValue: term.Singular, Score: singular}
+	}
+	if ref := refResourceMatch(document, term); ref > best {
+		best = ref
+		bestReason = MatchReason{Field: searchFieldRefResource, QueryTerm: term.Raw, MatchedValue: "ref", Score: ref}
+	}
+	if term.Noun {
+		best = min(best, scoreDomainActionWord)
+		bestReason.Score = best
+	}
+	return best, bestReason
+}
+
+// domainPairScore is what a term of a pair written in the plural scores on
+// the actions of the domain the pair names: the domain's own weight for the
+// word the query wrote as the catalog does, and one step below for the one it
+// wrote in the plural.
+//
+// Written in the singular, "merge request" matches both words of
+// merge_request and the compound tag merge request that every one of its
+// actions carries. Written in the plural it matched neither, since the
+// singular of requests is no alternative and forms no compound tag, and
+// search.merge_requests, whose action spells merge requests outright, took
+// the verbless query from merge_request.list.
+func domainPairScore(term searchTerm) int {
+	if term.Singular != "" {
+		return scoreSingularExact
+	}
+	return scoreDomainActionExact
+}
+
+// singularMatch scores the singular of a plural term against the action ID,
+// the one place it stands for the plural, and names the field it matched.
+//
+// It scores one step below what the singular itself would: the action's own
+// domain or action as a word of one, and a word of either as a partial
+// match. A plural names what its singular names, but the caller spelled the
+// plural, and an action whose ID spells the plural itself matches it at full
+// weight, so it scores above one that only holds the singular in the same
+// part of its ID: "list ssh keys" is user.ssh_keys before the deploy key
+// lists, "download job artifacts" is the archive job.artifacts before
+// job.download_single_artifact, and "search issues" is search.issues before
+// issue.list. The other signals still apply on top: "statuses" alone answers
+// server.status, because repository.commit_statuses spells the plural only
+// as the second word of its action and the specificity penalty takes 60
+// points for the first.
+func singularMatch(document searchDocument, singular string) (score int, field string) {
+	if singular == "" {
+		return 0, ""
+	}
+	if document.Domain == singular {
+		return scoreSingularExact, searchFieldDomain
+	}
+	if document.Action == singular {
+		return scoreSingularExact, searchFieldAction
+	}
+	if slices.Contains(document.ActionWords, singular) {
+		return scoreSingularWord, searchFieldAction
+	}
+	if slices.Contains(document.DomainWords, singular) {
+		return scoreSingularWord, searchFieldDomain
+	}
+	return 0, ""
 }
 
 // scoreSearchAlternative scores one spelling of a query term against an

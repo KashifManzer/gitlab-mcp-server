@@ -14,12 +14,13 @@ const (
 	searchFieldAction         = "action"
 	searchFieldRequiredParam  = "required_param"
 	searchFieldOptionalParam  = "optional_param"
+	searchFieldRefResource    = "ref_resource"
 	searchFieldSchemaProperty = "schema_property"
 	searchFieldSchemaEnum     = "schema_enum"
 	searchFieldSchemaDesc     = "schema_description"
 	searchFieldSpecificity    = "action_specificity"
 	searchFieldCompareIntent  = "compare_refs_intent"
-	searchFieldReleaseIntent  = "release_list_intent"
+	searchFieldPluralList     = "plural_list_intent"
 	searchFieldDiscoverIntent = "discover_project_intent"
 	searchFieldProjectIntent  = "project_get_intent"
 	searchFieldSearchIntent   = "search_projects_intent"
@@ -55,18 +56,41 @@ const (
 	scoreSchemaDescMatch      = 12
 	scoreFieldContains        = 25
 	scoreSynonymContains      = 18
-	scoreUnmatchedActionWord  = -60
+	// scoreUnmatchedActionWordPenalty is taken off for each word of the
+	// action name the query does not spell. It is written as the size of the
+	// penalty and negated where it applies, as scoreVerbIntentPenalty is, so
+	// that the sign is an operator in a statement the tests cover rather than
+	// in a constant the mutation gate cannot see.
+	scoreUnmatchedActionWordPenalty = 60
+	// scoreSingularExact and scoreSingularWord are what the singular of a
+	// plural scores against the action ID ([singularMatch]): one step below
+	// the singular's own match, an exact domain or action as a word of one
+	// and a word as a partial match, so that the spelling the caller wrote
+	// scores above the one the search derived from it.
+	scoreSingularExact = scoreDomainActionWord
+	scoreSingularWord  = scoreDomainActionContains
+	// scoreRefResource is what a branch, tag or commit named by a query that
+	// says what to do scores on an action whose ref is required
+	// ([refResourceMatch]): a word of a domain, one step below the action's
+	// own domain, so that the resource the query acts on ranks above the one
+	// it starts from. scoreRefResourcePlural is the same word written in the
+	// plural, a step lower again, as the singular of a plural scores on the
+	// action ID.
+	scoreRefResource       = scoreDomainActionWord
+	scoreRefResourcePlural = scoreSingularWord
 )
 
 const (
 	minimumHighConfidenceScore  = 80
 	minimumHighConfidenceMargin = 15
 	scoreVerbIntentBoost        = 16
-	scoreVerbIntentPenalty      = -24
+	// scoreVerbIntentPenalty is taken off an action that answers the query's
+	// verb with the opposite one, written as its size and negated where it
+	// applies.
+	scoreVerbIntentPenalty      = 24
 	scoreRequiredParamBoost     = 10
 	scoreCompoundTagBoost       = 50
 	scoreCompareRefsIntentBoost = 90
-	scoreReleaseListIntentBoost = 80
 	scoreDiscoverIntentBoost    = 95
 	scoreProjectGetIntentBoost  = 220
 	scoreSearchProjectsBoost    = 90
@@ -81,6 +105,11 @@ const (
 	scoreServiceAccountBoost    = 80
 	scoreServiceAccountScope    = 30
 	scoreScopeIntentBoost       = 80
+	// scorePluralListIntentBoost has to carry a list action past a read of one
+	// item of the same domain that an incidental parameter signal lifts by up
+	// to ten, and then by the high-confidence margin of fifteen, so that a
+	// plural query is answered with confidence rather than by a few points.
+	scorePluralListIntentBoost = 30
 )
 
 type verbIntent string

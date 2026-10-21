@@ -324,20 +324,68 @@ func TestSearch_ExactCanonicalIDBeatsBroadText(t *testing.T) {
 }
 
 // TestSearch_CurrentHighConfidenceQueriesRemainStable pins the top result of
-// twelve queries against the real catalog that a scoring change must not
-// move: the ones a model sends most, each with the action it has to reach.
+// the queries against the real catalog that a scoring change must not move:
+// the ones a model sends most, each with the action it has to reach.
+//
+// The list queries are pinned in the plural and in the singular, and in both
+// word orders, because a model writes them every way and the plural is the
+// one that used to break: "list issues" answered project.list and "list
+// branches" pipeline.list, since nothing matched a plural to the singular the
+// catalog spells (issue 1121). Those cases also require the top result to be
+// high confidence, a margin over the next result and not only first place,
+// so that a ranking decided by the tie-break fails here. "list branch" is the
+// one that was: branch.list and pipeline.list scored alike and the action ID
+// broke the tie. The release queries are pinned the same way because the
+// boost release.list used to have to itself was retired for the plural rule.
+//
+// More shapes are pinned because the first form of the plural rule broke
+// them: a read of the plural of merge request, whose first word is also a
+// verb ("show merge requests" answered merge_request.get), a plural that an
+// action's own name spells ("list ssh keys" answered the deploy key lists), a
+// plural of a word an intent reads ("list service accounts" tied the group
+// and project lists), a plural whose singular a compound tag of a write
+// spells ("protected branches" answered branch.protect), and a plural
+// downloaded, whose singular names the action for one artifact ("download job
+// artifacts" answered job.download_single_artifact). The last keeps its first
+// place without a confidence requirement: the download verb's own synonyms,
+// single and artifact, spell the compound tag single artifact that
+// job.download_single_artifact carries, the singular of artifacts reaches its
+// name as well, and job.download_artifacts downloads the same archive by ref,
+// so the three stay within a few points, as the first two did on the parent
+// by exactly the margin. "artifacts" alone is pinned with confidence, since a
+// plural with no verb must not lift job.delete_artifacts, which it names as
+// well.
 func TestSearch_CurrentHighConfidenceQueriesRemainStable(t *testing.T) {
 	registry := realCatalogRegistry(t)
 
-	tests := []struct {
-		name         string
-		query        string
-		limit        int
-		wantTop      string
-		wantContains string
-	}{
+	tests := []pinnedQuery{
 		{name: "merge request list", query: "merge request list open author project", wantTop: "merge_request.list"},
-		{name: "open issues", query: "list open issues", limit: 10},
+		{name: "open issues", query: "list open issues", limit: 10, wantTop: "issue.list", wantConfident: true},
+		{name: "plural issues", query: "list issues", wantTop: "issue.list", wantConfident: true},
+		{name: "plural issues noun first", query: "issues list", wantTop: "issue.list", wantConfident: true},
+		{name: "plural issues shown", query: "show issues", wantTop: "issue.list", wantConfident: true},
+		{name: "plural branches", query: "list branches", wantTop: "branch.list", wantConfident: true},
+		{name: "plural branches noun first", query: "branches list", wantTop: "branch.list", wantConfident: true},
+		{name: "plural pipelines", query: "list pipelines", wantTop: "pipeline.list", wantConfident: true},
+		{name: "plural pipelines noun first", query: "pipelines list", wantTop: "pipeline.list", wantConfident: true},
+		{name: "plural merge requests", query: "list merge requests", wantTop: "merge_request.list", wantConfident: true},
+		{name: "plural merge requests noun first", query: "merge requests list", wantTop: "merge_request.list", wantConfident: true},
+		{name: "plural merge requests shown", query: "show merge requests", wantTop: "merge_request.list", wantConfident: true},
+		{name: "plural merged merge requests shown", query: "show merged merge requests", wantTop: "merge_request.list", wantConfident: true},
+		{name: "plural mrs shown", query: "show mrs", wantTop: "merge_request.list", wantConfident: true},
+		{name: "plural named by an action", query: "list ssh keys", wantTop: "user.ssh_keys", wantConfident: true},
+		{name: "plural of a word an intent reads", query: "list service accounts", wantTop: "user.list_service_accounts", wantConfident: true},
+		{name: "plural a compound tag spells in the singular", query: "protected branches", wantTop: "branch.list_protected", wantConfident: true},
+		{name: "plural named by an action with no verb", query: "artifacts", wantTop: "job.artifacts", wantConfident: true},
+		{name: "plural archive downloaded", query: "download job artifacts", wantTop: "job.artifacts"},
+		{name: "singular issue", query: "list issue", wantTop: "issue.list", wantConfident: true},
+		{name: "singular issue noun first", query: "issue list", wantTop: "issue.list", wantConfident: true},
+		{name: "singular branch", query: "list branch", wantTop: "branch.list", wantConfident: true},
+		{name: "singular branch noun first", query: "branch list", wantTop: "branch.list", wantConfident: true},
+		{name: "singular pipeline", query: "list pipeline", wantTop: "pipeline.list", wantConfident: true},
+		{name: "singular pipeline noun first", query: "pipeline list", wantTop: "pipeline.list", wantConfident: true},
+		{name: "plural releases", query: "list releases", wantTop: "release.list", wantConfident: true},
+		{name: "singular release noun first", query: "release list", wantTop: "release.list", wantConfident: true},
 		{name: "pipeline trigger", query: "pipeline run trigger", wantContains: "pipeline.trigger_create"},
 		{name: "ci variable secret", query: "ci variable secret", wantTop: "ci_variable.create"},
 		{name: "project access token list", query: "project access tokens", wantTop: "access.token_project_list"},
@@ -363,16 +411,37 @@ func TestSearch_CurrentHighConfidenceQueriesRemainStable(t *testing.T) {
 			if result == nil || result.IsError {
 				t.Fatalf("Search() result = %+v, want non-error", result)
 			}
-			if output.Count == 0 {
-				t.Fatalf("Search(%q) returned no matches", tt.query)
-			}
-			if tt.wantTop != "" && output.Results[0].ID != tt.wantTop {
-				t.Fatalf("Search(%q) top result = %+v, want %s", tt.query, output.Results, tt.wantTop)
-			}
-			if tt.wantContains != "" && !slices.ContainsFunc(output.Results, func(result SearchResult) bool { return result.ID == tt.wantContains }) {
-				t.Fatalf("Search(%q) results = %+v, want %s", tt.query, output.Results, tt.wantContains)
-			}
+			assertPinnedQuery(t, tt, output)
 		})
+	}
+}
+
+// pinnedQuery is one query TestSearch_CurrentHighConfidenceQueriesRemainStable
+// pins: the action it has to reach first or among its results, and whether
+// that first result has to be high confidence.
+type pinnedQuery struct {
+	name          string
+	query         string
+	limit         int
+	wantTop       string
+	wantContains  string
+	wantConfident bool
+}
+
+// assertPinnedQuery holds one search's results to what tt pins.
+func assertPinnedQuery(t *testing.T, tt pinnedQuery, output SearchOutput) {
+	t.Helper()
+	if output.Count == 0 {
+		t.Fatalf("Search(%q) returned no matches", tt.query)
+	}
+	if tt.wantTop != "" && output.Results[0].ID != tt.wantTop {
+		t.Fatalf("Search(%q) top result = %+v, want %s", tt.query, output.Results, tt.wantTop)
+	}
+	if tt.wantContains != "" && !slices.ContainsFunc(output.Results, func(result SearchResult) bool { return result.ID == tt.wantContains }) {
+		t.Fatalf("Search(%q) results = %+v, want %s", tt.query, output.Results, tt.wantContains)
+	}
+	if tt.wantConfident && output.Results[0].LowConfidence {
+		t.Fatalf("Search(%q) top result %s is low confidence, want it ahead of the next by the high-confidence margin; results = %+v", tt.query, output.Results[0].ID, output.Results)
 	}
 }
 
@@ -2824,6 +2893,38 @@ func TestExecute_UnknownNounVerbAction_SuggestsTheActionsNamedThatWay(t *testing
 	want := []string{"`group.group_label_create`", "`project.label_create`"}
 	if !slices.Equal(got, want) {
 		t.Errorf("first two suggestions = %v, want %v, in %q", got, want, text)
+	}
+}
+
+// TestExecute_UnknownPluralAction_SuggestsTheActionOfItsSingularFirst verifies
+// that an unknown action whose domain is written in the plural is answered
+// with the action of the singular domain first, against the real catalog.
+//
+// The suggestions are scored term by term like a search, so they read the
+// plural the way search does: issues.list has to reach the issue domain
+// through its singular, or the actions that only mention issues in a
+// parameter or a description compete with the one it names (issue 1121).
+func TestExecute_UnknownPluralAction_SuggestsTheActionOfItsSingularFirst(t *testing.T) {
+	registry := realCatalogRegistry(t)
+
+	for _, tc := range []struct {
+		action string
+		want   string
+	}{
+		{action: "issues.list", want: "`issue.list`"},
+		{action: "branches.list", want: "`branch.list`"},
+		{action: "pipelines.list", want: "`pipeline.list`"},
+	} {
+		t.Run(tc.action, func(t *testing.T) {
+			text := executeText(t, registry, tc.action)
+			_, suggestions, found := strings.Cut(text, "Did you mean ")
+			if !found {
+				t.Fatalf("Execute(%s) error text = %q, want suggestions", tc.action, text)
+			}
+			if first, _, _ := strings.Cut(suggestions, ", "); first != tc.want {
+				t.Errorf("Execute(%s) first suggestion = %s, want %s, in %q", tc.action, first, tc.want, text)
+			}
+		})
 	}
 }
 
@@ -6390,10 +6491,31 @@ func TestRegistry_ActionTagHints(t *testing.T) {
 			"url":         map[string]any{},
 		}}
 		got := actionTags("repository.file_create", "repository", "file_create", schema)
-		for _, want := range []string{"repository file", "branch", "url", "close"} {
+		for _, want := range []string{"repository file", "path", "url", "close"} {
 			t.Run(want, func(t *testing.T) {
 				if !stringInSlice(got, want) {
 					t.Fatalf("actionTags() = %v, want %q", got, want)
+				}
+			})
+		}
+	})
+
+	// A ref parameter used to tag its action with branch, tag and commit, at
+	// the weight of a tag, which is above the weight of the action's own
+	// domain. Every action taking a ref then claimed those three resources as
+	// strongly as their own domains did: "list branch" tied branch.list with
+	// pipeline.list, "list tags" put pipeline.list first and "list commit"
+	// ranked it over repository.commit_list (issue 1121). A ref tags
+	// nothing now: a required one names the point its action starts from
+	// through refResourceMatch, a step below the action's own domain, and an
+	// optional one names nothing at all.
+	t.Run("a ref parameter names no resource", func(t *testing.T) {
+		schema := map[string]any{"properties": map[string]any{"ref": map[string]any{}}}
+		got := actionTags("pipeline.list", "pipeline", "list", schema)
+		for _, resource := range []string{"branch", "tag", "commit"} {
+			t.Run(resource, func(t *testing.T) {
+				if stringInSlice(got, resource) {
+					t.Errorf("actionTags(pipeline.list with ref) = %v, want no %q", got, resource)
 				}
 			})
 		}
@@ -6407,6 +6529,123 @@ func TestRegistry_ActionTagHints(t *testing.T) {
 		memberRole := actionTags("member_role.create", "member_role", "create", nil)
 		if !stringInSlice(memberRole, "member role") {
 			t.Fatalf("actionTags(member role) = %v, want member role", memberRole)
+		}
+	})
+}
+
+// TestMarkRefResources_MarksABranchTagOrCommitOfAQueryThatSaysWhatToDo
+// verifies which terms name the point an action with a required ref starts
+// from: a branch, a tag or a commit, in a query with a verb of any intent, and
+// nothing in a query with no verb, which names what it is about rather than
+// where to start. A ref itself and a sha are no resource of the three.
+func TestMarkRefResources_MarksABranchTagOrCommitOfAQueryThatSaysWhatToDo(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		want  []bool
+	}{
+		{name: "a write naming a branch and a commit", query: "create branch from commit", want: []bool{false, true, true}},
+		{name: "a read naming a tag", query: "show file at tag", want: []bool{false, false, true}},
+		{name: "a workflow verb naming a branch", query: "run pipeline on branch", want: []bool{false, false, true}},
+		{name: "a destructive verb naming a branch", query: "delete branch", want: []bool{false, true}},
+		{name: "no verb", query: "pipeline for branch", want: []bool{false, false}},
+		{name: "a ref and a sha", query: "get file at ref sha", want: []bool{false, false, false, false}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			terms := normalizeSearchTerms(tc.query)
+			markRefResources(terms)
+			got := make([]bool, 0, len(terms))
+			for _, term := range terms {
+				got = append(got, term.RefResource)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("markRefResources(%q) marked %v, want %v", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRefResourceMatch_ScoresAWordOfADomainOnARequiredRefOnly verifies what a
+// marked term scores against an action: a word of a domain where the action
+// requires a ref, a step lower when the query writes the word in the plural,
+// and nothing where the ref is optional, where the action has none, or where
+// the term names no ref resource.
+func TestRefResourceMatch_ScoresAWordOfADomainOnARequiredRefOnly(t *testing.T) {
+	required := searchDocument{RequiredParams: []string{"branch", "ref"}}
+	optional := searchDocument{RequiredParams: []string{"project_id"}, OptionalParams: []string{"ref"}}
+	marked := searchTerm{Raw: "commit", Alternatives: []string{"commit"}, RefResource: true}
+	plural := searchTerm{Raw: "commits", Alternatives: []string{"commits"}, Singular: "commit", RefResource: true}
+	unmarked := searchTerm{Raw: "commit", Alternatives: []string{"commit"}}
+
+	cases := []struct {
+		name     string
+		document searchDocument
+		term     searchTerm
+		want     int
+	}{
+		{name: "a required ref", document: required, term: marked, want: scoreRefResource},
+		{name: "a required ref named in the plural", document: required, term: plural, want: scoreRefResourcePlural},
+		{name: "an optional ref", document: optional, term: marked},
+		{name: "no ref", document: searchDocument{}, term: marked},
+		{name: "a term naming no ref resource", document: required, term: unmarked},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := refResourceMatch(tc.document, tc.term); got != tc.want {
+				t.Errorf("refResourceMatch() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSearch_RequiredRef_NamesThePointItsActionStartsFrom pins, against the
+// real catalog, what a required ref claims now that no ref tags its action.
+//
+// "create branch from commit" names branch.create twice, as what it creates
+// and as the point it creates it from, and has to answer it with high
+// confidence. With no claim at all repository.commit_create, which takes the
+// branch to commit to, answered it with confidence instead; with the ref tags
+// pipeline.create and tag.create came within ten points, because a tag
+// scored a commit as high as their own domains. "create tag from commit" is
+// the same shape for tag.create, which release.create tied on the parent, and
+// "create branches from commits" the same shape in the plural, where branches
+// reaches the branch domain only through its singular, so the ref claims of
+// the plurals have to score a step lower as well. A query with no verb names
+// what it is about, so "pipeline for branch" must not make the action that
+// creates a pipeline its answer.
+func TestSearch_RequiredRef_NamesThePointItsActionStartsFrom(t *testing.T) {
+	registry := realCatalogRegistry(t)
+	search := func(t *testing.T, query string) SearchOutput {
+		t.Helper()
+		_, output, err := registry.Search(t.Context(), nil, SearchInput{Query: query, Limit: 5})
+		if err != nil {
+			t.Fatalf("Search(%q) error = %v", query, err)
+		}
+		if output.Count == 0 {
+			t.Fatalf("Search(%q) returned no matches", query)
+		}
+		return output
+	}
+
+	for _, tc := range []struct{ query, wantTop string }{
+		{query: "create branch from commit", wantTop: "branch.create"},
+		{query: "create a branch from a commit", wantTop: "branch.create"},
+		{query: "new branch from commit", wantTop: "branch.create"},
+		{query: "create tag from commit", wantTop: "tag.create"},
+		{query: "create branches from commits", wantTop: "branch.create"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			output := search(t, tc.query)
+			if top := output.Results[0]; top.ID != tc.wantTop || top.LowConfidence {
+				t.Errorf("Search(%q) top = %s (low confidence %v), want %s with high confidence; results = %+v", tc.query, top.ID, top.LowConfidence, tc.wantTop, output.Results)
+			}
+		})
+	}
+	t.Run("a query with no verb", func(t *testing.T) {
+		output := search(t, "pipeline for branch")
+		if top := output.Results[0]; top.ID == "pipeline.create" {
+			t.Errorf("Search(%q) top = pipeline.create, want no action that creates a pipeline first; results = %+v", "pipeline for branch", output.Results)
 		}
 	})
 }
@@ -7493,8 +7732,14 @@ func TestScoreEntryWithExplanation_ScoresExactlyWhatTheSilentScorerScores(t *tes
 	if err != nil {
 		t.Fatalf("build action catalog: %v", err)
 	}
-	entries := NewRegistryFromCatalog(catalog).entries
+	registry := NewRegistryFromCatalog(catalog)
+	entries := registry.entries
 
+	// The five after "protected branch rule for the group" reach the singular
+	// of a plural, the domain a pair of words names, and the list a plural
+	// spells, and the last two the point a required ref starts from, as
+	// written and in the plural, which the two scorers read through separate
+	// code.
 	queries := []string{
 		"list open merge requests",
 		"delete the project",
@@ -7504,11 +7749,18 @@ func TestScoreEntryWithExplanation_ScoresExactlyWhatTheSilentScorerScores(t *tes
 		"who am i current user profile",
 		"retry the failed pipeline job",
 		"protected branch rule for the group",
+		"show merge requests",
+		"group merge requests",
+		"list ssh keys",
+		"deploy keys",
+		"download job artifacts",
+		"create branch from commit",
+		"create branches from commits",
 	}
 	for _, query := range queries {
 		t.Run(query, func(t *testing.T) {
 			t.Parallel()
-			terms := normalizeSearchTerms(query)
+			terms := registry.SearchIndex.searchTerms(query)
 			for _, entry := range entries {
 				silent := scoreEntry(entry, terms)
 				explained, explanation := scoreEntryWithExplanation(entry, terms)
@@ -7590,6 +7842,177 @@ func TestScoreEntryWithExplanation_KeepsTheFirstAlternativeOfATie(t *testing.T) 
 	}
 	if explanation.Reasons[0].Field != searchFieldTag || explanation.Reasons[0].MatchedValue != "mr" {
 		t.Fatalf("first reason = %+v, want the tag matched by the term as typed", explanation.Reasons[0])
+	}
+}
+
+// TestSingularMatch_ScoresTheActionIDOneStepBelowTheSingular verifies where
+// the singular of a plural is matched and what it scores there: the action's
+// own domain or action a step below an exact match, a word of either a step
+// below a word, and nothing anywhere else, a tag included.
+//
+// The empty singular is held against an entry whose domain is empty too, so
+// that a term with no singular cannot match a hand-built entry as its domain.
+func TestSingularMatch_ScoresTheActionIDOneStepBelowTheSingular(t *testing.T) {
+	document := searchDocument{
+		Domain:      "issue",
+		DomainWords: []string{"issue", "board"},
+		Action:      "note",
+		ActionWords: []string{"note", "list"},
+		Tags:        []string{"ticket"},
+	}
+
+	cases := []struct {
+		name      string
+		document  searchDocument
+		singular  string
+		wantScore int
+		wantField string
+	}{
+		{name: "the domain", document: document, singular: "issue", wantScore: scoreSingularExact, wantField: searchFieldDomain},
+		{name: "the action", document: document, singular: "note", wantScore: scoreSingularExact, wantField: searchFieldAction},
+		{name: "a word of the action", document: document, singular: "list", wantScore: scoreSingularWord, wantField: searchFieldAction},
+		{name: "a word of the domain", document: document, singular: "board", wantScore: scoreSingularWord, wantField: searchFieldDomain},
+		{name: "a tag", document: document, singular: "ticket"},
+		{name: "no singular", document: searchDocument{}, singular: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			score, field := singularMatch(tc.document, tc.singular)
+			if score != tc.wantScore || field != tc.wantField {
+				t.Errorf("singularMatch(%q) = %d, %q, want %d, %q", tc.singular, score, field, tc.wantScore, tc.wantField)
+			}
+		})
+	}
+}
+
+// TestScoreTerm_ReadsTheSingularAndTheDomainAPairNames verifies what one term
+// scores against one action, and the reason given for it, in the two scorers.
+//
+// The singular decides only when it scores more than every spelling of the
+// term, and an alternative that scores as much keeps the reason, since it is
+// what the caller wrote or a synonym of it. A term of a pair written in the
+// plural scores as the domain the pair names on its actions, a step below for
+// the one written in the plural. A verb that starts a domain name scores at
+// most as a word of a domain on every other action, even where it is the
+// action's own name, and on its own domain when the pair is written in the
+// singular; the same word as a verb keeps the action's full weight. A branch,
+// tag or commit scores as the point a required ref starts from, a step lower
+// when the query writes it in the plural, and the action's own domain still
+// scores above that.
+func TestScoreTerm_ReadsTheSingularAndTheDomainAPairNames(t *testing.T) {
+	issueList := scoringEntry("issue.list", "issue", "list")
+	issueTagged := scoringEntry("issue.list", "issue", "list")
+	issueTagged.Document.Tags = []string{"issues"}
+	issueNotes := scoringEntry("issue.note_list", "issue", "note_list")
+	notIssue := scoringEntry("board.list", "board", "list")
+	merge := scoringEntry("merge_request.merge", "merge_request", "merge")
+	otherMerge := scoringEntry("train.merge", "train", "merge")
+	pipelineCreate := scoringEntry("pipeline.create", "pipeline", "create")
+	pipelineCreate.Document.RequiredParams = []string{"ref"}
+	branchCreate := scoringEntry("branch.create", "branch", "create")
+	branchCreate.Document.RequiredParams = []string{"branch", "ref"}
+
+	cases := []struct {
+		name       string
+		entry      actionEntry
+		term       searchTerm
+		wantScore  int
+		wantReason MatchReason
+	}{
+		{
+			name:       "the singular scores where the plural does not",
+			entry:      issueList,
+			term:       searchTerm{Raw: "issues", Alternatives: []string{"issues"}, Singular: "issue"},
+			wantScore:  scoreSingularExact,
+			wantReason: MatchReason{Field: searchFieldDomain, QueryTerm: "issues", Alternative: "issue", MatchedValue: "issue", Score: scoreSingularExact},
+		},
+		{
+			name:       "the plural as written scores above its singular",
+			entry:      issueTagged,
+			term:       searchTerm{Raw: "issues", Alternatives: []string{"issues"}, Singular: "issue"},
+			wantScore:  scoreTagExact,
+			wantReason: MatchReason{Field: searchFieldTag, QueryTerm: "issues", MatchedValue: "issues", Score: scoreTagExact},
+		},
+		{
+			name:       "an alternative that ties the singular keeps the reason",
+			entry:      issueNotes,
+			term:       searchTerm{Raw: "issues", Alternatives: []string{"issues", "note"}, Singular: "issue"},
+			wantScore:  scoreSingularExact,
+			wantReason: MatchReason{Field: searchFieldAction, QueryTerm: "issues", Alternative: "note", MatchedValue: "note", Score: scoreDomainActionWord},
+		},
+		{
+			name:       "the written word of a plural pair on its domain",
+			entry:      merge,
+			term:       searchTerm{Raw: "merge", Alternatives: []string{"merge"}, Noun: true, Domain: "merge_request"},
+			wantScore:  scoreDomainActionExact,
+			wantReason: MatchReason{Field: searchFieldDomain, QueryTerm: "merge", MatchedValue: "merge_request", Score: scoreDomainActionExact},
+		},
+		{
+			name:       "the plural of a plural pair on its domain",
+			entry:      merge,
+			term:       searchTerm{Raw: "requests", Alternatives: []string{"requests"}, Singular: "request", Domain: "merge_request"},
+			wantScore:  scoreSingularExact,
+			wantReason: MatchReason{Field: searchFieldDomain, QueryTerm: "requests", Alternative: "request", MatchedValue: "merge_request", Score: scoreSingularExact},
+		},
+		{
+			name:       "the verb of a singular pair on its domain",
+			entry:      merge,
+			term:       searchTerm{Raw: "merge", Alternatives: []string{"merge"}, Noun: true},
+			wantScore:  scoreDomainActionWord,
+			wantReason: MatchReason{Field: searchFieldAction, QueryTerm: "merge", MatchedValue: "merge", Score: scoreDomainActionWord},
+		},
+		{
+			name:       "the verb of a plural pair on another domain",
+			entry:      otherMerge,
+			term:       searchTerm{Raw: "merge", Alternatives: []string{"merge"}, Noun: true, Domain: "merge_request"},
+			wantScore:  scoreDomainActionWord,
+			wantReason: MatchReason{Field: searchFieldAction, QueryTerm: "merge", MatchedValue: "merge", Score: scoreDomainActionWord},
+		},
+		{
+			name:       "the same word when it is a verb",
+			entry:      otherMerge,
+			term:       searchTerm{Raw: "merge", Alternatives: []string{"merge"}},
+			wantScore:  scoreDomainActionExact,
+			wantReason: MatchReason{Field: searchFieldAction, QueryTerm: "merge", MatchedValue: "merge", Score: scoreDomainActionExact},
+		},
+		{
+			name:      "a verb of a pair that matches nothing elsewhere",
+			entry:     notIssue,
+			term:      searchTerm{Raw: "merge", Alternatives: []string{"merge"}, Noun: true, Domain: "merge_request"},
+			wantScore: 0,
+		},
+		{
+			name:       "a ref resource on an action that requires a ref",
+			entry:      pipelineCreate,
+			term:       searchTerm{Raw: "commit", Alternatives: []string{"commit"}, RefResource: true},
+			wantScore:  scoreRefResource,
+			wantReason: MatchReason{Field: searchFieldRefResource, QueryTerm: "commit", MatchedValue: "ref", Score: scoreRefResource},
+		},
+		{
+			name:       "a ref resource in the plural, a step lower",
+			entry:      pipelineCreate,
+			term:       searchTerm{Raw: "commits", Alternatives: []string{"commits"}, Singular: "commit", RefResource: true},
+			wantScore:  scoreRefResourcePlural,
+			wantReason: MatchReason{Field: searchFieldRefResource, QueryTerm: "commits", MatchedValue: "ref", Score: scoreRefResourcePlural},
+		},
+		{
+			name:       "the action's own domain above the ref it requires",
+			entry:      branchCreate,
+			term:       searchTerm{Raw: "branch", Alternatives: []string{"branch"}, RefResource: true},
+			wantScore:  scoreDomainActionExact,
+			wantReason: MatchReason{Field: searchFieldDomain, QueryTerm: "branch", MatchedValue: "branch", Score: scoreDomainActionExact},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scoreTermValue(tc.entry, tc.term); got != tc.wantScore {
+				t.Errorf("scoreTermValue() = %d, want %d", got, tc.wantScore)
+			}
+			score, reason := scoreTermWithReason(tc.entry, tc.term)
+			if score != tc.wantScore || reason != tc.wantReason {
+				t.Errorf("scoreTermWithReason() = %d, %+v, want %d, %+v", score, reason, tc.wantScore, tc.wantReason)
+			}
+		})
 	}
 }
 
@@ -7925,8 +8348,8 @@ func TestScoreIntentFunctions_ReturnFalseForNonMatchingEntries(t *testing.T) {
 	if v := scoreCompareRefsIntentValue(unrelated, terms); v != 0 {
 		t.Fatalf("scoreCompareRefsIntentValue(unrelated) = %d, want 0", v)
 	}
-	if v := scoreReleaseListIntentValue(unrelated, terms); v != 0 {
-		t.Fatalf("scoreReleaseListIntentValue(unrelated) = %d, want 0", v)
+	if v := scorePluralListIntentValue(unrelated, terms); v != 0 {
+		t.Fatalf("scorePluralListIntentValue(unrelated) = %d, want 0", v)
 	}
 	if v := scoreProjectGetIntentValue(unrelated, terms); v != 0 {
 		t.Fatalf("scoreProjectGetIntentValue(unrelated) = %d, want 0", v)
@@ -7942,8 +8365,8 @@ func TestScoreIntentFunctions_ReturnFalseForNonMatchingEntries(t *testing.T) {
 	if score, reason := scoreCompareRefsIntent(unrelated, terms); score != 0 || reason != (MatchReason{}) {
 		t.Fatalf("scoreCompareRefsIntent(unrelated) = %d, %v, want 0, empty", score, reason)
 	}
-	if score, reason := scoreReleaseListIntent(unrelated, terms); score != 0 || reason != (MatchReason{}) {
-		t.Fatalf("scoreReleaseListIntent(unrelated) = %d, %v, want 0, empty", score, reason)
+	if score, reason := scorePluralListIntent(unrelated, terms); score != 0 || reason != (MatchReason{}) {
+		t.Fatalf("scorePluralListIntent(unrelated) = %d, %v, want 0, empty", score, reason)
 	}
 	if score, reason := scoreProjectGetIntent(unrelated, terms); score != 0 || reason != (MatchReason{}) {
 		t.Fatalf("scoreProjectGetIntent(unrelated) = %d, %v, want 0, empty", score, reason)
@@ -7981,8 +8404,8 @@ func TestScoreVerbIntentFor_AdjustsByWhatTheQueryAskedAndWhatTheActionDoes(t *te
 	}{
 		{name: "a query with no verb at all", entry: scoringEntry("project.get", "project", "get")},
 		{name: "a read intent on a read action", entry: scoringEntry("project.get", "project", "get"), intent: verbIntentRead, want: scoreVerbIntentBoost},
-		{name: "a read intent on a writing action", entry: scoringEntry("project.create", "project", "create"), intent: verbIntentRead, want: scoreVerbIntentPenalty / 2},
-		{name: "a read intent on a destructive action", entry: destructive, intent: verbIntentRead, want: scoreVerbIntentPenalty},
+		{name: "a read intent on a writing action", entry: scoringEntry("project.create", "project", "create"), intent: verbIntentRead, want: -scoreVerbIntentPenalty / 2},
+		{name: "a read intent on a destructive action", entry: destructive, intent: verbIntentRead, want: -scoreVerbIntentPenalty},
 		{name: "a write intent on a writing action", entry: scoringEntry("project.create", "project", "create"), intent: verbIntentWrite, want: scoreVerbIntentBoost},
 		{name: "a write intent on a read action", entry: scoringEntry("project.get", "project", "get"), intent: verbIntentWrite},
 		{name: "a workflow intent on a workflow action", entry: scoringEntry("pipeline.retry", "pipeline", "retry"), intent: verbIntentWorkflow, want: scoreVerbIntentBoost},
@@ -8037,7 +8460,7 @@ func TestScoreDestructiveVerbAdjustment_SeparatesTheNamedVerbsFromTheRest(t *tes
 		{name: "an action that destroys nothing", entry: scoringEntry("project.get", "project", "get"), terms: searchTermsFromWords("delete", "project")},
 		{name: "a destructive name the catalog did not mark", entry: scoringEntry("project.delete", "project", "delete"), terms: searchTermsFromWords("delete", "project"), want: scoreVerbIntentBoost * 3},
 		{name: "a marked action under a name that says nothing", entry: markedButNotNamed, terms: searchTermsFromWords("purge", "project"), want: scoreVerbIntentBoost},
-		{name: "a query naming no resource at all", entry: scoringEntry("project.delete", "project", "delete"), terms: searchTermsFromWords("zzzzzzzz"), want: scoreVerbIntentPenalty},
+		{name: "a query naming no resource at all", entry: scoringEntry("project.delete", "project", "delete"), terms: searchTermsFromWords("zzzzzzzz"), want: -scoreVerbIntentPenalty},
 		{name: "remove", entry: scoringEntry("runner.remove", "runner", "remove"), terms: searchTermsFromWords("remove", "runner"), want: scoreVerbIntentBoost * 3},
 		{name: "revoke", entry: scoringEntry("token.revoke", "token", "revoke"), terms: searchTermsFromWords("revoke", "token"), want: scoreVerbIntentBoost * 3},
 		{name: "destroy, which is destructive but is not one of the three", entry: scoringEntry("widget.destroy", "widget", "destroy"), terms: searchTermsFromWords("destroy", "widget"), want: scoreVerbIntentBoost},
@@ -8199,25 +8622,46 @@ func TestCompactParamList_EdgeCases(t *testing.T) {
 	}
 }
 
-// BenchmarkFind_PathologicalQuery measures the worst query a caller can now
-// send: words that match nothing, so the lexical pass returns nothing, the
-// fuzzy pass runs over the whole catalog, and the segmented pass runs one more
-// pass per window.
+// BenchmarkFind_PathologicalQuery measures the worst queries a caller can now
+// send, in two shapes. Words that match nothing: the lexical pass returns
+// nothing, the fuzzy pass runs over the whole catalog, and the segmented pass
+// runs one more pass per window. And plurals of words the catalog spells,
+// which cost more memory from a handful of words on and the most of all at
+// the length bound: each reaches a domain or an action through its singular,
+// so every pass is handed a large candidate set, and a plural is shorter than
+// a nonsense word, so more of them fit. Two of them cost less than two
+// nonsense words, which leave the fuzzy pass the whole catalog to edit
+// against.
 //
 // It exists because that cost was unbounded. A query was accepted at whatever
 // length a 4 MiB request body allows, which is hundreds of thousands of words,
 // and the cost grows with the word count times the size of the catalog. The
-// case at [MaxSearchQueryLength] is the ceiling a caller can now reach, and it
-// is here so a change to the scorer cannot quietly raise it: the shorter cases
-// beside it are the shape of the growth.
+// cases at [MaxSearchQueryLength] are the ceiling a caller can now reach, and
+// they are here so a change to the scorer cannot quietly raise it: the shorter
+// cases beside them are the shape of the growth. The plurals were added with
+// the rule that matches a plural to its singular (issue 1121), when they
+// became the costlier shape; a benchmark of the nonsense words alone would
+// have reported a ceiling the tool no longer has.
 func BenchmarkFind_PathologicalQuery(b *testing.B) {
 	registry := benchmarkRegistry(b)
 	ctx := context.Background()
 
 	// Nonsense words of a realistic length, none of which is a catalog token,
-	// so nothing prunes the candidate set at any stage.
-	word := func(i int) string { return fmt.Sprintf("zqx%04dvfh", i) }
-	queryOf := func(words int) string {
+	// so nothing prunes the candidate set at any stage. Each ends in "ies",
+	// so the plural rule tries all three singulars of every word before it
+	// finds none in the catalog: a word that did not end in "s" would leave
+	// that cost out of the ceiling this measures.
+	nonsense := func(i int) string { return fmt.Sprintf("zqx%04dies", i) }
+	// Plurals whose singular is a domain or action word of the Free catalog,
+	// distinct so no window of the segmented pass repeats another.
+	plurals := []string{
+		"issues", "branches", "pipelines", "requests", "projects", "groups", "labels", "milestones",
+		"jobs", "releases", "tags", "tokens", "users", "members", "commits", "notes",
+		"discussions", "runners", "packages", "variables", "environments", "deployments", "snippets", "wikis",
+		"entities", "repositories", "retries", "keys", "hooks", "badges", "boards", "approvals",
+	}
+	plural := func(i int) string { return plurals[i%len(plurals)] }
+	queryOf := func(word func(int) string, words int) string {
 		parts := make([]string, 0, words)
 		for i := range words {
 			parts = append(parts, word(i))
@@ -8227,7 +8671,7 @@ func BenchmarkFind_PathologicalQuery(b *testing.B) {
 	// The longest query the tool accepts, built by filling to the character
 	// bound rather than by counting words, since that bound is what a caller
 	// is held to.
-	atLimit := func() string {
+	atLimit := func(word func(int) string) string {
 		query := ""
 		for i := 0; ; i++ {
 			next := query
@@ -8246,9 +8690,12 @@ func BenchmarkFind_PathologicalQuery(b *testing.B) {
 		name  string
 		query string
 	}{
-		{name: "two_words", query: queryOf(2)},
-		{name: "eight_words", query: queryOf(8)},
-		{name: "at_the_length_limit", query: atLimit()},
+		{name: "two_words", query: queryOf(nonsense, 2)},
+		{name: "eight_words", query: queryOf(nonsense, 8)},
+		{name: "at_the_length_limit", query: atLimit(nonsense)},
+		{name: "two_plurals", query: queryOf(plural, 2)},
+		{name: "eight_plurals", query: queryOf(plural, 8)},
+		{name: "plurals_at_the_length_limit", query: atLimit(plural)},
 	}
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
@@ -9237,21 +9684,27 @@ func TestScoreCompareRefsIntent_PositiveCase(t *testing.T) {
 	}
 }
 
-// TestScoreReleaseListIntent_PositiveCase verifies that "list releases"
-// against release.list earns the release-list boost with a reason naming the
-// intent field and the "list releases" query term.
-func TestScoreReleaseListIntent_PositiveCase(t *testing.T) {
-	entry := scoringEntry("release.list", "release", "list")
+// TestScorePluralListIntent_NamesThePluralAndItsSingular verifies the reason
+// the plural-list boost explains itself with: its own field, the plural the
+// query wrote, the singular it was matched through, and the action it lifted.
+func TestScorePluralListIntent_NamesThePluralAndItsSingular(t *testing.T) {
+	entry := scoringEntry("issue.list", "issue", "list")
+	entry.ReadOnly = true
+	terms := []searchTerm{
+		{Raw: "show", Alternatives: []string{"show"}},
+		{Raw: "issues", Alternatives: []string{"issues"}, Singular: "issue"},
+	}
 
-	score, reason := scoreReleaseListIntent(entry, normalizeSearchTerms("list releases"))
-	if score == 0 || reason == (MatchReason{}) {
-		t.Fatalf("scoreReleaseListIntent() = %d, %+v, want positive score with populated reason", score, reason)
+	score, reason := scorePluralListIntent(entry, terms)
+	want := MatchReason{
+		Field:        searchFieldPluralList,
+		QueryTerm:    "issues",
+		Alternative:  "issue",
+		MatchedValue: "issue.list",
+		Score:        scorePluralListIntentBoost,
 	}
-	if reason.Field != searchFieldReleaseIntent {
-		t.Fatalf("scoreReleaseListIntent() field = %q, want %q", reason.Field, searchFieldReleaseIntent)
-	}
-	if reason.QueryTerm != "list releases" {
-		t.Fatalf("scoreReleaseListIntent() query term = %q, want %q", reason.QueryTerm, "list releases")
+	if score != scorePluralListIntentBoost || reason != want {
+		t.Fatalf("scorePluralListIntent() = %d, %+v, want %d, %+v", score, reason, scorePluralListIntentBoost, want)
 	}
 }
 
@@ -10861,12 +11314,44 @@ func TestScoreCompareRefsIntentValue_GuardsAreIndependent(t *testing.T) {
 	}
 }
 
-// TestScoreReleaseListIntentValue_GuardsAreIndependent verifies the three
-// conditions the release-list boost needs, one at a time. The plural is the
-// word a caller actually types ("list releases"), and it is tested without the
-// singular beside it because the two are separate checks: if only the singular
-// were read, the everyday phrasing would score nothing.
-func TestScoreReleaseListIntentValue_GuardsAreIndependent(t *testing.T) {
+// TestScorePluralListIntentValue_GuardsAreIndependent verifies each condition
+// of the plural-list boost on its own: the verb the query asks with, the
+// plural that names the resource, and the two spellings of an action that
+// lists it.
+//
+// The read and the verbless query are both boosted and a write is not, so the
+// verb guard is held from both sides. A plural is boosted through a list
+// action whose ID holds its singular, and through an action named by the
+// plural itself that is no list by name (runner.jobs), each without the other.
+// A word with no singular is no plural, even when it is the action's own
+// word, so "list" alone lifts nothing.
+//
+// The action has to read: the plural names job.delete_artifacts and
+// merge_request.context_commits_create as plainly as it names job.artifacts,
+// and the same entry is boosted once it is read-only. A verbless query is
+// held word by word: a word of the action's ID, its scope or a word the
+// synonym table reads as a list each lets the boost through, and a word that
+// is none of them, a verb the verb intent does not know, or a word only a
+// synonym of which the ID spells, keeps it out. A verb that names a domain
+// with the next word is no verb, so "merge requests" is verbless.
+func TestScorePluralListIntentValue_GuardsAreIndependent(t *testing.T) {
+	plural := func(raw, singular string) searchTerm {
+		return searchTerm{Raw: raw, Alternatives: []string{raw}, Singular: singular}
+	}
+	word := func(raw string, alternatives ...string) searchTerm {
+		return searchTerm{Raw: raw, Alternatives: append([]string{raw}, alternatives...)}
+	}
+	reader := func(id, domain, action string) actionEntry {
+		entry := scoringEntry(id, domain, action)
+		entry.ReadOnly = true
+		return entry
+	}
+	scoped := func(id, domain, action, scope string) actionEntry {
+		entry := reader(id, domain, action)
+		entry.Document.Scope = scope
+		return entry
+	}
+
 	cases := []struct {
 		name  string
 		entry actionEntry
@@ -10874,35 +11359,132 @@ func TestScoreReleaseListIntentValue_GuardsAreIndependent(t *testing.T) {
 		want  int
 	}{
 		{
-			name:  "singular release",
-			entry: scoringEntry("release.list", "release", "list"),
-			terms: searchTermsFromWords("list", "release"),
-			want:  scoreReleaseListIntentBoost,
+			name:  "a verbless plural of the list action's domain",
+			entry: reader("issue.list", "issue", "list"),
+			terms: []searchTerm{plural("issues", "issue")},
+			want:  scorePluralListIntentBoost,
 		},
 		{
-			name:  "plural releases alone",
-			entry: scoringEntry("release.list", "release", "list"),
-			terms: searchTermsFromWords("list", "releases"),
-			want:  scoreReleaseListIntentBoost,
+			name:  "a read of the plural",
+			entry: reader("issue.list", "issue", "list"),
+			terms: []searchTerm{word("show"), plural("issues", "issue")},
+			want:  scorePluralListIntentBoost,
 		},
 		{
-			name:  "the release domain with another action",
-			entry: scoringEntry("release.get", "release", "get"),
-			terms: searchTermsFromWords("list", "releases"),
+			name:  "a plural of a word of the list action's name",
+			entry: reader("environment.deployment_list", "environment", "deployment_list"),
+			terms: []searchTerm{plural("deployments", "deployment")},
+			want:  scorePluralListIntentBoost,
+		},
+		{
+			name:  "an action named by the plural itself",
+			entry: reader("runner.jobs", "runner", "jobs"),
+			terms: []searchTerm{word("runner"), plural("jobs", "job")},
+			want:  scorePluralListIntentBoost,
+		},
+		{
+			name:  "a write of the plural",
+			entry: reader("issue.list", "issue", "list"),
+			terms: []searchTerm{word("create"), plural("issues", "issue")},
 			want:  0,
 		},
 		{
-			name:  "no list verb",
-			entry: scoringEntry("release.list", "release", "list"),
-			terms: searchTermsFromWords("releases"),
+			name:  "a read of one item",
+			entry: reader("issue.get", "issue", "get"),
+			terms: []searchTerm{word("show"), plural("issues", "issue")},
 			want:  0,
+		},
+		{
+			name:  "a list action of another resource",
+			entry: reader("release.list", "release", "list"),
+			terms: []searchTerm{plural("tags", "tag")},
+			want:  0,
+		},
+		{
+			name:  "a list action of a domain the singular is one word of",
+			entry: reader("merge_request.list", "merge_request", "list"),
+			terms: []searchTerm{word("list"), plural("requests", "request")},
+			want:  0,
+		},
+		{
+			name:  "a list action of another domain than the pair names",
+			entry: reader("project.list", "project", "list"),
+			terms: []searchTerm{
+				word("show"),
+				{Raw: "merge", Alternatives: []string{"merge"}, Noun: true, Domain: "merge_request"},
+				{Raw: "requests", Alternatives: []string{"requests"}, Singular: "request", Domain: "merge_request"},
+			},
+			want: 0,
+		},
+		{
+			name:  "no plural at all",
+			entry: reader("issue.list", "issue", "list"),
+			terms: []searchTerm{word("list"), word("issue")},
+			want:  0,
+		},
+		{
+			name:  "an action the plural names that deletes",
+			entry: scoringEntry("job.delete_artifacts", "job", "delete_artifacts"),
+			terms: []searchTerm{plural("artifacts", "artifact")},
+			want:  0,
+		},
+		{
+			name:  "the same action when it reads",
+			entry: reader("job.delete_artifacts", "job", "delete_artifacts"),
+			terms: []searchTerm{plural("artifacts", "artifact")},
+			want:  scorePluralListIntentBoost,
+		},
+		{
+			name:  "an action the plural names that writes",
+			entry: scoringEntry("merge_request.context_commits_create", "merge_request", "context_commits_create"),
+			terms: []searchTerm{plural("commits", "commit")},
+			want:  0,
+		},
+		{
+			name:  "a verbless word of the action's ID",
+			entry: reader("user.ssh_keys", "user", "ssh_keys"),
+			terms: []searchTerm{word("ssh"), plural("keys", "key")},
+			want:  scorePluralListIntentBoost,
+		},
+		{
+			name:  "a verbless word of the action's scope",
+			entry: scoped("issue.list", "issue", "list", "project"),
+			terms: []searchTerm{word("project"), plural("issues", "issue")},
+			want:  scorePluralListIntentBoost,
+		},
+		{
+			name:  "a verbless filter of a list",
+			entry: reader("issue.list", "issue", "list"),
+			terms: []searchTerm{word("open", "active", "list"), plural("issues", "issue")},
+			want:  scorePluralListIntentBoost,
+		},
+		{
+			name:  "a verb the verb intent does not know",
+			entry: reader("issue.list", "issue", "list"),
+			terms: []searchTerm{word("assign"), plural("issues", "issue")},
+			want:  0,
+		},
+		{
+			name:  "a verb only a synonym of which the ID spells",
+			entry: reader("merge_request.issues_closed", "merge_request", "issues_closed"),
+			terms: []searchTerm{word("close", "update", "closed"), plural("issues", "issue")},
+			want:  0,
+		},
+		{
+			name:  "a verb that names a domain with the next word",
+			entry: reader("merge_request.list", "merge_request", "list"),
+			terms: []searchTerm{
+				{Raw: "merge", Alternatives: []string{"merge"}, Noun: true, Domain: "merge_request"},
+				{Raw: "requests", Alternatives: []string{"requests"}, Singular: "request", Domain: "merge_request"},
+			},
+			want: scorePluralListIntentBoost,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := scoreReleaseListIntentValue(tc.entry, tc.terms); got != tc.want {
-				t.Fatalf("scoreReleaseListIntentValue() = %d, want %d", got, tc.want)
+			if got := scorePluralListIntentValue(tc.entry, tc.terms); got != tc.want {
+				t.Fatalf("scorePluralListIntentValue() = %d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -11076,7 +11658,7 @@ func TestScoreActionSpecificity_PenalizesOnlyUnmatchedMultiWordActions(t *testin
 
 	t.Run("two of three action words unmatched", func(t *testing.T) {
 		terms := searchTermsFromWords("list")
-		want := 2 * scoreUnmatchedActionWord
+		want := -2 * scoreUnmatchedActionWordPenalty
 		if got := scoreActionSpecificityValue(multiWord, terms); got != want {
 			t.Fatalf("scoreActionSpecificityValue() = %d, want %d", got, want)
 		}
@@ -11091,8 +11673,8 @@ func TestScoreActionSpecificity_PenalizesOnlyUnmatchedMultiWordActions(t *testin
 
 	t.Run("one of three action words unmatched", func(t *testing.T) {
 		terms := searchTermsFromWords("service", "account")
-		if got := scoreActionSpecificityValue(multiWord, terms); got != scoreUnmatchedActionWord {
-			t.Fatalf("scoreActionSpecificityValue() = %d, want %d", got, scoreUnmatchedActionWord)
+		if got := scoreActionSpecificityValue(multiWord, terms); got != -scoreUnmatchedActionWordPenalty {
+			t.Fatalf("scoreActionSpecificityValue() = %d, want %d", got, -scoreUnmatchedActionWordPenalty)
 		}
 	})
 
@@ -11117,6 +11699,45 @@ func TestScoreActionSpecificity_PenalizesOnlyUnmatchedMultiWordActions(t *testin
 			t.Fatalf("scoreActionSpecificity() = %d, %+v; want zero result", score, reason)
 		}
 	})
+}
+
+// TestScoreActionSpecificity_ReadsTheSingularAndTheListAPluralAsksFor
+// verifies the two words a plural spells in an action name without writing
+// them, in both scorers.
+//
+// The singular of a plural is no alternative of its term, and it spells the
+// word of the action name all the same: "service accounts" names two of the
+// three words of service_account_list, as "service account" does. A plural
+// that asks for the list of what it names spells the word list as well, and
+// only for an action it asks that of: the same terms leave list unmatched on
+// an action that does not read.
+func TestScoreActionSpecificity_ReadsTheSingularAndTheListAPluralAsksFor(t *testing.T) {
+	terms := []searchTerm{
+		{Raw: "service", Alternatives: []string{"service"}},
+		{Raw: "accounts", Alternatives: []string{"accounts"}, Singular: "account"},
+	}
+	writer := scoringEntry("group.service_account_list", "group", "service_account_list")
+	reader := writer
+	reader.ReadOnly = true
+
+	cases := []struct {
+		name  string
+		entry actionEntry
+		want  int
+	}{
+		{name: "a plural spells the word of its singular", entry: writer, want: -scoreUnmatchedActionWordPenalty},
+		{name: "a plural that asks for the list spells list", entry: reader, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scoreActionSpecificityValue(tc.entry, terms); got != tc.want {
+				t.Errorf("scoreActionSpecificityValue() = %d, want %d", got, tc.want)
+			}
+			if score, _ := scoreActionSpecificity(tc.entry, terms); score != tc.want {
+				t.Errorf("scoreActionSpecificity() = %d, want %d", score, tc.want)
+			}
+		})
+	}
 }
 
 // TestClassifyVerbIntent_EveryVerbItRecognizes pins the class of each verb the
@@ -11174,6 +11795,9 @@ func TestQueryVerbIntent_HighestPrecedenceWins(t *testing.T) {
 		{name: "write outranks read", terms: searchTermsFromWords("get", "create"), want: verbIntentWrite},
 		{name: "no verb at all", terms: searchTermsFromWords("pipeline", "project"), want: ""},
 		{name: "no terms", terms: nil, want: ""},
+		{name: "a verb that starts a domain name is no verb", terms: []searchTerm{{Raw: "merge", Noun: true}, {Raw: "requests"}}, want: ""},
+		{name: "a read of a domain a verb starts", terms: []searchTerm{{Raw: "show"}, {Raw: "merge", Noun: true}, {Raw: "requests"}}, want: verbIntentRead},
+		{name: "the same verb on its own", terms: []searchTerm{{Raw: "show"}, {Raw: "merge"}}, want: verbIntentWorkflow},
 	}
 
 	for _, tc := range cases {
