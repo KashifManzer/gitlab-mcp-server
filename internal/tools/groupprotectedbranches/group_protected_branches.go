@@ -10,7 +10,13 @@ import (
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
 )
 
-// AccessLevelOutput represents an access description for a group protected branch.
+// AccessLevelOutput represents an access description for a group protected
+// branch. GitLab sends member_role_id and member_role_name on an entry that
+// grants a custom role, which needs an Ultimate license
+// (ee/lib/ee/api/entities/protected_ref_access.rb). client-go does not model
+// the name, so it is read off the captured response
+// (toolutil.GroupProtectedBranchExtra); the gap is recorded in
+// docs/development/upstream-bugs.md.
 type AccessLevelOutput struct {
 	ID                     int64  `json:"id"`
 	AccessLevel            int    `json:"access_level"`
@@ -18,6 +24,8 @@ type AccessLevelOutput struct {
 	DeployKeyID            int64  `json:"deploy_key_id,omitempty"`
 	UserID                 int64  `json:"user_id,omitempty"`
 	GroupID                int64  `json:"group_id,omitempty"`
+	MemberRoleID           int64  `json:"member_role_id,omitempty" tier:"ultimate"`
+	MemberRoleName         string `json:"member_role_name,omitempty" tier:"ultimate"`
 }
 
 // Output represents a single group-level protected branch.
@@ -39,7 +47,9 @@ type ListOutput struct {
 	Pagination toolutil.PaginationOutput `json:"pagination"`
 }
 
-func toAccessLevels(src []*gl.GroupBranchAccessDescription) []AccessLevelOutput {
+// toAccessLevels converts one access level array, with the custom role name of
+// each entry taken from the captured extra at the same index.
+func toAccessLevels(src []*gl.GroupBranchAccessDescription, extras []toolutil.ProtectedRefAccessExtra) []AccessLevelOutput {
 	out := make([]AccessLevelOutput, len(src))
 	for i, a := range src {
 		out[i] = AccessLevelOutput{
@@ -49,31 +59,38 @@ func toAccessLevels(src []*gl.GroupBranchAccessDescription) []AccessLevelOutput 
 			DeployKeyID:            a.DeployKeyID,
 			UserID:                 a.UserID,
 			GroupID:                a.GroupID,
+			MemberRoleID:           a.MemberRoleID,
+			MemberRoleName:         toolutil.MemberRoleNameAt(extras, i),
 		}
 	}
 	return out
 }
 
-func toOutput(b *gl.GroupProtectedBranch) Output {
+// toOutput converts a group protected branch, taking the custom role names of
+// its access levels from what the capture read beside the SDK's decode.
+func toOutput(b *gl.GroupProtectedBranch, extra toolutil.GroupProtectedBranchExtra) Output {
 	return Output{
 		ID:                        b.ID,
 		Name:                      b.Name,
-		PushAccessLevels:          toAccessLevels(b.PushAccessLevels),
-		MergeAccessLevels:         toAccessLevels(b.MergeAccessLevels),
-		UnprotectAccessLevels:     toAccessLevels(b.UnprotectAccessLevels),
+		PushAccessLevels:          toAccessLevels(b.PushAccessLevels, extra.PushAccessLevels),
+		MergeAccessLevels:         toAccessLevels(b.MergeAccessLevels, extra.MergeAccessLevels),
+		UnprotectAccessLevels:     toAccessLevels(b.UnprotectAccessLevels, extra.UnprotectAccessLevels),
 		AllowForcePush:            b.AllowForcePush,
 		CodeOwnerApprovalRequired: b.CodeOwnerApprovalRequired,
 	}
 }
 
-// BranchPermissionInput represents a permission entry for protect/update operations.
+// BranchPermissionInput represents a permission entry for protect/update
+// operations. A custom member role needs an Ultimate license
+// (doc/api/group_protected_branches.md).
 type BranchPermissionInput struct {
-	ID          *int64 `json:"id,omitempty"           jsonschema:"Existing permission ID to update"`
-	UserID      *int64 `json:"user_id,omitempty"      jsonschema:"User ID"`
-	GroupID     *int64 `json:"group_id,omitempty"     jsonschema:"Group ID"`
-	DeployKeyID *int64 `json:"deploy_key_id,omitempty" jsonschema:"Deploy key ID"`
-	AccessLevel *int   `json:"access_level,omitempty" jsonschema:"Access level (0=No access, 30=Developer, 40=Maintainer, 60=Admin)"`
-	Destroy     *bool  `json:"_destroy,omitempty"     jsonschema:"Set true to remove this permission"`
+	ID           *int64 `json:"id,omitempty"             jsonschema:"Existing permission ID to update"`
+	UserID       *int64 `json:"user_id,omitempty"        jsonschema:"User ID"`
+	GroupID      *int64 `json:"group_id,omitempty"       jsonschema:"Group ID"`
+	MemberRoleID *int64 `json:"member_role_id,omitempty" jsonschema:"Custom member role ID (Ultimate only)" tier:"ultimate"`
+	DeployKeyID  *int64 `json:"deploy_key_id,omitempty"  jsonschema:"Deploy key ID"`
+	AccessLevel  *int   `json:"access_level,omitempty"   jsonschema:"Access level (0=No access, 30=Developer, 40=Maintainer, 60=Admin)"`
+	Destroy      *bool  `json:"_destroy,omitempty"       jsonschema:"Set true to remove this permission"`
 }
 
 // ListInput defines parameters for the List action which retrieves group-level
@@ -103,9 +120,9 @@ type ProtectInput struct {
 	UnprotectAccessLevel      *int                    `json:"unprotect_access_level,omitempty"    jsonschema:"Unprotect access level (30=Developer, 40=Maintainer, 60=Admin on GitLab Self-Managed). 0 (No access) is not valid here"`
 	AllowForcePush            *bool                   `json:"allow_force_push,omitempty"          jsonschema:"Allow force push"`
 	CodeOwnerApprovalRequired *bool                   `json:"code_owner_approval_required,omitempty" jsonschema:"Require code owner approval"`
-	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Users/groups allowed to push"`
-	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Users/groups allowed to merge"`
-	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Users/groups allowed to unprotect"`
+	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Users, groups or custom roles allowed to push"`
+	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Users, groups or custom roles allowed to merge"`
+	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Users, groups or custom roles allowed to unprotect"`
 }
 
 // UpdateInput defines parameters for the Update action which modifies a group-level protected branch rule.
@@ -115,9 +132,9 @@ type UpdateInput struct {
 	Name                      string                  `json:"name,omitempty"                      jsonschema:"New branch name or wildcard"`
 	AllowForcePush            *bool                   `json:"allow_force_push,omitempty"          jsonschema:"Allow force push"`
 	CodeOwnerApprovalRequired *bool                   `json:"code_owner_approval_required,omitempty" jsonschema:"Require code owner approval"`
-	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Users/groups allowed to push"`
-	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Users/groups allowed to merge"`
-	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Users/groups allowed to unprotect"`
+	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Users, groups or custom roles allowed to push"`
+	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Users, groups or custom roles allowed to merge"`
+	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Users, groups or custom roles allowed to unprotect"`
 }
 
 // UnprotectInput defines parameters for the Unprotect action which removes a group-level protected branch rule.
@@ -133,11 +150,12 @@ func toBranchPermissions(input []BranchPermissionInput) *[]*gl.GroupBranchPermis
 	perms := make([]*gl.GroupBranchPermissionOptions, len(input))
 	for i, p := range input {
 		o := &gl.GroupBranchPermissionOptions{
-			ID:          p.ID,
-			UserID:      p.UserID,
-			GroupID:     p.GroupID,
-			DeployKeyID: p.DeployKeyID,
-			Destroy:     p.Destroy,
+			ID:           p.ID,
+			UserID:       p.UserID,
+			GroupID:      p.GroupID,
+			MemberRoleID: p.MemberRoleID,
+			DeployKeyID:  p.DeployKeyID,
+			Destroy:      p.Destroy,
 		}
 		if p.AccessLevel != nil {
 			v := gl.AccessLevelValue(*p.AccessLevel)
@@ -167,14 +185,19 @@ func List(ctx context.Context, client *gitlabclient.Client, input ListInput) (Li
 	if input.Sort != "" {
 		opts.Sort = input.Sort
 	}
+	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	branches, resp, err := client.GL().GroupProtectedBranches.ListProtectedBranches(string(input.GroupID), opts, gl.WithContext(ctx))
 	if err != nil {
 		return ListOutput{}, toolutil.WrapErrWithStatusHint("listGroupProtectedBranches", err, http.StatusForbidden,
 			"requires Owner role + Premium/Ultimate; verify group_id with group.list; group protected branches cascade to all projects in the group")
 	}
+	extras, err := toolutil.CapturedGroupProtectedBranches(captured, len(branches))
+	if err != nil {
+		return ListOutput{}, toolutil.WrapErr("listGroupProtectedBranches", err)
+	}
 	out := make([]Output, len(branches))
 	for i, b := range branches {
-		out[i] = toOutput(b)
+		out[i] = toOutput(b, extras[i])
 	}
 	return ListOutput{
 		Branches:   out,
@@ -193,12 +216,17 @@ func Get(ctx context.Context, client *gitlabclient.Client, input GetInput) (Outp
 	if input.Branch == "" {
 		return Output{}, toolutil.ErrFieldRequired("branch")
 	}
+	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	b, _, err := client.GL().GroupProtectedBranches.GetProtectedBranch(string(input.GroupID), input.Branch, gl.WithContext(ctx))
 	if err != nil {
 		return Output{}, toolutil.WrapErrWithStatusHint("getGroupProtectedBranch", err, http.StatusNotFound,
 			"verify group_id and name (branch name or wildcard like 'release/*'); name supports wildcards but matching is exact. Use group.protected_branch_list to enumerate")
 	}
-	return toOutput(b), nil
+	extra, err := toolutil.CapturedGroupProtectedBranch(captured)
+	if err != nil {
+		return Output{}, toolutil.WrapErr("getGroupProtectedBranch", err)
+	}
+	return toOutput(b, extra), nil
 }
 
 // Protect creates a new group-level protected branch rule.
@@ -232,12 +260,17 @@ func Protect(ctx context.Context, client *gitlabclient.Client, input ProtectInpu
 		v := gl.AccessLevelValue(*input.UnprotectAccessLevel)
 		opts.UnprotectAccessLevel = &v
 	}
+	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	b, _, err := client.GL().GroupProtectedBranches.ProtectRepositoryBranches(string(input.GroupID), opts, gl.WithContext(ctx))
 	if err != nil {
 		return Output{}, toolutil.WrapErrWithStatusHint("protectGroupBranch", err, http.StatusBadRequest,
 			"requires Owner + Premium/Ultimate; name supports wildcards (e.g. 'release/*'); push_access_level and merge_access_level: 0=No one, 30=Developer, 40=Maintainer, 60=Admin; allow_force_push=false recommended")
 	}
-	return toOutput(b), nil
+	extra, err := toolutil.CapturedGroupProtectedBranch(captured)
+	if err != nil {
+		return Output{}, toolutil.WrapErr("protectGroupBranch", err)
+	}
+	return toOutput(b, extra), nil
 }
 
 // Update modifies a group-level protected branch rule.
@@ -261,12 +294,17 @@ func Update(ctx context.Context, client *gitlabclient.Client, input UpdateInput)
 	if input.Name != "" {
 		opts.Name = new(input.Name)
 	}
+	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	b, _, err := client.GL().GroupProtectedBranches.UpdateProtectedBranch(string(input.GroupID), input.Branch, opts, gl.WithContext(ctx))
 	if err != nil {
 		return Output{}, toolutil.WrapErrWithStatusHint("updateGroupProtectedBranch", err, http.StatusBadRequest,
 			"verify name with group.protected_branch_list; partial updates merge with existing config. Unset fields keep current values; provide _destroy=true to remove access level entries")
 	}
-	return toOutput(b), nil
+	extra, err := toolutil.CapturedGroupProtectedBranch(captured)
+	if err != nil {
+		return Output{}, toolutil.WrapErr("updateGroupProtectedBranch", err)
+	}
+	return toOutput(b, extra), nil
 }
 
 // Unprotect removes a group-level protected branch rule.

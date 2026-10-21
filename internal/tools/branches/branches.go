@@ -66,9 +66,9 @@ type ProtectInput struct {
 	MergeAccessLevel          int                     `json:"merge_access_level,omitempty"        jsonschema:"Access level for merge (0=No access 30=Developer 40=Maintainer 60=Admin on GitLab Self-Managed)"`
 	UnprotectAccessLevel      int                     `json:"unprotect_access_level,omitempty"    jsonschema:"Access level allowed to unprotect (30=Developer 40=Maintainer 60=Admin on GitLab Self-Managed). 0 (No access) is not valid here"`
 	AllowForcePush            *bool                   `json:"allow_force_push,omitempty"          jsonschema:"Allow force push to this branch"`
-	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Fine-grained push access entries (by user, group, deploy key, or access level)"`
-	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Fine-grained merge access entries (by user, group, deploy key, or access level)"`
-	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Fine-grained unprotect access entries (by user, group, deploy key, or access level)"`
+	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Fine-grained push access entries (by user, group, custom role, deploy key, or access level)"`
+	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Fine-grained merge access entries (by user, group, custom role, deploy key, or access level)"`
+	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Fine-grained unprotect access entries (by user, group, custom role, deploy key, or access level)"`
 	CodeOwnerApprovalRequired *bool                   `json:"code_owner_approval_required,omitempty" tier:"premium" jsonschema:"Require CODEOWNERS approval for changes to matching files"`
 }
 
@@ -115,14 +115,15 @@ type ProtectedListOutput struct {
 
 // ProtectedToOutput converts a GitLab API [gl.ProtectedBranch] to the
 // MCP tool output format, surfacing the full push/merge/unprotect access-level
-// arrays, and takes what the capture read beside the decode.
+// arrays, and takes what the capture read beside the decode: whether the rule
+// is inherited and the custom role name of each access level.
 func ProtectedToOutput(b *gl.ProtectedBranch, extra toolutil.ProtectedBranchExtra) ProtectedOutput {
 	return ProtectedOutput{
 		ID:                        b.ID,
 		Name:                      b.Name,
-		PushAccessLevels:          branchAccessDescriptionsToOutput(b.PushAccessLevels),
-		MergeAccessLevels:         branchAccessDescriptionsToOutput(b.MergeAccessLevels),
-		UnprotectAccessLevels:     branchAccessDescriptionsToOutput(b.UnprotectAccessLevels),
+		PushAccessLevels:          branchAccessDescriptionsToOutput(b.PushAccessLevels, extra.PushAccessLevels),
+		MergeAccessLevels:         branchAccessDescriptionsToOutput(b.MergeAccessLevels, extra.MergeAccessLevels),
+		UnprotectAccessLevels:     branchAccessDescriptionsToOutput(b.UnprotectAccessLevels, extra.UnprotectAccessLevels),
 		AllowForcePush:            b.AllowForcePush,
 		CodeOwnerApprovalRequired: b.CodeOwnerApprovalRequired,
 		Inherited:                 extra.Inherited,
@@ -504,9 +505,9 @@ type ProtectedUpdateInput struct {
 	Name                      string                  `json:"name,omitempty"                      jsonschema:"New name or wildcard for the protected branch rule (rename)"`
 	AllowForcePush            *bool                   `json:"allow_force_push,omitempty"          jsonschema:"Allow force push to this branch"`
 	CodeOwnerApprovalRequired *bool                   `json:"code_owner_approval_required,omitempty" tier:"premium" jsonschema:"Require CODEOWNERS approval"`
-	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Fine-grained push access entries (by user, group, deploy key, or access level)"`
-	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Fine-grained merge access entries (by user, group, deploy key, or access level)"`
-	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Fine-grained unprotect access entries (by user, group, deploy key, or access level)"`
+	AllowedToPush             []BranchPermissionInput `json:"allowed_to_push,omitempty"           jsonschema:"Fine-grained push access entries (by user, group, custom role, deploy key, or access level)"`
+	AllowedToMerge            []BranchPermissionInput `json:"allowed_to_merge,omitempty"          jsonschema:"Fine-grained merge access entries (by user, group, custom role, deploy key, or access level)"`
+	AllowedToUnprotect        []BranchPermissionInput `json:"allowed_to_unprotect,omitempty"      jsonschema:"Fine-grained unprotect access entries (by user, group, custom role, deploy key, or access level)"`
 }
 
 // ProtectedUpdate updates settings on an existing protected branch.

@@ -100,6 +100,7 @@ for the fork, branch, fix, test and MR workflow.
   - [UpdateSettingsOptions models twenty-six settings the update route does not take](#updatesettingsoptions-models-twenty-six-settings-the-update-route-does-not-take)
   - [ListTopicsOptions and CreateTopicOptions model no organization_id](#listtopicsoptions-and-createtopicoptions-model-no-organization_id)
   - [ListPipelineTriggerJobsOptions models no include_retried, which the trigger job routes read and do not declare](#listpipelinetriggerjobsoptions-models-no-include_retried-which-the-trigger-job-routes-read-and-do-not-declare)
+  - [BranchAccessDescription and GroupBranchAccessDescription model no member_role_name](#branchaccessdescription-and-groupbranchaccessdescription-model-no-member_role_name)
 - [MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)](#mcp-go-sdk-githubcommodelcontextprotocolgo-sdk)
   - [No keep-alive interval for SSE streams on StreamableHTTPOptions](#no-keep-alive-interval-for-sse-streams-on-streamablehttpoptions)
   - [A malformed message ends the session instead of answering -32700](#a-malformed-message-ends-the-session-instead-of-answering--32700)
@@ -374,7 +375,7 @@ readable without opening the tracker:
 | 125 | client-go | [The issue statistics options type assignee_id as an integer](#the-issue-statistics-options-type-assignee_id-as-an-integer) | No | No | No | No | Yes, the three statistics actions write `None` or `Any` into the query through a request option |
 | 126 | client-go | [Three option structs carry a timestamp parameter as a date](#three-option-structs-carry-a-timestamp-parameter-as-a-date) | No | No | No | No | Yes, `user.add_ssh_key`, `user.add_ssh_key_for_user`, `snippet.list_all` and the two changelog actions leave the field unset and write the instant given through a request option |
 | 127 | gitlab-org/gitlab | [SubmoduleHelper compares submodule URLs as text](#submodulehelper-compares-submodule-urls-as-text) | No | No | No | No; GitLab's pages leave such a submodule unlinked | Yes, `repository.list_submodules` and `repository.read_submodule_file` resolve a sibling namespace and the other spellings of the instance's clone URLs |
-| 128 | client-go | [A nil SearchOptions panics in every search method but one](#a-nil-searchoptions-panics-in-every-search-method-but-one) | Yes, by the merge request | Yes, [gitlab-org/api/client-go!3139](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3139), merged | **Yes, v3.22.1**, in the v3.29.0 pin | No; every search action here passes options | Not needed |
+| 128 | client-go | [A nil SearchOptions panics in every search method but one](#a-nil-searchoptions-panics-in-every-search-method-but-one) | Yes, by the merge request | Yes, [gitlab-org/api/client-go!3139](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3139), merged | **Yes, v3.22.1**, in the v3.30.0 pin | No; every search action here passes options | Not needed |
 | 129 | client-go | [The Link header parser reads rel only from the first parameter](#the-link-header-parser-reads-rel-only-from-the-first-parameter) | Yes, by the merge request | Yes, [gitlab-org/api/client-go!3143](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3143), open | No | No; GitLab writes `rel` as the only parameter, so only a proxy that rewrites the header reaches it | None taken |
 | 130 | client-go | [The wiki search decodes GitLab's blobs into wiki pages](#the-wiki-search-decodes-gitlabs-blobs-into-wiki-pages) | No | No | No | No | Yes, `search.wiki` reads its page from the captured response |
 | 131 | gitlab-org/gitlab | [The REST code search answers an exact-search name match with the path as its snippet](#the-rest-code-search-answers-an-exact-search-name-match-with-the-path-as-its-snippet) | No; the search page's version of it was closed | No | No | No | Yes, the code and wiki search Markdown reads a result whose snippet is its own path as a path match and fences nothing |
@@ -384,6 +385,7 @@ readable without opening the tracker:
 | 135 | client-go | [`UpdateSettingsOptions` models twenty-six settings the update route does not take](#updatesettingsoptions-models-twenty-six-settings-the-update-route-does-not-take) | No | No | No | No | Yes, `admin.settings_update` refuses them by name before anything is sent, as it refuses a key client-go does not model |
 | 136 | client-go | [`ListTopicsOptions` and `CreateTopicOptions` model no `organization_id`](#listtopicsoptions-and-createtopicoptions-model-no-organization_id) | No | No | No | No | None; `admin.topic_list` and `admin.topic_create` act on the organization GitLab resolves for the request |
 | 137 | client-go and gitlab-org/gitlab | [`ListPipelineTriggerJobsOptions` models no `include_retried`, which the trigger job routes read and do not declare](#listpipelinetriggerjobsoptions-models-no-include_retried-which-the-trigger-job-routes-read-and-do-not-declare) | No | No | No | No | Yes, `job.list_bridges` adds `include_retried` to the `trigger_jobs` query through a request option, only when the caller asked |
+| 138 | client-go | [`BranchAccessDescription` and `GroupBranchAccessDescription` model no `member_role_name`](#branchaccessdescription-and-groupbranchaccessdescription-model-no-member_role_name) | No, not yet; it goes out as a small merge request at the pace of the ones that replace row 34's joint one | No, not yet | No | No | Yes, every project and group protected branch read and write, and the `audit_project_full` prompt, read it off the captured response |
 
 States verified against the upstream trackers on 2026-09-12, and rows 8 to 23
 again on 2026-09-13 when the go-sdk batch was filed. Rows 39 to 44 were added
@@ -1386,6 +1388,23 @@ now reads merged in part, for the `Skype` deprecation of
 `gitlab-org/api/client-go!3113`, which its section had recorded without
 counting it, and rows 31 and 37 name the two open merge requests.
 
+Read on 2026-10-21 for the change that moves this server's client-go pin
+from v3.29.0 to v3.30.0, tagged that day, against the module source of both.
+The tag carries five merges, none of them ours and none a row here waits on:
+`member_role_id` on the project and group protected branch access levels and
+permission options, the work items REST service taken off the client (row
+45's section records it), the merge request method comments moved onto the
+interface, and two documentation link fixes. Every struct and option the
+rows that named v3.29.0 as the pin cite is unchanged, on the same lines where
+a row gives them (rows 6, 44, 52, 54, 95, 96, 98, 101, 116, 122, 128, 133,
+135, 136 and 137), so those rows now name v3.30.0 and say what they said, and
+no capture or other workaround of this file retires with the pin.
+`member_role_id` was not a recorded gap: GitLab documents it from 19.2, and
+this server publishes and takes it from v3.30.0. Row 138 is new:
+`member_role_name`, which GitLab sends beside it on an Ultimate instance and
+client-go does not model, read off the captured response from the same
+change.
+
 ## GitLab client (`gitlab.com/gitlab-org/api/client-go`)
 
 ### Panic unmarshalling an issue with no id
@@ -1495,7 +1514,8 @@ is recorded anywhere this entry could cite.
   2026-10-19, and the merge request still has no approval.
 - **Merged**: no. The struct is unchanged at v3.15.0 and at v3.16.0, tagged
   on 2026-10-07 (`feature_flags.go:115-125`), and read on 2026-10-19 at
-  v3.29.0, the version `go.mod` pins, it is unchanged on the same lines.
+  v3.29.0 and on 2026-10-21 at v3.30.0, the version `go.mod` pins, it is
+  unchanged on the same lines.
 - **Blocking**: no.
 - **Workaround**: yes, in two places. `internal/tools/features.Set` builds the
   request body itself, and so does `setFeature` in
@@ -4381,8 +4401,8 @@ want the shapes above rather than the nearest existing struct, and the nested
   ("feat(projects): add merge_train_enforcement to project structs"),
   another contributor's, merged at 23:32 UTC on 2026-10-17 and first in
   **v3.27.0**, which models it as a `MergeTrainEnforcementValue`. For the
-  rest, no: read on 2026-10-19 at v3.29.0, the version `go.mod` pins, no
-  other key this entry names is modeled.
+  rest, no: read on 2026-10-19 at v3.29.0 and on 2026-10-21 at v3.30.0, the
+  version `go.mod` pins, no other key this entry names is modeled.
 - **Blocking**: no. Every key is worked around.
 - **Workaround**: yes, for every key but `merge_train_enforcement`. They are
   read from the captured response beside the SDK's decode (ADR-0021),
@@ -4591,6 +4611,14 @@ entity before surfacing anything.
   is still open. Neither touches the GraphQL documents this entry is about,
   so the workaround reads the same request. @daniyalAD closed the issue at
   17:51 UTC on 2026-10-16 ("MR merged, closing issue"), in milestone 19.6.
+  Read on 2026-10-21, @phil-wong's
+  [gitlab-org/api/client-go!3146](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3146),
+  first in v3.30.0, comments `WorkItemsRESTServiceInterface` and
+  `Client.WorkItemsREST` out and unexports the service while the work on the
+  REST API is on hold, so the client no longer offers it. The GraphQL
+  `WorkItemsService` and its documents are untouched, and this server, which
+  never called the REST service, drops the SDK audit's declaration of it with
+  the move of its pin to v3.30.0.
 - **Merged**: no.
 - **Blocking**: yes, on Community Edition. `issue.work_item_get`,
   `issue.work_item_create` and `issue.work_item_update` cannot answer there:
@@ -4867,9 +4895,9 @@ although a reviewer may prefer both changed for symmetry.
 and cannot control. The consequence came from the e2e scenario's own comment,
 which had recorded the 422 without connecting it to the tag. Verified identical
 in v3.0.0, v3.10.0, v3.12.0 and v3.14.0, on 2026-10-07 in v3.15.0 and
-v3.16.0, tagged that day (`protected_packages.go:86-87`), and on 2026-10-19
-in v3.29.0, the version `go.mod` pins, on the same lines, so a dependency
-bump does not retire it.
+v3.16.0, tagged that day (`protected_packages.go:86-87`), on 2026-10-19 in
+v3.29.0 and on 2026-10-21 in v3.30.0, the version `go.mod` pins, on the same
+lines, so a dependency bump does not retire it.
 
 **Effort**: small, two struct tags and a test, like
 [`SetFeatureFlagOptions`](#setfeatureflagoptions-fields-lack-omitempty).
@@ -4902,9 +4930,10 @@ bump does not retire it.
   `dependency_list_export.go:70`,
   `group_boards.go:216`, `group_members.go:198`, `project_members.go:152`,
   `projects.go:1361`, `issue_links.go:121` and `pipeline_schedules.go:267`.
-  Read on 2026-10-19 at v3.29.0, the version `go.mod` pins, each tag is
-  unchanged and six are on the same line; the `project_members.go` one is at
-  line 167, moved by the documentation comments v3.28.0 added above it.
+  Read on 2026-10-19 at v3.29.0, each tag is unchanged and six are on the
+  same line; the `project_members.go` one is at line 167, moved by the
+  documentation comments v3.28.0 added above it. v3.30.0, the version
+  `go.mod` pins, leaves the seven files unchanged.
 - **Blocking**: no, field by field in the second table below. For five of the
   seven, GitLab reads a null exactly as it reads the key left out, or never
   receives one. `label_id` is latent: a null would be refused beside another
@@ -5802,7 +5831,7 @@ reported as a key GitLab sends that the output did not publish.
 
 **Where**: `ListGroupMilestonesOptions` in client-go's `group_milestones.go`
 declares `IncludeDescendents *bool` with the url tag `include_descendents`,
-unchanged at v3.29.0. `GroupMilestone` in the same file modeled `id`, `iid`,
+unchanged at v3.30.0. `GroupMilestone` in the same file modeled `id`, `iid`,
 `group_id`, `title`, `description`, `start_date`, `due_date`, `state`,
 `updated_at`, `created_at` and `expired` up to v3.25.0, and from v3.26.0
 `web_url` as well, and no `project_id`. The project milestone struct,
@@ -5889,7 +5918,7 @@ the group milestone tests.
   decision; `CreateGroupBoardList` refuses an input without `label_id` before
   it sends anything). This entry replaces issue 1101, closed on 2026-10-07.
 
-**Where**: client-go v3.15.0 to v3.29.0, the version `go.mod` pins, which
+**Where**: client-go v3.15.0 to v3.30.0, the version `go.mod` pins, which
 leave the file unchanged, `group_boards.go:215-217`:
 
 ```go
@@ -5983,7 +6012,7 @@ the body only when set.
   struct of this server's own rather than in `gl.UpdateGroupIssueBoardOptions`.
   That struct retires when a release models them.
 
-**Where**: client-go v3.15.0 to v3.29.0, the version `go.mod` pins, which
+**Where**: client-go v3.15.0 to v3.30.0, the version `go.mod` pins, which
 leave the file unchanged, `group_boards.go:158-164`:
 
 ```go
@@ -6076,7 +6105,7 @@ only when set.
   group board requests and the board readers of `sent_shapes.go` go, and
   every handler reads the SDK's structs alone.
 
-**Where**: client-go v3.15.0 to v3.29.0, the version `go.mod` pins, which
+**Where**: client-go v3.15.0 to v3.30.0, the version `go.mod` pins, which
 leave both files unchanged, `group_boards.go:97-104` and `boards.go:133-142`:
 
 ```go
@@ -6848,7 +6877,7 @@ method leaves out when it is empty, and a routing test.
   unmerged on 2026-10-21, so it goes out in a small merge request on its
   topic.
 - **In review**: no.
-- **Merged**: no. v3.29.0, the version `go.mod` pins, decodes every one of
+- **Merged**: no. v3.30.0, the version `go.mod` pins, decodes every one of
   them as a number, as v3.15.0 did.
 - **Blocking**: no.
 - **Workaround**: yes, for every one of these but a deployable's. Each
@@ -6870,7 +6899,7 @@ method leaves out when it is empty, and a routing test.
   milestone's burndown events need none of this: client-go already decodes
   their weight as a pointer.
 
-**Where**: at v3.15.0 and unchanged at v3.29.0, `DORAMetric.Value`
+**Where**: at v3.15.0 and unchanged at v3.30.0, `DORAMetric.Value`
 (`float64`, `dora_metrics.go`), `Pipeline.Duration` and
 `Pipeline.QueuedDuration` (`int64`, `pipelines.go`), `Job`, `Bridge` and
 `TriggerJob` (added in v3.24.0 for the `trigger_jobs` route, field for field
@@ -7073,8 +7102,8 @@ date-only update sends neither key.
   so it goes out with the option struct commits in a small merge request on
   their topic.
 - **In review**: no.
-- **Merged**: no. v3.18.0 carries the same fields, and so does v3.29.0, the
-  version `go.mod` pins, which adds the eighth struct's field.
+- **Merged**: no. v3.18.0 carries the same fields, and so do v3.29.0, which
+  adds the eighth struct's field, and v3.30.0, the version `go.mod` pins.
 - **Blocking**: no.
 - **Workaround**: yes. Each handler reads the field as a pointer and passes
   `toolutil.EditJSONBody`, the request option that writes into the JSON body
@@ -7239,7 +7268,7 @@ field.
   ("fix(search): accept nil SearchOptions in every search method"), opened
   by this project's maintainer at 05:14 UTC on 2026-10-14.
 - **Merged**: **yes, v3.22.1**. It merged at 21:32 UTC on 2026-10-14, and
-  v3.22.1 is the first tag that carries it. This server pins v3.29.0, which
+  v3.22.1 is the first tag that carries it. This server pins v3.30.0, which
   does.
 - **Blocking**: no. Every search action builds its options through
   `searchOpts` in `internal/tools/search/search.go`, which returns a
@@ -7408,9 +7437,10 @@ test that each reaches the query only when set.
   go out in small merge requests on their topic.
 - **In review**: no.
 - **Merged**: no. Neither v3.15.0 nor v3.25.0, the newest when read on
-  2026-10-17, models any of them, and read on 2026-10-19 neither does
-  v3.29.0, the version this server pins: no struct below gained one of the
-  keys, and no option struct one of the parameters.
+  2026-10-17, models any of them, and neither does v3.29.0, read on
+  2026-10-19, or v3.30.0, the version this server pins, read on 2026-10-21:
+  no struct below gained one of the keys, and no option struct one of the
+  parameters.
 - **Blocking**: no.
 - **Workaround**: partial. The merge request author's `bot` is not published
   yet: every merge request route renders its author through the new
@@ -7566,10 +7596,10 @@ instead. A table test of `rateLimitBackoff` and a client test against an
 - **Reported**: no.
 - **In review**: no.
 - **Merged**: no. All twenty-six are in the struct at v3.15.0 and still are
-  at v3.29.0, the version `go.mod` pins, and each of the 51 settings v3.16.0
-  to v3.29.0 added is one the route declares. Three carry a `Deprecated:`
-  notice at v3.29.0: `housekeeping_bitmaps_enabled` ("Cannot be set through
-  the API, always true"), which v3.15.0 carries already, and
+  at v3.30.0, the version `go.mod` pins, and each of the 51 settings v3.16.0
+  to v3.29.0 added is one the route declares; v3.30.0 adds none. Three carry
+  a `Deprecated:` notice at v3.30.0: `housekeeping_bitmaps_enabled` ("Cannot
+  be set through the API, always true"), which v3.15.0 carries already, and
   `autocomplete_users` and `autocomplete_users_unauthenticated` ("The API
   never accepted ..."), which v3.15.0 does not carry and v3.17.0 does, beside
   the `_limit` settings they point to. The other twenty-three carry none.
@@ -7645,7 +7675,7 @@ major version.
 
 - **Reported**: no.
 - **In review**: no.
-- **Merged**: no. At v3.29.0, the version `go.mod` pins, `ListTopicsOptions`
+- **Merged**: no. At v3.30.0, the version `go.mod` pins, `ListTopicsOptions`
   carries the page, `search` and `without_projects` (added in v3.16.0), and
   `CreateTopicOptions` carries `name`, `title`, `description` and the avatar.
   `Topic` already decodes `organization_id`, one of the gaps of
@@ -7694,7 +7724,7 @@ when set.
 - **Merged**: no. `ListPipelineTriggerJobsOptions`, which v3.24.0 added with
   `ListPipelineTriggerJobs` through another contributor's
   [gitlab-org/api/client-go!3134](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3134),
-  carries the page and `scope` and nothing else at v3.29.0, the version
+  carries the page and `scope` and nothing else at v3.30.0, the version
   `go.mod` pins, while the `ListJobsOptions` the deprecated
   `ListPipelineBridges` takes carries `include_retried`. GitLab 19.5.0
   declares the parameter on neither trigger job route.
@@ -7749,6 +7779,73 @@ with `url` and `json` tags and `omitempty` on
 GitLab, `optional :include_retried, type: Boolean, default: false` on both
 routes, as the pipeline jobs route declares it, which also makes `false`
 mean false, and the parameter in the page's table.
+
+### BranchAccessDescription and GroupBranchAccessDescription model no member_role_name
+
+- **Reported**: no, not yet. It goes out as a small merge request of its
+  own, at the pace of the small merge requests that replace the joint one
+  [entry 34](#response-structs-that-miss-a-field-gitlab-sends-unconditionally)
+  describes.
+- **In review**: no, not yet.
+- **Merged**: no. v3.30.0, the version `go.mod` pins, added `member_role_id`
+  to both structs and to the two permission option structs through another
+  contributor's
+  [gitlab-org/api/client-go!3149](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3149),
+  and not the name GitLab sends beside it.
+- **Blocking**: no.
+- **Workaround**: yes. Every handler that answers with a protected branch
+  rule reads `member_role_name` off the captured response beside the SDK's
+  decode
+  ([ADR-0021](adr/adr-0021-captured-response-for-fields-the-sdk-does-not-model.md)),
+  one `toolutil.ProtectedRefAccessExtra` per access level in GitLab's order:
+  `Protect` (its 409 path included), `ProtectedGet`, `ProtectedList` and
+  `ProtectedUpdate` in `internal/tools/branches`, behind `branch.protect`,
+  `branch.get_protected`, `branch.list_protected` and
+  `branch.update_protected`, through `toolutil.CapturedProtectedBranch` and
+  `CapturedProtectedBranches`; and `List`, `Get`, `Protect` and `Update` in
+  `internal/tools/groupprotectedbranches`, behind
+  `group.protected_branch_list`, `group.protected_branch_get`,
+  `group.protected_branch_protect` and `group.protected_branch_update`,
+  through `toolutil.CapturedGroupProtectedBranch` and
+  `CapturedGroupProtectedBranches`. A name that does not decode as a string
+  fails the call rather than reaching the caller as an empty one
+  (`TestProtectedBranches_UnreadableCapturedMemberRoleName` and
+  `TestGroupProtectedBranches_UnreadableCapturedMemberRoleName`). The
+  `audit_project_full` prompt, the one that renders branch protection, reads
+  it the same way, through `CapturedProtectedBranches` in
+  `handleAuditProjectFull` (`internal/prompts/prompt_audit.go`), names a
+  custom role as the tools do, and reports the section unread when a name
+  does not decode
+  (`TestAuditProjectFull_UnreadableCapturedMemberRoleName_LeavesTheSectionUnread`);
+  `handleAuditBranchProtection` in the same file, which no prompt registers,
+  reads it too. The capture retires when both structs carry the field.
+
+**Where**: `protected_branches.go`, `BranchAccessDescription`, and
+`group_protected_branches.go`, `GroupBranchAccessDescription`, which decode
+each entry of a protected branch's `push_access_levels`,
+`merge_access_levels` and `unprotect_access_levels` on every project and
+group protected branch route that answers with a rule.
+
+**What**: `ee/lib/ee/api/entities/protected_ref_access.rb` exposes
+`member_role_id` and `member_role_name` together, under one condition: the
+access level can carry a member role and custom roles are licensed for its
+namespace, which is Ultimate. `member_role_name` is the name of the custom
+role the level grants, read through the level's `member_role`, and null on a
+level that grants none. `Entities::ProtectedBranch` and `Entities::GroupProtectedBranch`
+both present their three arrays through that entity, and the 19.5.0 live
+record (`docs/development/gitlab-api-live.json`) holds both keys on
+`API::Entities::ProtectedRefAccess` under that condition. client-go v3.30.0
+decodes the id and drops the name, so a caller of the SDK learns which
+custom role a rule grants only by its number.
+
+**How we found it**: moving the pin to v3.30.0, which added `member_role_id`
+to both structs. The entity in the live record exposes the name beside it,
+and R-PATH's sent report had not named it, since it judges a type against
+the entity its routes annotate and not the entity a nested array renders
+with.
+
+**Effort**: small: a `MemberRoleName string` with its `json` tag on both
+structs, and a test that each decodes it.
 
 ## MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)
 
