@@ -26,10 +26,11 @@ var cardFixture = map[string]string{
 // the tree writes it: through a template, a builder write, a print call, a
 // shared header constant and the two cell builders; and beside them the
 // collection rows, author items and metric tables the rule must not read as a
-// card.
+// card, and row-shaped text handed to calls that are not a builder's write.
 const mdcardSource = `package mdcard
 
 import (
+	"bufio"
 	"fmt"
 	"strings"
 
@@ -97,6 +98,15 @@ func FormatThroughCard(item Item) string {
 	t.Row(item.Title, toolutil.EscapeMdTableCell(item.State))
 	c.End()
 	return b.String()
+}
+
+// FormatThroughOtherWriters hands row-shaped text to a writer of another
+// package and to a strings function that writes nothing. A builder's write is
+// recognized by its method and its package together, so neither is one, and
+// neither line is read for the card shape.
+func FormatThroughOtherWriters(w *bufio.Writer) string {
+	w.WriteString("- **Pending**\n")
+	return strings.TrimSpace("- **Draft**\n")
 }
 `
 
@@ -360,6 +370,15 @@ func TestCardScoped_Files_LeavesThePromptsAndCardItselfAlone(t *testing.T) {
 				t.Errorf("cardScoped(%s, %s) = %v, want %v", tc.pkg, tc.file, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestPromptsPath_UnderTheModulePath_MovesWithIt holds the prompts path, which
+// is written out whole, to the module path it lives under, so a module move
+// still has one place to land.
+func TestPromptsPath_UnderTheModulePath_MovesWithIt(t *testing.T) {
+	if want := modulePath + "/internal/prompts"; promptsPath != want {
+		t.Errorf("promptsPath = %q, want %q", promptsPath, want)
 	}
 }
 
