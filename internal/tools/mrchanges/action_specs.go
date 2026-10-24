@@ -19,7 +19,7 @@ const (
 // ActionSpecs returns canonical specs for merge request changes and diff version actions.
 func ActionSpecs(client *gitlabclient.Client) []toolutil.ActionSpec {
 	return []toolutil.ActionSpec{
-		mrChangeReadSpec("changes_get", toolutil.RouteAction(client, Get), "gitlab_mr_changes_get"),
+		mrChangeListSpec("changes_get", toolutil.RouteAction(client, Get), "gitlab_mr_changes_get"),
 		mrChangeReadSpec("raw_diffs", toolutil.RouteAction(client, RawDiffs), "gitlab_mr_raw_diffs"),
 		mrChangeReadSpec("diff_versions_list", toolutil.RouteAction(client, ListDiffVersions), "gitlab_mr_diff_versions_list"),
 		mrChangeReadSpec("diff_version_get", toolutil.RouteAction(client, GetDiffVersion), "gitlab_mr_diff_version_get"),
@@ -34,6 +34,17 @@ func mrChangeReadSpec(name string, route toolutil.ActionRoute, individualTool st
 	options := mrChangeOptions(individualTool)
 	decorateMRChangeMeta(&options, individualTool)
 	return toolutil.NewReadActionSpec(name, route, options)
+}
+
+// mrChangeListSpec is mrChangeReadSpec for the changed files, a list the
+// output's shape cannot show: GitLab pages the diffs, and one page of them is
+// published beside the merge_request_iid it was asked for and the paths whose
+// diff came back empty, with no pagination block, which the catalog would
+// derive as a read of one object.
+func mrChangeListSpec(name string, route toolutil.ActionRoute, individualTool string) toolutil.ActionSpec {
+	spec := mrChangeReadSpec(name, route, individualTool)
+	spec.ContentKind = toolutil.ActionSpecContentList
+	return spec
 }
 
 // decorateMRChangeMeta applies the per-action discovery metadata, replacing the
@@ -83,36 +94,30 @@ var (
 // mrChangeActionMeta maps each individual MR-changes tool to its discovery metadata.
 var mrChangeActionMeta = map[string]mrChangeActionMetaEntry{
 	"gitlab_mr_changes_get": {
-		usage:   "Get the current file diffs (changes) for a merge request by project_id and merge_request_iid. Use this first when the prompt asks to inspect, view, or analyze MR changes without running an LLM analyzer. Returns structured per-file diffs with old/new paths and line metadata for inline review.",
-		aliases: []string{"get merge request changes", "view mr changes", "inspect mr diff", "list merge request changes", "mr code diff"},
-		related: []string{actionRawDiffs, actionDiffVersionsList, actionMRGet, actionMRDiscussionsList},
-		description: "Get the current file diffs (changes) for a merge request. " +
-			"Returns: per-file diffs with old_path, new_path, diff content, file status (added/deleted/renamed), file modes, and truncated_files when GitLab collapses large diffs. " +
-			"See also: gitlab_mr_diff_versions_list, gitlab_mr_raw_diffs, gitlab_mr_get.",
+		usage:       "Get the current file diffs (changes) for a merge request by project_id and merge_request_iid. Use this first when the prompt asks to inspect, view, or analyze MR changes without running an LLM analyzer. Returns structured per-file diffs with old/new paths and line metadata for inline review.",
+		aliases:     []string{"get merge request changes", "view mr changes", "inspect mr diff", "list merge request changes", "mr code diff"},
+		related:     []string{actionRawDiffs, actionDiffVersionsList, actionMRGet, actionMRDiscussionsList},
+		description: "Get the current file diffs (changes) for a merge request. Returns: per-file diffs with old_path, new_path, diff content, file status (added/deleted/renamed), file modes, and truncated_files when GitLab collapses large diffs. See also: gitlab_mr_diff_versions_list, gitlab_mr_raw_diffs, gitlab_mr_get.",
 		params: map[string]toolutil.ParameterGuidance{
 			"project_id":        scopeProjectGuidance,
 			"merge_request_iid": mrIIDGuidance,
 		},
 	},
 	"gitlab_mr_raw_diffs": {
-		usage:   "Get the raw unified-diff output for a merge request in plain-text git-apply format. Use this when a raw patch or unified diff is requested, or when changes_get reports truncated_files and the full diff payload is needed.",
-		aliases: []string{"get raw merge request diff", "mr unified diff", "mr patch", "raw mr diff", "git apply patch for mr"},
-		related: []string{actionChangesGet, actionDiffVersionsList, actionMRGet},
-		description: "Get the raw unified-diff output for a merge request in plain-text git-apply format. " +
-			"Returns: raw_diff, a single plain-text unified diff for the MR head suitable for patch application or programmatic analysis. " +
-			"See also: gitlab_mr_changes_get, gitlab_mr_diff_versions_list.",
+		usage:       "Get the raw unified-diff output for a merge request in plain-text git-apply format. Use this when a raw patch or unified diff is requested, or when changes_get reports truncated_files and the full diff payload is needed.",
+		aliases:     []string{"get raw merge request diff", "mr unified diff", "mr patch", "raw mr diff", "git apply patch for mr"},
+		related:     []string{actionChangesGet, actionDiffVersionsList, actionMRGet},
+		description: "Get the raw unified-diff output for a merge request in plain-text git-apply format. Returns: raw_diff, a single plain-text unified diff for the MR head suitable for patch application or programmatic analysis. See also: gitlab_mr_changes_get, gitlab_mr_diff_versions_list.",
 		params: map[string]toolutil.ParameterGuidance{
 			"project_id":        scopeProjectGuidance,
 			"merge_request_iid": mrIIDGuidance,
 		},
 	},
 	"gitlab_mr_diff_versions_list": {
-		usage:   "List the diff versions (historical snapshots) of a merge request. Use when the prompt asks for the MR's diff revisions or version history. Returns version IDs and SHAs but not the diffs themselves. Pass a version_id to diff_version_get to retrieve the actual diff.",
-		aliases: []string{"list merge request diff versions", "mr diff revisions", "list mr diff snapshots", "merge request version history"},
-		related: []string{actionDiffVersionGet, actionChangesGet, actionMRGet},
-		description: "List all diff versions (historical snapshots) of a merge request. " +
-			"Returns: an array of diff versions with id, head/base/start SHAs, state, real_size, and created_at, plus pagination metadata. " +
-			"See also: gitlab_mr_diff_version_get, gitlab_mr_changes_get.",
+		usage:       "List the diff versions (historical snapshots) of a merge request. Use when the prompt asks for the MR's diff revisions or version history. Returns version IDs and SHAs but not the diffs themselves. Pass a version_id to diff_version_get to retrieve the actual diff.",
+		aliases:     []string{"list merge request diff versions", "mr diff revisions", "list mr diff snapshots", "merge request version history"},
+		related:     []string{actionDiffVersionGet, actionChangesGet, actionMRGet},
+		description: "List all diff versions (historical snapshots) of a merge request. Returns: an array of diff versions with id, head/base/start SHAs, state, real_size, and created_at, plus pagination metadata. See also: gitlab_mr_diff_version_get, gitlab_mr_changes_get.",
 		params: map[string]toolutil.ParameterGuidance{
 			"project_id":        scopeProjectGuidance,
 			"merge_request_iid": mrIIDGuidance,
@@ -124,12 +129,10 @@ var mrChangeActionMeta = map[string]mrChangeActionMetaEntry{
 		},
 	},
 	"gitlab_mr_diff_version_get": {
-		usage:   "Get a single merge request diff version with its commits and file diffs. Use the version_id from diff_versions_list. Set unidiff to return diffs in unified-diff format.",
-		aliases: []string{"get merge request diff version", "show mr diff snapshot", "get mr diff revision", "merge request version detail"},
-		related: []string{actionDiffVersionsList, actionChangesGet, actionMRGet},
-		description: "Get a single merge request diff version with its commits and file diffs. " +
-			"Returns: the diff version with id, SHAs, state, real_size, the full commit list, and per-file diffs (optionally in unified-diff format). " +
-			"See also: gitlab_mr_diff_versions_list, gitlab_mr_changes_get.",
+		usage:       "Get a single merge request diff version with its commits and file diffs. Use the version_id from diff_versions_list. Set unidiff to return diffs in unified-diff format.",
+		aliases:     []string{"get merge request diff version", "show mr diff snapshot", "get mr diff revision", "merge request version detail"},
+		related:     []string{actionDiffVersionsList, actionChangesGet, actionMRGet},
+		description: "Get a single merge request diff version with its commits and file diffs. Returns: the diff version with id, SHAs, state, real_size, the full commit list, and per-file diffs (optionally in unified-diff format). See also: gitlab_mr_diff_versions_list, gitlab_mr_changes_get.",
 		params: map[string]toolutil.ParameterGuidance{
 			"project_id":        scopeProjectGuidance,
 			"merge_request_iid": mrIIDGuidance,

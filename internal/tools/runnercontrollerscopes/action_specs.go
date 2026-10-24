@@ -17,23 +17,27 @@ const (
 	actionScopeRemoveRunner   = "controller_scope_remove_runner"
 )
 
-// runnerDomain is the catalog domain internal/tools/runners aggregates these
-// specs into. An ActionSpec carries the bare name above, and every surface
-// resolves the domain-qualified form below, so anything that hands a model an
-// action ID reads the prefixed constant.
-const runnerDomain = "runner."
-
-// The canonical catalog IDs the bare names project to. Both readers of an
-// action ID take them from here: the RelatedActions cross-links and the
-// markdown next-step hints. A bare name resolves to nothing on any surface,
-// and nothing in the repository checks these strings, so keeping one block is
-// what keeps a hint from answering a model "unknown action".
+// The canonical catalog IDs the bare names project to, in the runner domain
+// internal/tools/runners aggregates these specs into. An ActionSpec carries
+// the bare name above, and every surface resolves the domain-qualified form
+// below, so both readers of an action ID take it from here: the
+// RelatedActions cross-links and the markdown next-step hints. A bare name
+// resolves to nothing on any surface, so keeping one block is what keeps a
+// hint from answering a model "unknown action".
+//
+// They are spelled whole rather than joined from the domain and the bare
+// names, because gremlins reads a + in a constant initializer as arithmetic and
+// reports its mutant as not covered: the initializer carries no statement
+// counter, and the - it would become does not compile. What the join
+// guaranteed, that each ID is the domain and a bare name this package
+// registers, TestMarkdownHints_NameTheSameCanonicalIDs holds instead, against
+// the domain the tests pin to the individual tool names.
 const (
-	catalogScopeList           = runnerDomain + actionScopeList
-	catalogScopeAddInstance    = runnerDomain + actionScopeAddInstance
-	catalogScopeRemoveInstance = runnerDomain + actionScopeRemoveInstance
-	catalogScopeAddRunner      = runnerDomain + actionScopeAddRunner
-	catalogScopeRemoveRunner   = runnerDomain + actionScopeRemoveRunner
+	catalogScopeList           = "runner.controller_scope_list"
+	catalogScopeAddInstance    = "runner.controller_scope_add_instance"
+	catalogScopeRemoveInstance = "runner.controller_scope_remove_instance"
+	catalogScopeAddRunner      = "runner.controller_scope_add_runner"
+	catalogScopeRemoveRunner   = "runner.controller_scope_remove_runner"
 )
 
 // ActionSpecs returns canonical specs for runner controller scope actions.
@@ -47,7 +51,7 @@ const (
 // "Returns: … See also: …" individual-tool description) per the 1:1 audit.
 func ActionSpecs(client *gitlabclient.Client) []toolutil.ActionSpec {
 	return []toolutil.ActionSpec{
-		runnerControllerScopeReadSpec(actionScopeList, toolutil.RouteAction(client, List), "gitlab_runner_controller_scope_list", listScopeMeta()),
+		runnerControllerScopeListSpec(actionScopeList, toolutil.RouteAction(client, List), "gitlab_runner_controller_scope_list", listScopeMeta()),
 		runnerControllerScopeCreateSpec(actionScopeAddInstance, toolutil.RouteAction(client, AddInstanceScope), "gitlab_runner_controller_scope_add_instance", addInstanceScopeMeta()),
 		runnerControllerScopeDeleteSpec(actionScopeRemoveInstance, toolutil.DestructiveAction(client, removeInstanceScopeOutput), "gitlab_runner_controller_scope_remove_instance", removeInstanceScopeMeta()),
 		runnerControllerScopeCreateSpec(actionScopeAddRunner, toolutil.RouteAction(client, AddRunnerScope), "gitlab_runner_controller_scope_add_runner", addRunnerScopeMeta()),
@@ -145,8 +149,15 @@ func removeRunnerScopeOutput(ctx context.Context, client *gitlabclient.Client, i
 	return out, nil
 }
 
-func runnerControllerScopeReadSpec(name string, route toolutil.ActionRoute, individualTool string, meta scopeActionMeta) toolutil.ActionSpec {
-	return toolutil.NewReadActionSpec(name, route, runnerControllerScopeOptions(individualTool, meta))
+// runnerControllerScopeListSpec builds the one read, the scope listing. It
+// declares itself a list because the output's shape cannot show it: the
+// instance-level and the runner-level scopings are two lists side by side,
+// with no pagination block, which the catalog would derive as a read of one
+// object.
+func runnerControllerScopeListSpec(name string, route toolutil.ActionRoute, individualTool string, meta scopeActionMeta) toolutil.ActionSpec {
+	options := runnerControllerScopeOptions(individualTool, meta)
+	options.ContentKind = toolutil.ActionSpecContentList
+	return toolutil.NewReadActionSpec(name, route, options)
 }
 
 func runnerControllerScopeCreateSpec(name string, route toolutil.ActionRoute, individualTool string, meta scopeActionMeta) toolutil.ActionSpec {
