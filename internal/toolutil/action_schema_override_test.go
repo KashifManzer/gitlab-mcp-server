@@ -1,6 +1,7 @@
 // action_schema_override_test.go tests the canonical parameter injections
-// applied to every action input schema: the pagination bounds, the date/time
-// and URI formats, and the instance-wide enums; the root overrides that state
+// applied to every action input schema: the pagination bounds, the date/time,
+// URI and email formats, and the instance-wide enums; the patterns an action
+// publishes for a cron expression or a full commit SHA; the root overrides that state
 // a requirement across parameters; and the items overrides that state what
 // each element of a list must carry.
 package toolutil
@@ -10,6 +11,8 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -131,6 +134,173 @@ func TestApplyCanonicalParamFormats_TypeGuard(t *testing.T) {
 
 			if got := property["format"]; got != tc.wantFormat {
 				t.Errorf("expires_at.format = %v, want %v", got, tc.wantFormat)
+			}
+		})
+	}
+}
+
+// TestApplyCanonicalParamFormats_EmailIsAnAddressAndARedirectURIIsNone
+// verifies what issue 1272 left in the central formats: an email is
+// published as an email address, so a model reading the schema knows the
+// form GitLab checks and find's example fills it with one rather than
+// "value". An OAuth redirect URI gets no central format: the one endpoint
+// that takes it splits the value on whitespace and checks each URI, so it
+// takes several, one per line, which the uri format does not describe.
+func TestApplyCanonicalParamFormats_EmailIsAnAddressAndARedirectURIIsNone(t *testing.T) {
+	cases := []struct {
+		name string
+		want any
+	}{
+		{name: "email", want: formatEmail},
+		{name: "redirect_uri", want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			property := map[string]any{"type": "string"}
+			applyCanonicalParamFormats(map[string]any{"properties": map[string]any{tc.name: property}})
+			if got := property["format"]; got != tc.want {
+				t.Errorf("%s.format = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSchemaNoFormatOverride_KeepsTheCentralFormatOffItsParameter verifies
+// the override a parameter named like a universal one takes when its
+// endpoint takes more than the central format describes, as an invitation's
+// email takes several addresses separated by commas: the published property
+// carries no format key at all, null included, while a parameter of the same
+// name without the override keeps the central one. A nil value of any
+// override is the same request for any keyword, at any depth, whatever put
+// the keyword there, and the schema it was derived from is left as it was.
+func TestSchemaNoFormatOverride_KeepsTheCentralFormatOffItsParameter(t *testing.T) {
+	if got, want := SchemaNoFormatOverride(" email "), (InputSchemaOverride{PropertyPath: "email", Values: map[string]any{"format": nil}}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("SchemaNoFormatOverride() = %#v, want %#v", got, want)
+	}
+	schema := func() map[string]any {
+		return map[string]any{"type": "object", "properties": map[string]any{
+			"email": map[string]any{"type": "string", "description": "Address"},
+			"configuration": map[string]any{"type": "object", "properties": map[string]any{
+				"url": map[string]any{"type": "string", "format": "uri", "description": "Source instance"},
+			}},
+		}}
+	}
+	property := func(published map[string]any, path ...string) map[string]any {
+		node := published
+		for _, name := range path {
+			properties, _ := node["properties"].(map[string]any)
+			node, _ = properties[name].(map[string]any)
+		}
+		return node
+	}
+
+	plain := specInputSchema(schema(), nil)
+	if got := property(plain, "email")["format"]; got != formatEmail {
+		t.Errorf("email without the override: format = %v, want %s", got, formatEmail)
+	}
+
+	source := schema()
+	published := specInputSchema(source, []InputSchemaOverride{
+		SchemaNoFormatOverride("email"),
+		SchemaPropertyOverride("configuration.url", map[string]any{"format": nil}),
+	})
+	for _, path := range [][]string{{"email"}, {"configuration", "url"}} {
+		t.Run(strings.Join(path, "."), func(t *testing.T) {
+			node := property(published, path...)
+			if format, has := node["format"]; has {
+				t.Errorf("%v carries format %v, want no format key", path, format)
+			}
+			if node["description"] == nil {
+				t.Errorf("%v lost its description: %v", path, node)
+			}
+		})
+	}
+	if got := property(source, "configuration", "url")["format"]; got != "uri" {
+		t.Errorf("the source schema's configuration.url format = %v, want it left as uri", got)
+	}
+}
+
+// TestSchemaPatternOverride_SetsThePatternAtItsPath verifies the override a
+// pattern is published with: the property at the trimmed path, and nothing
+// in its values but the pattern.
+func TestSchemaPatternOverride_SetsThePatternAtItsPath(t *testing.T) {
+	got := SchemaPatternOverride(" cron ", CronPattern)
+	want := InputSchemaOverride{PropertyPath: "cron", Values: map[string]any{"pattern": CronPattern}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SchemaPatternOverride() = %#v, want %#v", got, want)
+	}
+}
+
+// TestCronPattern_HoldsWhatGitLabParses verifies the cron pattern against
+// what GitLab's parser answers. Every value was put to Fugit 1.11.2, the
+// version GitLab pins, as Gitlab::Ci::CronParser#cron_valid? puts it (the
+// expression and a time zone): the ones it parses are accepted, steps,
+// ranges, names, L, # and a seconds field among them, and of the ones it
+// refuses, the pattern refuses those that are no cron line at all.
+func TestCronPattern_HoldsWhatGitLabParses(t *testing.T) {
+	expression := regexp.MustCompile(CronPattern)
+	cases := []struct {
+		value string
+		want  bool
+	}{
+		{value: "0 1 * * *", want: true},
+		{value: "*/15 9-17 * * mon-fri", want: true},
+		{value: "0 0 1,15 * *", want: true},
+		{value: "0 0 * * 1#2", want: true},
+		{value: "0 0 L * *", want: true},
+		{value: "0 0 * * tue%2", want: true},
+		{value: "0 0 -1 * *", want: true},
+		{value: "30 0 1 * * *", want: true},
+		{value: " 0 1 * * * ", want: true},
+		{value: "0\t1 * * *", want: true},
+		{value: "@yearly", want: true},
+		{value: "@annually", want: true},
+		{value: "@monthly", want: true},
+		{value: "@weekly", want: true},
+		{value: "@daily", want: true},
+		{value: "@midnight", want: true},
+		{value: "@noon", want: true},
+		{value: "@hourly", want: true},
+		{value: "every day", want: false},
+		{value: "daily", want: false},
+		{value: "0 1 * *", want: false},
+		{value: "0 1 * * * * *", want: false},
+		{value: "@reboot", want: false},
+		{value: "@DAILY", want: false},
+		{value: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%q", tc.value), func(t *testing.T) {
+			if got := expression.MatchString(tc.value); got != tc.want {
+				t.Errorf("CronPattern matches %q = %t, want %t", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFullCommitSHAPattern_HoldsAFullLowerCaseSHA verifies the full-SHA
+// pattern: the 40 hex digits of a SHA-1 repository and the 64 of a SHA-256
+// one, in the lower case git writes, and nothing a route taking any revision
+// would also take, an abbreviated SHA, a branch name or an upper-case SHA.
+func TestFullCommitSHAPattern_HoldsAFullLowerCaseSHA(t *testing.T) {
+	expression := regexp.MustCompile(FullCommitSHAPattern)
+	cases := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "a SHA-1", value: strings.Repeat("0a", 20), want: true},
+		{name: "a SHA-256", value: strings.Repeat("0a", 32), want: true},
+		{name: "an upper-case SHA-1", value: strings.Repeat("0A", 20), want: false},
+		{name: "an abbreviated SHA", value: "0a1b2c3", want: false},
+		{name: "a length between the two", value: strings.Repeat("0a", 26), want: false},
+		{name: "a SHA-1 and one digit more", value: strings.Repeat("0a", 20) + "0", want: false},
+		{name: "a branch name", value: "main", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := expression.MatchString(tc.value); got != tc.want {
+				t.Errorf("FullCommitSHAPattern matches %q = %t, want %t", tc.value, got, tc.want)
 			}
 		})
 	}

@@ -14,11 +14,31 @@ import (
 // to write a date as "YYYY-MM-DD" and a color as "value", and a model that
 // copied either sent a call its schema refused (issue 1175). The dates lie in
 // the future, so an expiry the example sets is one GitLab accepts.
+//
+// The same held for every string whose form GitLab checks, an email address,
+// a commit SHA, a cron expression, a duration and a redirect URI among them
+// (issue 1272). A SHA is the 40 hex digits of a full SHA-1, which a route
+// taking any revision takes as well, the digest the 64 of a SHA-256, the
+// fingerprint the SHA256 form ssh-keygen prints, the duration one GitLab
+// reads as an hour, and the version a release's first semantic version.
 const (
-	exampleDate     = "2030-01-31"
-	exampleDateTime = "2030-01-31T00:00:00Z"
-	exampleURL      = "https://example.com"
-	exampleHexColor = "#1F75CB"
+	exampleDate        = "2030-01-31"
+	exampleDateTime    = "2030-01-31T00:00:00Z"
+	exampleURL         = "https://example.com"
+	exampleHexColor    = "#1F75CB"
+	exampleEmail       = "user@example.com"
+	exampleHostname    = "example.com"
+	exampleSHA         = "0123456789abcdef0123456789abcdef01234567"
+	exampleDigest      = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	exampleCron        = "0 1 * * *"
+	exampleDuration    = "1h"
+	exampleFingerprint = "SHA256:ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+	exampleVersion     = "1.0.0"
+	exampleProjectPath = "group/project"
+	// examplePathPattern starts with exampleProjectPath, as GitLab requires
+	// of a container repository path pattern. It is spelled out rather than
+	// joined, so that no operator sits where a test could not tell it apart.
+	examplePathPattern = "group/project/*"
 )
 
 // The numbers an example uses. exampleIdentifier stands in for any ID, and
@@ -33,8 +53,11 @@ const (
 
 // patternExamples are the values tried, in order, for a string whose pattern
 // refuses its placeholder: one per pattern shape the catalog declares (the hex
-// color of a security attribute, the absolute URL of a release link).
-var patternExamples = []string{exampleHexColor, exampleURL}
+// color of a security attribute, the absolute URL of a release link, the
+// digest of an attestation's subject, the cron expression of a schedule or a
+// deploy freeze, the fingerprint of an SSH key, the semantic version of a
+// changelog).
+var patternExamples = []string{exampleHexColor, exampleURL, exampleDigest, exampleCron, exampleFingerprint, exampleVersion}
 
 // exampleFor builds the gitlab_execute_action call find and describe offer for
 // an action: every parameter the schema's root requires and the first
@@ -233,6 +256,10 @@ func exampleFormatted(name string, schema map[string]any) string {
 		return exampleDateTime
 	case "uri":
 		return exampleURL
+	case "email":
+		return exampleEmail
+	case "hostname":
+		return exampleHostname
 	}
 	return fmt.Sprint(placeholderForParam(name))
 }
@@ -284,23 +311,41 @@ func firstSchemaBranch(schema map[string]any) map[string]any {
 }
 
 // placeholderForParam returns the value an example uses for a parameter by
-// its name alone: a path for a project or group, a branch name, a URL, a
-// color, an access level, an identifier or a date. [exampleValue] starts from
-// it and keeps it wherever the parameter's schema allows. A name GitLab gives
-// a meaning its schema does not state is here for that reason: a label's
-// color is a free string to its schema, and an access level an integer.
+// its name alone: a path for a project or group, a branch name, a URL, an
+// email address, a color, an access level, a SHA, a duration, an identifier
+// or a date. [exampleValue] starts from it and keeps it wherever the
+// parameter's schema allows. A name GitLab gives a meaning its schema does
+// not state is here for that reason: a label's color is a free string to its
+// schema, and an access level an integer. So is a SHA where the route also
+// takes a ref name, and a duration, both published with no pattern because
+// one would refuse values GitLab takes (issue 1272); a container
+// repository's path pattern, which GitLab holds to the project's own path, a
+// rule across two parameters that no pattern can state; and an OAuth
+// redirect URI and an invitation's email, which take several values in one
+// string and so publish no format, since a format names one, while the
+// example still sends one. A commit is a SHA as well: it is the name
+// [exampleValue] gives the element of a list of commits, which is what
+// merge_request.context_commits_create and context_commits_delete send.
 func placeholderForParam(name string) any {
 	switch name {
 	case "project_id", "target_project_id":
-		return "group/project"
+		return exampleProjectPath
+	case "repository_path_pattern":
+		return examplePathPattern
+	case "duration":
+		return exampleDuration
+	case "sha", "commit":
+		return exampleSHA
 	case "group_id", "namespace_id":
 		return "group/subgroup"
 	case "file_path", "artifact_path":
 		return "path/to/file"
 	case "ref", "branch", "branch_name", "target_branch", "source_branch":
 		return "main"
-	case "url", "remote_url", "external_url", "web_url":
+	case "url", "remote_url", "external_url", "web_url", "redirect_uri":
 		return exampleURL
+	case "email":
+		return exampleEmail
 	case "color":
 		return exampleHexColor
 	case "access_level", "group_access", "base_access_level":
@@ -308,6 +353,9 @@ func placeholderForParam(name string) any {
 	}
 	if identifierParam(name) {
 		return exampleIdentifier
+	}
+	if strings.HasSuffix(name, "_sha") {
+		return exampleSHA
 	}
 	if strings.Contains(name, "date") {
 		return exampleDate

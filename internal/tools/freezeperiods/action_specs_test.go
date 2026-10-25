@@ -4,6 +4,7 @@ package freezeperiods
 import (
 	"context"
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -39,6 +40,34 @@ func TestActionSpecs_Metadata(t *testing.T) {
 	}
 	if byTool["gitlab_update_freeze_period"].ParameterGuidance["freeze_period_id"].SemanticRole == "" {
 		t.Fatal("gitlab_update_freeze_period should define freeze_period_id parameter guidance")
+	}
+}
+
+// TestActionSpecs_EachAction_TakesItsAliasesAndUsageFromTheTable verifies
+// that every action is served the aliases and the Usage freezePeriodActionMeta
+// holds under its name, none of them empty, and that the table names no
+// action the package does not serve, so a misspelled key cannot leave an
+// action with no discovery metadata unnoticed.
+func TestActionSpecs_EachAction_TakesItsAliasesAndUsageFromTheTable(t *testing.T) {
+	specs := ActionSpecs(nil)
+	for _, spec := range specs {
+		t.Run(spec.Name, func(t *testing.T) {
+			meta, ok := freezePeriodActionMeta[spec.Name]
+			if !ok || meta.usage == "" || len(meta.aliases) == 0 {
+				t.Fatalf("freezePeriodActionMeta[%q] = %+v, %t, want an entry with aliases and a usage", spec.Name, meta, ok)
+			}
+			if spec.Usage != meta.usage {
+				t.Errorf("%s Usage = %q, want %q", spec.Name, spec.Usage, meta.usage)
+			}
+			for _, alias := range meta.aliases {
+				if !slices.Contains(spec.Aliases, alias) {
+					t.Errorf("%s Aliases = %v, missing %q", spec.Name, spec.Aliases, alias)
+				}
+			}
+		})
+	}
+	if len(freezePeriodActionMeta) != len(specs) {
+		t.Errorf("freezePeriodActionMeta holds %d actions, and the package serves %d", len(freezePeriodActionMeta), len(specs))
 	}
 }
 
@@ -194,6 +223,31 @@ func TestCatalogSurface_DeleteConfirmDeclined(t *testing.T) {
 		}
 	}
 	t.Error("expected text content in cancellation result")
+}
+
+// TestActionSpecs_FreezeWindow_IsHeldToCronLines verifies that the two
+// actions that send a freeze window publish its start and its end with
+// toolutil.CronPattern, so a model reading the schema knows the form GitLab
+// parses, and find's example fills each with a cron line rather than the
+// "value" GitLab refused (issue 1272). The other three actions take no cron.
+func TestActionSpecs_FreezeWindow_IsHeldToCronLines(t *testing.T) {
+	sendsWindow := map[string]bool{"gitlab_create_freeze_period": true, "gitlab_update_freeze_period": true}
+	for _, spec := range ActionSpecs(nil) {
+		t.Run(spec.IndividualTool.Name, func(t *testing.T) {
+			properties, _ := spec.Route.InputSchema["properties"].(map[string]any)
+			for _, name := range []string{"freeze_start", "freeze_end"} {
+				t.Run(name, func(t *testing.T) {
+					property, has := properties[name].(map[string]any)
+					if has != sendsWindow[spec.IndividualTool.Name] {
+						t.Fatalf("%s has a %s property: %t, want %t", spec.IndividualTool.Name, name, has, sendsWindow[spec.IndividualTool.Name])
+					}
+					if has && property["pattern"] != toolutil.CronPattern {
+						t.Errorf("%s %s pattern = %v, want toolutil.CronPattern", spec.IndividualTool.Name, name, property["pattern"])
+					}
+				})
+			}
+		})
+	}
 }
 
 func freezePeriodSpecsByTool(t *testing.T, specs []toolutil.ActionSpec) map[string]toolutil.ActionSpec {
