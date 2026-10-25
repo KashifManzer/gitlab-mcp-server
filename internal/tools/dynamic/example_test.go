@@ -340,6 +340,30 @@ func TestFind_LDAPLinkExamples_NameTheCommonNameAlone(t *testing.T) {
 	}
 }
 
+// TestFind_ProtectedEnvironmentExamples_DeployAsDevelopers verifies the call
+// find and describe offer for the project and the group protect. Each deploy
+// access level names exactly one of a role, a user or a group, and the item
+// schema says so with a oneOf, which the example used to read nothing of: it
+// filled an item's required list alone, which is empty, so it sent
+// deploy_access_levels [{}] and GitLab refused the call it built (issue
+// 1271). Now it fills the first alternative of the item, the role, with the
+// level an example grants everywhere, Developer.
+func TestFind_ProtectedEnvironmentExamples_DeployAsDevelopers(t *testing.T) {
+	registry := NewRegistryFromCatalog(mustCachedCatalog(t, true))
+	for _, action := range []string{"environment.protected_protect", "group.protected_env_protect"} {
+		t.Run(action, func(t *testing.T) {
+			entry, ok := registry.resolveAction(action)
+			if !ok {
+				t.Fatalf("resolveAction(%s) found nothing", action)
+			}
+			params, _ := registry.describeEntry(entry).Example.Arguments["params"].(map[string]any)
+			if got := fmt.Sprint(params["deploy_access_levels"]); got != "[map[access_level:30]]" {
+				t.Errorf("%s example deploy_access_levels = %s, want [map[access_level:30]]", action, got)
+			}
+		})
+	}
+}
+
 // TestExampleFor_FillsTheRequiredParamsAndTheFirstAlternative verifies the
 // shape of the example call: every parameter the schema's root requires, the
 // first alternative group and none of the others, and top-level confirm only
@@ -437,6 +461,37 @@ func TestExampleValue_SatisfiesEachConstraint(t *testing.T) {
 				},
 			}},
 			want: []any{map[string]any{"content": "value", "file_path": "path/to/file"}},
+		},
+		{
+			name:  "an array of objects fills the first alternative of each item",
+			param: "deploy_access_levels",
+			schema: map[string]any{"type": []any{"null", "array"}, "minItems": 1, "items": map[string]any{
+				"type": "object",
+				"oneOf": []any{
+					map[string]any{"required": []string{"access_level"}},
+					map[string]any{"required": []string{"user_id"}},
+				},
+				"properties": map[string]any{
+					"access_level": map[string]any{"type": []any{"null", "integer"}, "enum": []any{20, 30, 40, 60, nil}},
+					"user_id":      map[string]any{"type": []any{"null", "integer"}},
+				},
+			}},
+			want: []any{map[string]any{"access_level": 30}},
+		},
+		{
+			name:  "an object fills its required fields and its first alternative",
+			param: "rule",
+			schema: map[string]any{
+				"type":     "object",
+				"required": []any{"name"},
+				"anyOf":    []any{map[string]any{"required": []any{"group_id"}}, map[string]any{"required": []any{"user_id"}}},
+				"properties": map[string]any{
+					"name":     map[string]any{"type": "string"},
+					"group_id": map[string]any{"type": "integer"},
+					"user_id":  map[string]any{"type": "integer"},
+				},
+			},
+			want: map[string]any{"group_id": 123, "name": "value"},
 		},
 		{
 			name:  "an object fills its required fields only",
