@@ -335,13 +335,14 @@ func heldIsDecidedByIssue951(held Decision) bool {
 // decided for the keys before admission. The address (IDN-004) and the
 // transport source (IDN-005) are derived at budgetKey, the whole IPv4 address
 // or the IPv6 /64, and the budgets keyed on them (AUB-001 to AUB-003) record
-// the decision and carry F-14 and F-25 no longer, F-34 staying on the two that
-// carry it for issue 958. AUB-006 is the /48 aggregate the decision added: a
-// constant on a key of its own, charged with the refused credentials the
-// distinct-credential budget is charged with, refused in the words every
-// budget refuses with, its zero not an operator's to set, and its table capped
-// with the others by AUB-004. Both findings stay in the register's list, filed
-// as issue 954's.
+// the decision and carry F-14 and F-25 no longer, nor F-34 on the two that
+// carried it, which issue 958 answered when a zero failure window stopped
+// switching the distinct-credential budget off. AUB-006 is the /48 aggregate
+// the decision added: a constant on a key of its own, charged with the refused
+// credentials the distinct-credential budget is charged with, refused in the
+// words every budget refuses with, its zero not an operator's to set, and its
+// table capped with the others by AUB-004. Both findings stay in the
+// register's list, filed as issue 954's.
 func TestDecisions_AuthenticationKeys_AreDecidedByIssue954(t *testing.T) {
 	for _, id := range []string{"IDN-004", "IDN-005", "AUB-001", "AUB-002", "AUB-003", "AUB-006"} {
 		t.Run(id, func(t *testing.T) {
@@ -360,9 +361,10 @@ func TestDecisions_AuthenticationKeys_AreDecidedByIssue954(t *testing.T) {
 		})
 	}
 	for _, id := range []string{"AUB-001", "AUB-003"} {
-		t.Run(id+" keeps F-34", func(t *testing.T) {
-			if d, _ := Lookup(id); !slices.Equal(d.Findings, []string{"F-34"}) {
-				t.Errorf("%s carries %v, want F-34 alone, which issue 958 answers", id, d.Findings)
+		t.Run(id+" carries no finding", func(t *testing.T) {
+			if d, _ := Lookup(id); len(d.Findings) != 0 || d.OffWith != "" || !slices.Contains(d.Decided, "issue 958") {
+				t.Errorf("%s carries %v, follows %q off and records %v; want no finding, no row it follows off, "+
+					"and issue 958, which answered the F-34 it carried", id, d.Findings, d.OffWith, d.Decided)
 			}
 		})
 	}
@@ -382,16 +384,17 @@ func TestDecisions_AuthenticationKeys_AreDecidedByIssue954(t *testing.T) {
 // own oldest for a fresh key, and a source the limiter did not record is given
 // no place, and the sites that keep and reclaim a pair and forget the sources
 // with none live are declared, with the alias of AUB-004's value the last of
-// them reads. F-16, issue 958's, is carried as before, and F-35 stays in the
-// register's list, filed as issue 982's.
+// them reads. It carries no finding: F-16, issue 958's, left it when the
+// fallback of its window to the default was written once, and F-35 stays in
+// the register's list, filed as issue 982's.
 func TestDecisions_TransportSourcePairs_AreBoundedByIssue982(t *testing.T) {
 	d, _ := Lookup("AUB-002")
 	if !d.Table || d.AtCapacity != ReclaimOwnThenRefuse || !slices.Contains(d.Decided, "issue 982") {
 		t.Errorf("AUB-002: table %v, at capacity %d, decided %v; want a table that reclaims its own key's holding, by issue 982",
 			d.Table, d.AtCapacity, d.Decided)
 	}
-	if !slices.Equal(d.Findings, []string{"F-16"}) {
-		t.Errorf("AUB-002 carries %v, want F-16 alone: F-35 is answered", d.Findings)
+	if len(d.Findings) != 0 {
+		t.Errorf("AUB-002 carries %v, want no finding: F-35 and F-16 are answered", d.Findings)
 	}
 	for _, name := range []string{
 		"transportBudget.charge", "transportBudget.keepLocked",
@@ -798,7 +801,11 @@ var findingsOfNoRow = []string{"F-18", "F-23", "F-24", "F-27"}
 // distinct-credential budget's reason as GitLab 19.5 answered it, and F-35 did
 // when issue 982 bounded the transport-source budget's record of charged pairs
 // per source and to the sources its limiter recorded, and F-11 did when issue
-// 958 stated the rule for what a row does at capacity.
+// 958 stated the rule for what a row does at capacity, and F-16 and F-34 did
+// when issue 958 stated each zero it kept from meaning off, made the zeros a
+// flag and its variable read apart mean one thing, stopped a zero failure
+// window switching the distinct-credential budget off, and wrote each default
+// and fallback once.
 func TestDecisions_AFindingNoRowCarries_IsAnsweredByItsIssue(t *testing.T) {
 	carried := map[string]bool{}
 	decided := map[string]bool{}
@@ -826,7 +833,7 @@ func TestDecisions_AFindingNoRowCarries_IsAnsweredByItsIssue(t *testing.T) {
 			}
 		})
 	}
-	if got, want := strings.Join(answered, ","), "F-03,F-07,F-08,F-09,F-10,F-11,F-14,F-17,F-19,F-20,F-25,F-29,F-30,F-31,F-33,F-35"; got != want {
+	if got, want := strings.Join(answered, ","), "F-03,F-07,F-08,F-09,F-10,F-11,F-14,F-16,F-17,F-19,F-20,F-25,F-29,F-30,F-31,F-33,F-34,F-35"; got != want {
 		t.Errorf("findings answered and carried by no row = %s, want %s", got, want)
 	}
 }
@@ -837,17 +844,20 @@ func TestDecisions_AFindingNoRowCarries_IsAnsweredByItsIssue(t *testing.T) {
 // (POL-001), the tool-call bucket's burst refused beside a positive rate
 // while a zero rate still switches the bucket off (RTC-001), and the
 // credential age ceiling and the watcher ceiling, two Go options whose zero
-// selects the default (ADM-008, HLD-003). The rows that carry F-34 still are
-// the four whose zero a change of code answers next: the OAuth cache TTL's
-// flag, which selects the default where its variable refuses, the failure
-// window that switches the distinct-credential budget off with it, and the
-// session timeout's variable, which refuses the zero its flag reads as off.
+// selects the default (ADM-008, HLD-003), and the OAuth cache TTL's zero
+// refused at startup by its flag as by its variable (ADM-005), where the flag
+// used to replace it with the default. No row carries F-34 any longer: the
+// other three that did had a zero that meant off and was read apart, the
+// failure window's, which switched the distinct-credential budget off with it
+// (AUB-001, AUB-003), and the session timeout's, whose variable refused what
+// its flag reads as off (END-005), and each now records issue 958.
 func TestDecisions_ZeroExceptions_AreDecidedByIssue958(t *testing.T) {
 	for _, tc := range []struct {
 		id       string
 		zero     Zero
 		settings []SettingZero
 	}{
+		{"ADM-005", ZeroRefused, nil},
 		{"POL-001", ZeroRefused, nil},
 		{"RTC-001", ZeroOff, []SettingZero{{Config: "RateLimitBurst", Zero: ZeroRefused}}},
 		{"ADM-008", ZeroSelectsDefault, nil},
@@ -864,14 +874,19 @@ func TestDecisions_ZeroExceptions_AreDecidedByIssue958(t *testing.T) {
 			}
 		})
 	}
-	var carrying []string
+	for _, id := range []string{"AUB-001", "AUB-003", "END-005"} {
+		t.Run(id, func(t *testing.T) {
+			d, _ := Lookup(id)
+			if d.Zero != ZeroOff || d.ZeroBy != "" || d.OffWith != "" || !slices.Contains(d.Decided, "issue 958") {
+				t.Errorf("%s: zero %d, zero by %q, off with %q, decided %v; want a zero that switches it off alone, "+
+					"and issue 958 recorded", id, d.Zero, d.ZeroBy, d.OffWith, d.Decided)
+			}
+		})
+	}
 	for _, d := range Decisions() {
 		if d.Carries("F-34") {
-			carrying = append(carrying, d.ID)
+			t.Errorf("%s carries F-34, which issue 958 answered", d.ID)
 		}
-	}
-	if want := []string{"ADM-005", "AUB-001", "AUB-003", "END-005"}; !slices.Equal(carrying, want) {
-		t.Errorf("F-34 is carried by %v, want %v", carrying, want)
 	}
 }
 
@@ -912,11 +927,12 @@ func TestDecisions_CapacityRule_AnswersF11UnderIssue958(t *testing.T) {
 // rows F-16 recorded as bounds no setting reaches with no reason stated, which
 // issue 958 answered by stating one: the rejected-token cache, the credential
 // age ceiling, the unexplained-401 interval, the probe bound and the upstream
-// retries. Each records the issue and carries F-16 no longer. F-16 stays on
-// the four whose default or fallback is written in two places, which a later
-// change of code answers: the revalidation interval, the pool size and the
-// idle timeout, which the pool states a second time, and the transport-source
-// budget's window fallback, whose 500 states its reason here too.
+// retries. Each records the issue and carries F-16 no longer. Nor does any
+// other row: the four whose default or fallback was written in two places
+// record the issue too, the revalidation interval, the pool size and the idle
+// timeout, which the pool aliased from the register in place of stating them a
+// second time, and the transport-source budget, whose window falls back to the
+// default through the one helper and whose 500 states its reason here.
 func TestDecisions_UnreasonedBounds_StateTheirReasonUnderIssue958(t *testing.T) {
 	for _, id := range []string{"ADM-006", "ADM-008", "ADM-010", "POL-006", "RTC-006"} {
 		t.Run(id, func(t *testing.T) {
@@ -930,14 +946,46 @@ func TestDecisions_UnreasonedBounds_StateTheirReasonUnderIssue958(t *testing.T) 
 	if d, _ := Lookup("AUB-002"); d.Fixed == "" {
 		t.Error("AUB-002 states no reason its 500 is fixed")
 	}
-	var carrying []string
+	for _, id := range []string{"ADM-009", "AUB-002", "POL-001", "POL-004"} {
+		t.Run(id+" writes its default once", func(t *testing.T) {
+			if d, _ := Lookup(id); !slices.Contains(d.Decided, "issue 958") {
+				t.Errorf("%s records %v, want issue 958, which wrote its default or fallback once", id, d.Decided)
+			}
+		})
+	}
 	for _, d := range Decisions() {
 		if d.Carries("F-16") {
-			carrying = append(carrying, d.ID)
+			t.Errorf("%s carries F-16, which issue 958 answered", d.ID)
 		}
 	}
-	if want := []string{"ADM-009", "AUB-002", "POL-001", "POL-004"}; !slices.Equal(carrying, want) {
-		t.Errorf("F-16 is carried by %v, want %v", carrying, want)
+}
+
+// TestDecisions_PoolDefaults_AreAliasesOfTheRegister pins the three defaults
+// issue 958 found stated twice, once in internal/config and again as the
+// pool's own fallback: the pool size, the revalidation interval and the idle
+// timeout. The pool's statements are aliases of the register's constants now,
+// declared as such on POL-001, ADM-009 and POL-004, so a change of value is one
+// edit and check-tenancy's G2 holds every place that reads it; none of the
+// three keeps a Pin, a site holding a literal of its own. The role stays for a
+// value that has to be stated twice, which G4 holds to its constant, so this
+// asks it of these three rows and not of the register.
+func TestDecisions_PoolDefaults_AreAliasesOfTheRegister(t *testing.T) {
+	for _, tc := range []struct{ id, name, value string }{
+		{"POL-001", "defaultMaxSize", "PoolSize"},
+		{"ADM-009", "DefaultRevalidateInterval", "RevalidateInterval"},
+		{"POL-004", "DefaultIdleTimeout", "PoolIdleTimeout"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			d, _ := Lookup(tc.id)
+			if !slices.Contains(d.Sites, alias(pkgPool, tc.name, tc.value)) {
+				t.Errorf("%s declares %v, want serverpool's %s an alias of %s", tc.id, d.Sites, tc.name, tc.value)
+			}
+			for _, s := range d.Sites {
+				if s.Role == Pin {
+					t.Errorf("%s declares %s.%s as a Pin, a second statement of %s", tc.id, s.Pkg, s.Name, s.Reads)
+				}
+			}
+		})
 	}
 }
 
