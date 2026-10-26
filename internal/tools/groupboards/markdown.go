@@ -32,40 +32,15 @@ func boardHeading(kind string, id int64, title string) string {
 	return fmt.Sprintf("%s #%d: %s", kind, id, title)
 }
 
-// boardListScope names what a column collects, which is the one thing a reader
-// of a column wants: its label, or the assignee, milestone or iteration a
-// Premium list is scoped to. A column with no scope of its own is the board's
-// backlog or closed column and renders as nothing rather than as an invented
-// scope.
-//
-// It is a chain of ifs rather than a tagless switch so that a mutation test
-// can reach every condition: Go's coverage counts a block for each case body
-// but none for the case expressions themselves, which gremlins then reports as
-// never covered whatever the tests drive.
+// boardListScope names what a column collects as the project boards name it,
+// through [toolutil.BoardColumnScope], given the milestone by title since this
+// package mirrors the group milestone shape rather than the project one.
 func boardListScope(l BoardListOutput) string {
-	if name := boardListLabelName(l); name != "" {
-		return toolutil.EscapeMdTableCell(name)
+	var milestone string
+	if l.Milestone != nil {
+		milestone = l.Milestone.Title
 	}
-	if l.Assignee != nil && l.Assignee.Username != "" {
-		return toolutil.MdUserHandle(l.Assignee.Username)
-	}
-	if l.Milestone != nil && l.Milestone.Title != "" {
-		return "Milestone: " + toolutil.EscapeMdTableCell(l.Milestone.Title)
-	}
-	if l.Iteration != nil && l.Iteration.Title != "" {
-		return "Iteration: " + toolutil.EscapeMdTableCell(l.Iteration.Title)
-	}
-	return ""
-}
-
-// boardListLimit renders a column's issue or weight ceiling. Zero is GitLab
-// saying the column has no limit, not a limit of nothing, so it renders as a
-// dash rather than as the number 0.
-func boardListLimit(v int64) string {
-	if v == 0 {
-		return "-"
-	}
-	return strconv.FormatInt(v, 10)
+	return toolutil.BoardColumnScope(l.Label, l.Assignee, milestone, l.Iteration)
 }
 
 // boardLabelNames lists a board's scope label names, skipping the nil entries
@@ -88,14 +63,7 @@ func writeBoardListsTable(c *toolutil.Card, lists []BoardListOutput) {
 	}
 	t := c.Table("Lists", "ID", "Scope", "Position", "Max Issues", "Max Weight", toolutil.BoardListMetricLabel)
 	for _, l := range lists {
-		t.Row(
-			strconv.FormatInt(l.ID, 10),
-			boardListScope(l),
-			strconv.FormatInt(l.Position, 10),
-			boardListLimit(l.MaxIssueCount),
-			boardListLimit(l.MaxIssueWeight),
-			toolutil.CellOr(l.LimitMetric, "-"),
-		)
+		t.Row(boardListCells(l)...)
 	}
 }
 
@@ -137,8 +105,22 @@ func FormatGroupBoardMarkdown(out GroupBoardOutput) string {
 	return b.String()
 }
 
+// writeColumnLimits closes a page of group boards with the columns that carry
+// a work-in-progress limit, through the section the project boards write in
+// the same words.
+func writeColumnLimits(b *strings.Builder, boards []GroupBoardOutput) {
+	var limits toolutil.BoardColumnLimits
+	for _, bd := range boards {
+		for _, l := range bd.Lists {
+			limits.Add(bd.ID, l.ID, boardListScope(l), l.MaxIssueCount, l.MaxIssueWeight, l.LimitMetric)
+		}
+	}
+	limits.Write(b)
+}
+
 // FormatListGroupBoardsMarkdown renders a page of group issue boards as a
-// Markdown table: a collection of objects that share columns.
+// Markdown table: a collection of objects that share columns, followed by the
+// columns of those boards that carry a work-in-progress limit.
 func FormatListGroupBoardsMarkdown(out ListGroupBoardsOutput) string {
 	if len(out.Boards) == 0 {
 		return toolutil.EmptyMessage("group issue boards")
@@ -155,8 +137,9 @@ func FormatListGroupBoardsMarkdown(out ListGroupBoardsOutput) string {
 			strconv.Itoa(len(bd.Lists)),
 		))
 	}
+	writeColumnLimits(&b, out.Boards)
 	toolutil.WriteListFooter(&b, out.Pagination, true,
-		toolutil.HintAction(actionBoardGet, "read one board with its columns"),
+		toolutil.HintAction(actionBoardGet, "read one board with every column, its scope and its position"),
 		toolutil.HintAction(actionBoardCreate, "add a new board to the group"),
 	)
 	return b.String()
@@ -200,14 +183,7 @@ func FormatListBoardListsMarkdown(out ListBoardListsOutput) string {
 	toolutil.WriteListHeading(&b, "Board Lists", len(out.Lists), out.Pagination)
 	b.WriteString(toolutil.MarkdownTableHeader("ID", "Scope", "Position", "Max Issues", "Max Weight", toolutil.BoardListMetricLabel))
 	for _, l := range out.Lists {
-		b.WriteString(toolutil.MarkdownTableRow(
-			strconv.FormatInt(l.ID, 10),
-			boardListScope(l),
-			strconv.FormatInt(l.Position, 10),
-			boardListLimit(l.MaxIssueCount),
-			boardListLimit(l.MaxIssueWeight),
-			toolutil.CellOr(l.LimitMetric, "-"),
-		))
+		b.WriteString(toolutil.MarkdownTableRow(boardListCells(l)...))
 	}
 	toolutil.WriteListFooter(&b, out.Pagination, false,
 		toolutil.HintAction(actionBoardListGet, "read one column"),
@@ -223,6 +199,12 @@ func boardListLabelName(l BoardListOutput) string {
 		return l.Label.Name
 	}
 	return ""
+}
+
+// boardListCells is a column's row in a table of the board's columns, in the
+// cells the project boards write theirs in ([toolutil.BoardColumnCells]).
+func boardListCells(l BoardListOutput) []string {
+	return toolutil.BoardColumnCells(l.ID, boardListScope(l), l.Position, l.MaxIssueCount, l.MaxIssueWeight, l.LimitMetric)
 }
 
 // groupCell links a board's group to its page, or renders nothing when GitLab
