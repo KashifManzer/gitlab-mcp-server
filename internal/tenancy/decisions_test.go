@@ -808,7 +808,9 @@ var findingsOfNoRow = []string{"F-18", "F-23", "F-24", "F-27"}
 // when issue 958 stated each zero it kept from meaning off, made the zeros a
 // flag and its variable read apart mean one thing, stopped a zero failure
 // window switching the distinct-credential budget off, and wrote each default
-// and fallback once.
+// and fallback once, and F-13 did when issue 957 moved every variable a row
+// names onto the configuration package's list, read through it, and gave
+// the listen ceiling its flag.
 func TestDecisions_AFindingNoRowCarries_IsAnsweredByItsIssue(t *testing.T) {
 	carried := map[string]bool{}
 	decided := map[string]bool{}
@@ -836,7 +838,7 @@ func TestDecisions_AFindingNoRowCarries_IsAnsweredByItsIssue(t *testing.T) {
 			}
 		})
 	}
-	if got, want := strings.Join(answered, ","), "F-03,F-07,F-08,F-09,F-10,F-11,F-14,F-16,F-17,F-19,F-20,F-25,F-29,F-30,F-31,F-33,F-34,F-35"; got != want {
+	if got, want := strings.Join(answered, ","), "F-03,F-07,F-08,F-09,F-10,F-11,F-13,F-14,F-16,F-17,F-19,F-20,F-25,F-29,F-30,F-31,F-33,F-34,F-35"; got != want {
 		t.Errorf("findings answered and carried by no row = %s, want %s", got, want)
 	}
 }
@@ -1061,11 +1063,37 @@ func TestDecisions_MalformedExceptions_AreDecidedByIssue957(t *testing.T) {
 	}
 }
 
+// TestDecisions_LocalAllowLists_AreReadFromStdiosEnvironmentAlone pins the
+// value source issue 957 gave AUT-006, the one row on it. RQB-004's stdio
+// line is read on stdio alone too, but a per-request bound is declared with
+// no value source. AUT-006's three allow-lists are consulted once a
+// caller-supplied local path is admitted, and a server reached over HTTP
+// refuses every such path first (RQB-008), so INV-017's flag, which it asks
+// of a setting in HTTP mode, has nothing to configure. The row names the
+// variables and no flag, and exists on stdio.
+func TestDecisions_LocalAllowLists_AreReadFromStdiosEnvironmentAlone(t *testing.T) {
+	var stdioOnly []string
+	for _, d := range Decisions() {
+		if d.Source == StdioEnvOnly {
+			stdioOnly = append(stdioOnly, d.ID)
+		}
+	}
+	if want := []string{"AUT-006"}; !slices.Equal(stdioOnly, want) {
+		t.Errorf("the rows only stdio's environment reaches are %v, want %v", stdioOnly, want)
+	}
+	d, _ := Lookup("AUT-006")
+	wantEnvs := []string{"GITLAB_MCP_ALLOWED_UPLOAD_DIRS", "GITLAB_MCP_ALLOWED_DOWNLOAD_DIRS", "GITLAB_MCP_ALLOWED_IMPORT_DIRS"}
+	if !slices.Equal(d.Envs, wantEnvs) || len(d.Flags) != 0 || d.StdioKey != KeyProcess {
+		t.Errorf("AUT-006: envs %v, flags %v, stdio key %s; want the three allow-lists, no flag and the process on stdio",
+			d.Envs, d.Flags, d.StdioKey)
+	}
+}
+
 // TestDecisions_TelemetryToolName_IsARowOfItsOwn pins IDN-014, the row issue
 // 957 gave GITLAB_MCP_TELEMETRY_TOOL_NAME, which no row named: a process-wide
-// rule set by its flag and its variable, read around the configuration
-// package until the next layer moves the read, which F-13 records meanwhile,
-// and decided by nothing else the register holds.
+// rule set by its flag and its variable, read through the configuration
+// package since issue 957 moved the read, so it carries no finding, and
+// decided by nothing else the register holds.
 func TestDecisions_TelemetryToolName_IsARowOfItsOwn(t *testing.T) {
 	d, ok := Lookup("IDN-014")
 	if !ok {
@@ -1076,8 +1104,8 @@ func TestDecisions_TelemetryToolName_IsARowOfItsOwn(t *testing.T) {
 		t.Errorf("IDN-014: source %d, flags %v, envs %v, config %v; want the flag and the variable, carried by no internal/config field",
 			d.Source, d.Flags, d.Envs, d.Config)
 	}
-	if !slices.Equal(d.Findings, []string{"F-13"}) || !slices.Equal(d.Decided, []string{"issue 957"}) {
-		t.Errorf("IDN-014: findings %v, decided %v; want F-13 while the variable is read directly, and issue 957", d.Findings, d.Decided)
+	if len(d.Findings) != 0 || !slices.Equal(d.Decided, []string{"issue 957"}) {
+		t.Errorf("IDN-014: findings %v, decided %v; want none, the variable being read through the configuration package, and issue 957", d.Findings, d.Decided)
 	}
 	if want := []Site{enforce(pkgServer, "dropToolNameFromMetrics")}; !slices.Equal(d.Sites, want) {
 		t.Errorf("IDN-014: sites %v, want %v", d.Sites, want)

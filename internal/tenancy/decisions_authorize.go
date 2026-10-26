@@ -172,7 +172,12 @@ func authorizeDecisions() []Decision {
 			ID: "AUT-006", Question: Authorize, Kind: Rule, Class: ClassP, Disposition: Ruled,
 			Resource: "the local directories a stdio tool may read from or write to",
 			Key:      KeyProcess, StdioKey: KeyProcess,
-			Source: EnvOnly,
+			// Only stdio reads the three lists: each is consulted once a
+			// caller-supplied local path is admitted, and a server reached
+			// over HTTP refuses every such path first (RQB-008), so they have
+			// no flag and INV-017's, which it asks of a setting in HTTP mode,
+			// would configure nothing (issue 957).
+			Source: StdioEnvOnly,
 			Envs: []string{
 				"GITLAB_MCP_ALLOWED_UPLOAD_DIRS", "GITLAB_MCP_ALLOWED_DOWNLOAD_DIRS", "GITLAB_MCP_ALLOWED_IMPORT_DIRS",
 			},
@@ -182,8 +187,7 @@ func authorizeDecisions() []Decision {
 			// that names nothing widens nothing, and the list is read when a
 			// tool resolves a path, after the server has started.
 			Malformed: SkipEntry, MalformedBy: "issue 957",
-			Decided:  []string{"issue 957"},
-			Findings: []string{"F-13"},
+			Decided: []string{"issue 957"},
 			Refusals: []Refusal{
 				{
 					Methods: []string{"tools/call"}, Channel: ToolError, Answer: AskOperator,
@@ -342,8 +346,7 @@ func authorizeDecisions() []Decision {
 			// it (cmd/server:applyEnvBackedFlags), so a flag value that does
 			// not parse reads as off too.
 			Malformed: ReadsAsOff, MalformedBy: "issue 957",
-			Decided:  []string{"ADR-0022", "issue 957"},
-			Findings: []string{"F-13"},
+			Decided: []string{"ADR-0022", "issue 957"},
 			Refusals: []Refusal{
 				{
 					Methods: []string{"tools/call"}, Channel: ToolError,
