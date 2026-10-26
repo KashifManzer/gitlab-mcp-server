@@ -639,7 +639,7 @@ func loadLimitEnv() (limitEnv, error) {
 	values := limitEnv{}
 	var err error
 	if values.maxFileSize, err = UploadMaxFileSizeFromEnv(); err != nil {
-		return limitEnv{}, fmt.Errorf("invalid UPLOAD_MAX_FILE_SIZE value: %w", err)
+		return limitEnv{}, err
 	}
 	if values.revalidateInterval, err = parseDisableableDurationEnv("SESSION_REVALIDATE_INTERVAL", DefaultRevalidateInterval, MaxRevalidateInterval); err != nil {
 		return limitEnv{}, err
@@ -662,11 +662,18 @@ func loadLimitEnv() (limitEnv, error) {
 // refused the start, and the session timeout's refused even the digit its
 // flag reads as off. Anything else, a negative duration included, goes on to
 // that parser and its bound.
+//
+// The value is read trimmed once, so a blank one is unset and keeps the
+// default, which is what HTTP mode's overlay makes of it before it calls this.
+// Stdio's [Load] used to hand the parser the untrimmed value, which refused a
+// blank one as a duration that did not parse, so the same exported line
+// stopped a stdio server and started an HTTP one.
 func parseDisableableDurationEnv(name string, defaultValue, maxValue time.Duration) (time.Duration, error) {
-	if d, err := time.ParseDuration(TrimmedGetenv(name)); err == nil && d == 0 {
+	raw := TrimmedGetenv(name)
+	if d, err := time.ParseDuration(raw); err == nil && d == 0 {
 		return 0, nil
 	}
-	value, err := parseDuration(Getenv(name), defaultValue)
+	value, err := parseDuration(raw, defaultValue)
 	if err != nil {
 		return 0, fmt.Errorf("invalid %s value: %w", name, err)
 	}
@@ -686,13 +693,12 @@ func gitLabURLFromEnv() string {
 
 // validate checks that every setting [Load] reads is present and valid. HTTP
 // mode builds its configuration from flags and validates it there, so nothing
-// here judges a setting only HTTP mode has.
+// here judges a setting only HTTP mode has. The upload limit is not judged
+// here either: its reader, [UploadMaxFileSizeFromEnv], refuses a value above
+// the ceiling for both transports before a Config holds it.
 func (c *Config) validate() error {
 	if err := c.validateURLAndToken(); err != nil {
 		return err
-	}
-	if c.UploadMaxFileSize > MaxFileSize {
-		return fmt.Errorf("UPLOAD_MAX_FILE_SIZE exceeds maximum of 1 TB (got %d bytes)", c.UploadMaxFileSize)
 	}
 	if err := c.validateSurfaces(); err != nil {
 		return err
@@ -861,6 +867,11 @@ func parseMetaParamSchema(s, defaultValue string) (string, error) {
 // parseSize parses a human-friendly size string (e.g. "50MB", "10mb", "2GB",
 // "1024") into bytes. Supported suffixes: KB, MB, GB (case-insensitive).
 // Returns defaultValue when s is empty.
+//
+// A count whose bytes do not fit in an int64 is refused rather than
+// multiplied (issue 1170): the product wrapped, so 17179869185GB came back as
+// 1 GiB, a limit nobody wrote that no ceiling had a reason to refuse, and
+// 8589934592GB as the most negative int64, which toolutil reads as no limit.
 func parseSize(s string, defaultValue int64) (int64, error) {
 	if s == "" {
 		return defaultValue, nil
@@ -890,6 +901,9 @@ func parseSize(s string, defaultValue int64) (int64, error) {
 	}
 	if n <= 0 {
 		return 0, fmt.Errorf("size must be positive, got %q", s)
+	}
+	if n > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("size %q is a byte count that does not fit in 64 bits", s)
 	}
 
 	return n * multiplier, nil
@@ -1071,12 +1085,28 @@ func validatePublicURL(raw string) error {
 }
 
 // UploadMaxFileSizeFromEnv resolves the upload limit from the environment, or
-// returns the default when it is unset.
+// returns the default when it is unset (register row RQB-007).
 //
-// Exported because HTTP mode builds its configuration from flags rather than
-// through Load, and the flag for this setting works by writing the environment
-// variable. Without one function both paths call, the limit applied depended on
-// the transport: raised on stdio, ignored on HTTP.
+// It is the setting's one reader, which [Load] calls for stdio and
+// [LoadHTTPEnvOverlay] for HTTP mode, and --upload-max-file-size works by
+// writing the variable, so the flag is read here too. Without one function
+// both paths call, the limit applied depended on the transport: raised on
+// stdio, ignored on HTTP.
+//
+// It refuses a value that does not parse, one that is not positive and one
+// above [MaxFileSize], naming the variable, and the ceiling is applied here
+// rather than by Load's validation for the same reason: HTTP mode never runs
+// that, and used to warn and use the default or the maximum where stdio
+// refused (issue 1170). A blank value is read as unset, which is what the
+// overlay makes of one before it calls this, so a stdio server no longer
+// refuses the line an HTTP server starts under.
 func UploadMaxFileSizeFromEnv() (int64, error) {
-	return parseSize(Getenv("UPLOAD_MAX_FILE_SIZE"), DefaultMaxFileSize)
+	size, err := parseSize(TrimmedGetenv("UPLOAD_MAX_FILE_SIZE"), DefaultMaxFileSize)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %sUPLOAD_MAX_FILE_SIZE value: %w", EnvPrefix, err)
+	}
+	if size > MaxFileSize {
+		return 0, fmt.Errorf("%sUPLOAD_MAX_FILE_SIZE exceeds maximum of 1 TB (got %d bytes)", EnvPrefix, size)
+	}
+	return size, nil
 }

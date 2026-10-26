@@ -1,6 +1,7 @@
 package tenancy
 
 import (
+	"maps"
 	"reflect"
 	"slices"
 	"strconv"
@@ -1060,6 +1061,76 @@ func TestDecisions_MalformedExceptions_AreDecidedByIssue957(t *testing.T) {
 	}
 	if !slices.Equal(departing, want) {
 		t.Errorf("the rows whose malformed value departs from refusing startup, or that name a decision for one, are %v, want %v", departing, want)
+	}
+}
+
+// TestDecisions_UploadLimit_RefusesAMalformedValueByIssue1170 pins what issue
+// 1170 decided for the upload limit (RQB-007): a value that does not parse,
+// one that is not positive and one above the ceiling refuse startup on both
+// transports, which is every limit's policy (INV-017). HTTP mode used to warn
+// and use the default for the first two and the maximum for the third, and
+// the row stated no policy at all, so nothing held it to either answer. The
+// refusal is enforced by the one reader both transports call and by the
+// overlay HTTP mode reads it through.
+func TestDecisions_UploadLimit_RefusesAMalformedValueByIssue1170(t *testing.T) {
+	d, ok := Lookup("RQB-007")
+	if !ok {
+		t.Fatal("RQB-007 names no row")
+	}
+	if d.Malformed != RefuseStartup || d.MalformedBy != "" || !slices.Equal(d.Decided, []string{"issue 1170"}) {
+		t.Errorf("RQB-007: malformed %d by %q, decided %v; want a refused start, the default policy, decided by issue 1170",
+			d.Malformed, d.MalformedBy, d.Decided)
+	}
+	if !slices.Equal(d.Flags, []string{"--upload-max-file-size"}) || !slices.Equal(d.Envs, []string{"GITLAB_MCP_UPLOAD_MAX_FILE_SIZE"}) {
+		t.Errorf("RQB-007: flags %v, envs %v; want --upload-max-file-size and the variable it writes", d.Flags, d.Envs)
+	}
+	var missing []string
+	for _, site := range []Site{enforce(pkgConfig, "UploadMaxFileSizeFromEnv"), enforce(pkgConfig, "loadOverlayUploadLimit")} {
+		if !slices.Contains(d.Sites, site) {
+			missing = append(missing, site.Name)
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("RQB-007 does not name %v in %s, where a malformed value is refused", missing, pkgConfig)
+	}
+}
+
+// TestDecisions_ASettingOnARowWithNoValueSource_StatesItsMalformedPolicy pins
+// the policy of every row that names a flag or a variable without a value
+// source of its own: the request bounds an operator sets and the escape hatch
+// of the free instance choice. Four of them stated none, which says no
+// operator writes a value, beside the flag or the variable an operator writes
+// it in. The flag package refuses a value of a numeric, duration or boolean
+// flag it cannot parse, and the action timeout's and the upload limit's
+// variables are refused on both transports by the readers the configuration
+// package holds to their bounds, so each of the four refuses startup (issue
+// 1170). The stdio line limit is the fifth, whose value warns and keeps the
+// default by issue 957's decision.
+func TestDecisions_ASettingOnARowWithNoValueSource_StatesItsMalformedPolicy(t *testing.T) {
+	want := map[string]Malformed{
+		"DST-002": RefuseStartup,
+		"RQB-001": RefuseStartup,
+		"RQB-004": WarnKeepDefault,
+		"RQB-005": RefuseStartup,
+		"RQB-007": RefuseStartup,
+	}
+	var named []string
+	for _, d := range Decisions() {
+		if d.Source == SourceNone && (len(d.Flags) > 0 || len(d.Envs) > 0) {
+			named = append(named, d.ID)
+		}
+	}
+	slices.Sort(named)
+	if ids := slices.Sorted(maps.Keys(want)); !slices.Equal(named, ids) {
+		t.Errorf("the rows naming a setting with no value source are %v, want %v", named, ids)
+	}
+	for _, id := range named {
+		t.Run(id, func(t *testing.T) {
+			d, _ := Lookup(id)
+			if d.Malformed != want[id] {
+				t.Errorf("flags %v, envs %v, malformed policy %d; want %d", d.Flags, d.Envs, d.Malformed, want[id])
+			}
+		})
 	}
 }
 
