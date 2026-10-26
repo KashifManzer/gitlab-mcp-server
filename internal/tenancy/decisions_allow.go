@@ -67,8 +67,14 @@ func allowDecisions() []Decision {
 			Envs: []string{"GITLAB_MCP_RATE_LIMIT_RPS", "GITLAB_MCP_RATE_LIMIT_BURST"},
 			// A zero rate switches the bucket off. A zero burst beside a positive
 			// rate is refused at startup by both validators rather than meaning
-			// off, the INV-015 departure F-34 records (issue 958).
+			// off, which issue 958 decided: the rate is the setting that says
+			// off, and a bucket of no size beside a rate would refuse every
+			// call (INV-015), so the pair contradicts itself and is refused
+			// rather than guessed at. The discovery documents' bucket reads
+			// either zero as off (RTC-008, issue 1053); this one keeps the
+			// refusal it had, as issue 958 decided.
 			Config: []string{"RateLimitRPS", "RateLimitBurst"}, Malformed: RefuseStartup, Zero: ZeroOff,
+			SettingZeros: []SettingZero{{Config: "RateLimitBurst", Zero: ZeroRefused}}, ZeroBy: "issue 958",
 			// This row is how the server meets MCP's one mandatory limit,
 			// "Rate limit tool invocations", and issue 959 decided where it
 			// stands on it (F-19): on by default in HTTP mode, off by default
@@ -82,8 +88,8 @@ func allowDecisions() []Decision {
 			// (toolutil.LabelForRevision), which answers F-20 as part of
 			// issue 961's work while that issue stays open for F-21, F-22
 			// and F-24.
-			Decided:  []string{"issue 959", "issue 961"},
-			Findings: []string{"F-01", "F-02", "F-21", "F-32", "F-34"},
+			Decided:  []string{"issue 959", "issue 961", "issue 958"},
+			Findings: []string{"F-01", "F-02", "F-21", "F-32"},
 			Refusals: []Refusal{
 				{
 					Methods: []string{"tools/call"}, Channel: ToolError, Prefix: "rate limit exceeded for ",
@@ -193,6 +199,8 @@ func allowDecisions() []Decision {
 			ReasonAt: reasonAt(pkgSubscriptions, "ErrRateLimited"),
 			Values:   []string{"WatchRateLimitPause", "WatchRateLimitPauseMax", "WatchRateLimitJitter"},
 			Source:   Constant, Zero: ZeroNotApplicable,
+			Fixed: "the pause answers a 429 GitLab sent, so it is sized against GitLab's limit and not the " +
+				"deployment's: a shorter one would only spend the user's budget faster while GitLab refuses it",
 			// GitLab answered the first read 429, so the refusal says the
 			// caller made too many requests and carries 429's code (issue 956).
 			Decided:  []string{"issue 956"},
@@ -225,7 +233,11 @@ func allowDecisions() []Decision {
 			ReasonAt: reasonAt(pkgGitLab, "maxRetries"),
 			Values:   []string{"UpstreamRetries", "UpstreamRetryWaitMax", "UpstreamRetryStep"},
 			Source:   Constant, Zero: ZeroNotApplicable,
-			Findings: []string{"F-16", "F-32"},
+			Fixed: "they bound what one failed request costs an instance that is already struggling, and the longest " +
+				"a tool call waits upstream, which nothing else bounds; more retries would multiply every caller " +
+				"against that instance, and the step is client-go's own floor",
+			Decided:  []string{"issue 958"},
+			Findings: []string{"F-32"},
 			Sites: []Site{
 				alias(pkgGitLab, "maxRetries", "UpstreamRetries"),
 				alias(pkgGitLab, "maxRetryBackoff", "UpstreamRetryWaitMax"),
@@ -277,6 +289,9 @@ func allowDecisions() []Decision {
 			// Which method draws on it is MeterFor's answer, as for RTC-003.
 			Functions: []string{"MeterFor"},
 			Source:    Constant, Zero: ZeroNotApplicable, OffWith: "RTC-003", OffWithBy: "issue 951",
+			Fixed: "the process partner of RTC-003, sized in tools so that at the defaults it never refuses one " +
+				"credential what its own bucket allows; an operator who could raise it could undo the bound on the " +
+				"processor every credential shares (INV-004), and switching rate limiting off switches it off",
 			AtCapacity: RefuseNewcomer,
 			Decided:    []string{"issue 951"},
 			Refusals: []Refusal{
@@ -448,6 +463,8 @@ func allowDecisions() []Decision {
 			Reason:   "so the process-wide one is what bounds the process",
 			ReasonAt: reasonAt(pkgServer, "maxListenStreamsPerProcess"),
 			Values:   []string{"ListenStreamsPerProcess"},
+			Fixed: "the process partner of HLD-001, whose number multiplies with every credential a caller holds, " +
+				"so only this one bounds the process, and an operator who could raise it could undo the bound (INV-004)",
 			Decided:  []string{"issue 540", "issue 956"},
 			Findings: []string{"F-21"},
 			Refusals: []Refusal{
@@ -476,12 +493,24 @@ func allowDecisions() []Decision {
 			StatedUnit: KeyTenant, ReasonUnit: KeyTenant,
 			Reason:   "ten watchers at a five-second interval would consume such a user's entire budget",
 			ReasonAt: reasonAt(pkgSubscriptions, "DefaultMaxWatchers"),
-			Values:   []string{"WatchersPerCredential"}, Source: Constant, Zero: ZeroSelectsDefault,
+			Values:   []string{"WatchersPerCredential"}, Source: OptionOnly, Zero: ZeroSelectsDefault,
+			Fixed: "it is sized to GitLab's figure, the budget a throttled self-managed instance gives one user, " +
+				"rather than to anything a deployment provisions, and the process's own bound beside it is HLD-004's; " +
+				"only the tests set the manager's Options field, and no operator reaches it",
+			// No operator sets it: a zero reaches it only as the Go zero of an
+			// Options field the code left unset, which selects the default.
+			// Issue 958 lists that zero among those that do not mean off and
+			// holds each to an exception stated with its reason, and this one
+			// is stated rather than read as off: off would leave one
+			// credential's watchers bounded by nothing but the process's
+			// (HLD-004), spending a GitLab user's budget past what this row's
+			// reason sizes it to.
+			ZeroBy:     "issue 958",
 			AtCapacity: ReclaimOwnThenRefuse,
 			// The refusal says the caller holds too many and carries 429's
 			// code (issue 956).
-			Decided:  []string{"issue 956"},
-			Findings: []string{"F-05", "F-21", "F-34"},
+			Decided:  []string{"issue 956", "issue 958"},
+			Findings: []string{"F-05", "F-21"},
 			// Reclaiming ends the longest-demoted watch of the same manager,
 			// whose listens are told so.
 			Refusals: []Refusal{
@@ -515,6 +544,9 @@ func allowDecisions() []Decision {
 			Reason:   "only this one bounds the process",
 			ReasonAt: reasonAt(pkgServer, "maxWatchersPerProcess"),
 			Values:   []string{"WatchersPerProcess"},
+			Fixed: "the process partner of HLD-003, whose number multiplies with every credential a caller holds, " +
+				"so only this one bounds the process, and an operator who could raise it could undo the bound " +
+				"(INV-004); the lever an operator has is --max-http-clients",
 			Decided:  []string{"issue 561", "issue 956"},
 			Findings: []string{"F-21"},
 			Refusals: []Refusal{
@@ -538,7 +570,15 @@ func allowDecisions() []Decision {
 			Values: []string{
 				"WatchLease", "WatchSlowInterval", "WatchMaxLifetime", "WatchBaseInterval", "WatchMinInterval",
 			},
-			Source: Constant, Zero: ZeroNotApplicable,
+			// The values reach the manager through Options fields that select
+			// their default for a Go zero, as HLD-003's ceiling does. Of the
+			// manager's options, issue 958 lists only that ceiling's zero among
+			// those that do not mean off, so this row reads its zeros as no
+			// operator's.
+			Source: OptionOnly, Zero: ZeroNotApplicable,
+			Fixed: "the polling cadence comes from GitLab's rate limits rather than from the deployment, and the " +
+				"lease and the lifetime bound what a watch nobody renews costs (ADR-0015), so none is a figure a " +
+				"deployment would choose; only the tests set the manager's Options fields, and no operator reaches them",
 			Decided: []string{"ADR-0015"},
 			Refusals: []Refusal{
 				listenEnd("lifetime_reached", StartOver, refuse(pkgServer, "endOfLifetime")),
@@ -794,15 +834,22 @@ func allowDecisions() []Decision {
 			},
 		},
 		{
+			// A zero is refused at startup by the flag and the variable
+			// alike, which issue 958 decided rather than reading it as off:
+			// the pool's entries are keyed on credentials a caller mints, so a
+			// pool with no bound would grow with every token presented
+			// (INV-010), and a pool that kept none would have no entry to
+			// serve a request on (INV-015). Neither is a deployment an operator
+			// asking for zero could want.
 			ID: "POL-001", Question: Allow, Kind: Ceiling, Class: ClassP, Disposition: Valued,
 			Resource: "pool entries",
 			Key:      KeyProcess, StdioKey: KeyNone, Table: true,
 			Values: []string{"PoolSize", "PoolSizeMax"},
 			Source: Configurable, Flags: []string{"--max-http-clients"}, Envs: []string{"GITLAB_MCP_MAX_HTTP_CLIENTS"},
-			Config: []string{"MaxHTTPClients"}, Malformed: RefuseStartup, Zero: ZeroRefused,
+			Config: []string{"MaxHTTPClients"}, Malformed: RefuseStartup, Zero: ZeroRefused, ZeroBy: "issue 958",
 			AtCapacity: EvictAcrossKeys,
-			Decided:    []string{"ADR-0020", "issue 561"},
-			Findings:   []string{"F-16", "F-34"},
+			Decided:    []string{"ADR-0020", "issue 561", "issue 958"},
+			Findings:   []string{"F-16"},
 			// The pool keeps its own fallback, stated a second time (issue
 			// 958); it is held equal rather than aliased.
 			Sites: []Site{
@@ -888,6 +935,8 @@ func allowDecisions() []Decision {
 			Resource: "how long signed multi-round-trip request state stays usable",
 			Key:      KeyRequest, StdioKey: KeyRequest,
 			Values: []string{"RequestStateTTL"}, Source: Constant, Zero: ZeroNotApplicable,
+			Fixed: "it bounds how long signed request state can be replayed, against how long a person takes to " +
+				"answer a prompt, and neither depends on the deployment",
 			Findings: []string{"F-12"},
 			Sites: []Site{
 				alias(pkgElicitation, "stateTTL", "RequestStateTTL"),

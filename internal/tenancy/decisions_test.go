@@ -797,7 +797,8 @@ var findingsOfNoRow = []string{"F-18", "F-23", "F-24", "F-27"}
 // /64 with a /48 aggregate and a named unix-socket key, and stated the
 // distinct-credential budget's reason as GitLab 19.5 answered it, and F-35 did
 // when issue 982 bounded the transport-source budget's record of charged pairs
-// per source and to the sources its limiter recorded.
+// per source and to the sources its limiter recorded, and F-11 did when issue
+// 958 stated the rule for what a row does at capacity.
 func TestDecisions_AFindingNoRowCarries_IsAnsweredByItsIssue(t *testing.T) {
 	carried := map[string]bool{}
 	decided := map[string]bool{}
@@ -825,8 +826,140 @@ func TestDecisions_AFindingNoRowCarries_IsAnsweredByItsIssue(t *testing.T) {
 			}
 		})
 	}
-	if got, want := strings.Join(answered, ","), "F-03,F-07,F-08,F-09,F-10,F-14,F-17,F-19,F-20,F-25,F-29,F-30,F-31,F-33,F-35"; got != want {
+	if got, want := strings.Join(answered, ","), "F-03,F-07,F-08,F-09,F-10,F-11,F-14,F-17,F-19,F-20,F-25,F-29,F-30,F-31,F-33,F-35"; got != want {
 		t.Errorf("findings answered and carried by no row = %s, want %s", got, want)
+	}
+}
+
+// TestDecisions_ZeroExceptions_AreDecidedByIssue958 pins the zeros issue 958
+// states as exceptions rather than switching them off, each recorded through
+// ZeroBy in place of F-34: the pool size's zero refused at startup
+// (POL-001), the tool-call bucket's burst refused beside a positive rate
+// while a zero rate still switches the bucket off (RTC-001), and the
+// credential age ceiling and the watcher ceiling, two Go options whose zero
+// selects the default (ADM-008, HLD-003). The rows that carry F-34 still are
+// the four whose zero a change of code answers next: the OAuth cache TTL's
+// flag, which selects the default where its variable refuses, the failure
+// window that switches the distinct-credential budget off with it, and the
+// session timeout's variable, which refuses the zero its flag reads as off.
+func TestDecisions_ZeroExceptions_AreDecidedByIssue958(t *testing.T) {
+	for _, tc := range []struct {
+		id       string
+		zero     Zero
+		settings []SettingZero
+	}{
+		{"POL-001", ZeroRefused, nil},
+		{"RTC-001", ZeroOff, []SettingZero{{Config: "RateLimitBurst", Zero: ZeroRefused}}},
+		{"ADM-008", ZeroSelectsDefault, nil},
+		{"HLD-003", ZeroSelectsDefault, nil},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			d, _ := Lookup(tc.id)
+			if d.Zero != tc.zero || !slices.Equal(d.SettingZeros, tc.settings) {
+				t.Errorf("%s: zero %d, settings %v; want %d and %v", tc.id, d.Zero, d.SettingZeros, tc.zero, tc.settings)
+			}
+			if d.ZeroBy != "issue 958" || !slices.Contains(d.Decided, "issue 958") || d.Carries("F-34") {
+				t.Errorf("%s: zero by %q, decided %v, findings %v; want issue 958 recorded as the decision and no F-34",
+					tc.id, d.ZeroBy, d.Decided, d.Findings)
+			}
+		})
+	}
+	var carrying []string
+	for _, d := range Decisions() {
+		if d.Carries("F-34") {
+			carrying = append(carrying, d.ID)
+		}
+	}
+	if want := []string{"ADM-005", "AUB-001", "AUB-003", "END-005"}; !slices.Equal(carrying, want) {
+		t.Errorf("F-34 is carried by %v, want %v", carrying, want)
+	}
+}
+
+// TestDecisions_CapacityRule_AnswersF11UnderIssue958 pins the rows F-11 was
+// carried by, the two whose behavior at capacity no rule judged before issue
+// 958 stated one: the rejected-token cache evicts its oldest record, which a
+// table kept before admission may, and the authentication tables stop
+// counting a new key, which their silent refusals say. Each records the
+// issue, no row carries F-11 any longer, and F-11 stays in the register's
+// list, filed as issue 958's.
+func TestDecisions_CapacityRule_AnswersF11UnderIssue958(t *testing.T) {
+	for _, tc := range []struct {
+		id       string
+		capacity Capacity
+	}{
+		{"ADM-006", EvictOldest},
+		{"AUB-004", StopCounting},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			d, _ := Lookup(tc.id)
+			if d.AtCapacity != tc.capacity || !slices.Contains(d.Decided, "issue 958") || d.Carries("F-11") {
+				t.Errorf("%s: at capacity %d, decided %v, findings %v; want %d, issue 958 recorded and no F-11",
+					tc.id, d.AtCapacity, d.Decided, d.Findings, tc.capacity)
+			}
+		})
+	}
+	for _, d := range Decisions() {
+		if d.Carries("F-11") {
+			t.Errorf("%s carries F-11, which the capacity rule answers", d.ID)
+		}
+	}
+	if FindingIssue("F-11") != 958 {
+		t.Errorf("F-11 is filed as issue %d, want it kept as issue 958's", FindingIssue("F-11"))
+	}
+}
+
+// TestDecisions_UnreasonedBounds_StateTheirReasonUnderIssue958 pins the five
+// rows F-16 recorded as bounds no setting reaches with no reason stated, which
+// issue 958 answered by stating one: the rejected-token cache, the credential
+// age ceiling, the unexplained-401 interval, the probe bound and the upstream
+// retries. Each records the issue and carries F-16 no longer. F-16 stays on
+// the four whose default or fallback is written in two places, which a later
+// change of code answers: the revalidation interval, the pool size and the
+// idle timeout, which the pool states a second time, and the transport-source
+// budget's window fallback, whose 500 states its reason here too.
+func TestDecisions_UnreasonedBounds_StateTheirReasonUnderIssue958(t *testing.T) {
+	for _, id := range []string{"ADM-006", "ADM-008", "ADM-010", "POL-006", "RTC-006"} {
+		t.Run(id, func(t *testing.T) {
+			d, _ := Lookup(id)
+			if d.Fixed == "" || !slices.Contains(d.Decided, "issue 958") || d.Carries("F-16") {
+				t.Errorf("%s: fixed %q, decided %v, findings %v; want a reason, issue 958 recorded and no F-16",
+					id, d.Fixed, d.Decided, d.Findings)
+			}
+		})
+	}
+	if d, _ := Lookup("AUB-002"); d.Fixed == "" {
+		t.Error("AUB-002 states no reason its 500 is fixed")
+	}
+	var carrying []string
+	for _, d := range Decisions() {
+		if d.Carries("F-16") {
+			carrying = append(carrying, d.ID)
+		}
+	}
+	if want := []string{"ADM-009", "AUB-002", "POL-001", "POL-004"}; !slices.Equal(carrying, want) {
+		t.Errorf("F-16 is carried by %v, want %v", carrying, want)
+	}
+}
+
+// TestDecisions_GoOptions_AreTheValuesOnlyTestsSet pins the rows whose value
+// only a Go option reaches, which no production code sets and no operator can:
+// the pool's credential age option (ADM-008), and the watcher manager's
+// Options fields, its per-credential ceiling (HLD-003) and its lease, cadence
+// and lifetime (HLD-007). Each says why its value is fixed, as a constant
+// does, and no other row is declared a Go option's.
+func TestDecisions_GoOptions_AreTheValuesOnlyTestsSet(t *testing.T) {
+	var options []string
+	for _, d := range Decisions() {
+		if d.Source != OptionOnly {
+			continue
+		}
+		options = append(options, d.ID)
+		if d.Fixed == "" {
+			t.Errorf("%s: a Go option's value with no reason it is fixed", d.ID)
+		}
+	}
+	if want := []string{"ADM-008", "HLD-003", "HLD-007"}; !slices.Equal(options, want) {
+		t.Errorf("the rows only a Go option reaches are %v, want %v", options, want)
 	}
 }
 
