@@ -111,7 +111,7 @@ func allowDecisions() []Decision {
 				enforce(pkgToolutil, "NewRateLimiter"),
 				enforce(pkgToolutil, "attachRateLimitFunc"),
 				enforce(pkgToolutil, "ValidateRateLimit"),
-				enforce(pkgConfig, "Config.validateDurationsAndRates"),
+				enforce(pkgConfig, "Config.validateRates"),
 				enforce(pkgServer, "serverShell.newCredentialState"),
 				refuse(pkgToolutil, "RateLimitRefusalPrefix"),
 				refuse(pkgToolutil, "rateLimitRetrySuffix"),
@@ -900,8 +900,9 @@ func allowDecisions() []Decision {
 			Config: []string{"PoolIdleTimeout"}, Malformed: RefuseStartup, Zero: ZeroOff,
 			// The pool's own fallback aliases the value as the configuration's
 			// default does, where it used to state it a second time (issue 958,
-			// answering F-16 here).
-			Decided: []string{"issue 958"},
+			// answering F-16 here). The flag refuses a negative value as the
+			// variable does, where it used to read one as off (issue 1171).
+			Decided: []string{"issue 958", "issue 1171"},
 			Refusals: []Refusal{
 				listenEnd("credential_reset", StartOver, refuse(pkgServer, "endOfCredentialReset")),
 			},
@@ -912,6 +913,7 @@ func allowDecisions() []Decision {
 				alias(pkgPool, "idleSweepMinInterval", "PoolIdleSweepFloor"),
 				alias(pkgPool, "DefaultIdleTimeout", "PoolIdleTimeout"),
 				enforce(pkgPool, "ServerPool.StartIdleEviction"),
+				enforce(pkgServer, "validateHTTPDurationConfig"),
 			},
 		},
 		{

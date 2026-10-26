@@ -1648,6 +1648,113 @@ func TestPrintHelp_RevalidateInterval_DoesNotPromiseThatZeroStopsReverification(
 	}
 }
 
+// The headers of the help's two environment blocks, and the heading after the
+// second, which [helpBlock] cuts the help at.
+const (
+	helpStdioEnvironmentHeader = "ENVIRONMENT VARIABLES (stdio mode)\n"
+	helpHTTPEnvironmentHeader  = "ENVIRONMENT VARIABLES (HTTP mode)\n"
+	helpExamplesHeader         = "JSON CONFIGURATION EXAMPLES\n"
+)
+
+// helpBlock returns the part of help between the line start and the line end,
+// or the empty string when either is missing.
+func helpBlock(help, start, end string) string {
+	_, rest, found := strings.Cut(help, start)
+	if !found {
+		return ""
+	}
+	block, _, found := strings.Cut(rest, end)
+	if !found {
+		return ""
+	}
+	return block
+}
+
+// TestPrintHelp_HTTPEnvironmentBlock_ListsTheSettingsStdioDoesNotRead holds
+// the split of the help's two environment blocks to the code: the HTTP block,
+// whose variables it says have no stdio equivalent, documents exactly the
+// settings only HTTP mode has ([config.HTTPOnlyEnvUses] with every setting
+// this project defines set), and the stdio block documents none of them.
+//
+// Nothing held the split, so a setting stdio began reading kept its entry
+// under "no stdio equivalent": GITLAB_MCP_ACTION_TIMEOUT, which bounds an
+// action on both transports, sat there marked as both transports', and
+// GITLAB_MCP_SESSION_REVALIDATE_INTERVAL stayed there after issue 1171 gave
+// stdio the setting. A setting HTTP mode gains fails here until it has an
+// entry in the HTTP block.
+//
+// Not parallel: it sets environment variables.
+func TestPrintHelp_HTTPEnvironmentBlock_ListsTheSettingsStdioDoesNotRead(t *testing.T) {
+	stdout := captureStdout(t)
+	printHelp()
+	help := stdout()
+
+	for _, name := range config.PrefixedEnvNames() {
+		t.Setenv(config.EnvPrefix+name, "set")
+	}
+	httpOnly := config.HTTPOnlyEnvUses()
+
+	httpBlock := helpVariableNames(helpBlock(help, helpHTTPEnvironmentHeader, helpExamplesHeader))
+	if got := slices.Sorted(slices.Values(httpBlock)); !slices.Equal(got, httpOnly) {
+		t.Errorf("the HTTP environment block documents %v, want the settings only HTTP mode has, %v", got, httpOnly)
+	}
+	for _, name := range helpVariableNames(helpBlock(help, helpStdioEnvironmentHeader, helpHTTPEnvironmentHeader)) {
+		if slices.Contains(httpOnly, name) {
+			t.Errorf("the stdio environment block documents %s, a setting only HTTP mode has", name)
+		}
+	}
+}
+
+// helpVariableNames returns the variables block documents, the first word of
+// each row that names one of this project's settings.
+func helpVariableNames(block string) []string {
+	var names []string
+	for line := range strings.SplitSeq(block, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && strings.HasPrefix(fields[0], config.EnvPrefix) && helpIndent(line) == 2 {
+			names = append(names, fields[0])
+		}
+	}
+	return names
+}
+
+// TestPrintHelp_RevalidateIntervalVariable_SaysWhatStdioReadsItFor holds the
+// help's entry of GITLAB_MCP_SESSION_REVALIDATE_INTERVAL to both of its
+// readers since issue 1171 gave stdio the setting: it sits in the stdio block
+// marked as both transports' and names the stdio re-read, and the default and
+// the pool's credential ceiling it prints are the constants the two readers
+// use.
+//
+// It stayed in the HTTP block, under "The variables below have no stdio
+// equivalent", after stdio began re-reading a fine-grained token's grant at it,
+// so -h told a stdio operator the variable did nothing there.
+func TestPrintHelp_RevalidateIntervalVariable_SaysWhatStdioReadsItFor(t *testing.T) {
+	stdout := captureStdout(t)
+	printHelp()
+	help := stdout()
+
+	const name = "GITLAB_MCP_SESSION_REVALIDATE_INTERVAL"
+	if entry := helpEntry(helpBlock(help, helpHTTPEnvironmentHeader, helpExamplesHeader), name); entry != "" {
+		t.Errorf("the HTTP block, whose variables have no stdio equivalent, documents %s: %q", name, entry)
+	}
+	entry := helpEntry(helpBlock(help, helpStdioEnvironmentHeader, helpHTTPEnvironmentHeader), name)
+	if entry == "" {
+		t.Fatalf("the stdio environment block does not document %s", name)
+	}
+	for _, want := range []string{
+		"Both transports",
+		"a stdio process re-reads its fine-grained token's grant",
+		fmt.Sprintf("(default %s; 0 stops the periodic", config.DefaultRevalidateInterval),
+		fmt.Sprintf("older than %s is still rebuilt", serverpool.DefaultMaxCredentialAge),
+	} {
+		t.Run(want, func(t *testing.T) {
+			if !strings.Contains(entry, want) {
+				t.Errorf("help entry %s = %q, want it to carry %q", name, entry, want)
+			}
+		})
+	}
+}
+
 // TestPrintHelp_EachDefaultIsPrintedInItsOwnEntry holds every value the help
 // formats from a constant to the entry that describes it. They reach one
 // format string as a long list of arguments in which two of the same type can
@@ -12843,6 +12950,62 @@ func TestValidateHTTPDurationConfig_RefusesWhatWouldNeverExpire(t *testing.T) {
 				t.Errorf("error = %v, want it to name %s", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidateHTTPDurationConfig_ANegativeDuration_IsRefused pins the three
+// duration flags whose zero turns their setting off to what their variables
+// accept (issue 1171, Q16 of its triage): zero and anything up to the maximum
+// start, and a negative value refuses the start, naming the flag and what zero
+// means. A negative --session-timeout, --revalidate-interval or
+// --pool-idle-timeout used to start a server that read it as off, the session
+// timeout without the warning its zero writes, while the variable of each
+// refused the same value. The upper bound is held beside it, the session
+// timeout's for the first time.
+func TestValidateHTTPDurationConfig_ANegativeDuration_IsRefused(t *testing.T) {
+	t.Parallel()
+
+	settings := []struct {
+		flag    string
+		max     time.Duration
+		setting func(*config.Config) *time.Duration
+	}{
+		{"--session-timeout", config.MaxSessionTimeout, func(c *config.Config) *time.Duration { return &c.SessionTimeout }},
+		{"--revalidate-interval", config.MaxRevalidateInterval, func(c *config.Config) *time.Duration { return &c.RevalidateInterval }},
+		{"--pool-idle-timeout", config.MaxPoolIdleTimeout, func(c *config.Config) *time.Duration { return &c.PoolIdleTimeout }},
+	}
+	values := []struct {
+		name    string
+		value   func(maxValue time.Duration) time.Duration
+		wantErr string
+	}{
+		{name: "zero", value: func(time.Duration) time.Duration { return 0 }},
+		{name: "at its maximum", value: func(maxValue time.Duration) time.Duration { return maxValue }},
+		{name: "a nanosecond below zero", value: func(time.Duration) time.Duration { return -time.Nanosecond }, wantErr: " must not be negative, got -1ns (0 turns it off)"},
+		{name: "a minute below zero", value: func(time.Duration) time.Duration { return -time.Minute }, wantErr: " must not be negative, got -1m0s (0 turns it off)"},
+		{name: "past its maximum", value: func(maxValue time.Duration) time.Duration { return maxValue + time.Nanosecond }, wantErr: " exceeds maximum of "},
+	}
+	for _, s := range settings {
+		for _, v := range values {
+			t.Run(s.flag+"/"+v.name, func(t *testing.T) {
+				t.Parallel()
+
+				cfg := &config.Config{}
+				*s.setting(cfg) = v.value(s.max)
+
+				err := validateHTTPDurationConfig(cfg)
+
+				if v.wantErr == "" {
+					if err != nil {
+						t.Errorf("validateHTTPDurationConfig = %v, want nil", err)
+					}
+					return
+				}
+				if err == nil || !strings.HasPrefix(err.Error(), s.flag+" ") || !strings.Contains(err.Error(), v.wantErr) {
+					t.Errorf("error = %v, want it to name %s and read %q", err, s.flag, v.wantErr)
+				}
+			})
+		}
 	}
 }
 
