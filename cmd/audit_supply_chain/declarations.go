@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // declarationsFile is where a declaration table finding sends its reader.
@@ -124,6 +125,45 @@ var declaredGuardedMatches = map[string]guardedMatch{
 		input:    "cosign-release",
 		value:    "main",
 		reason:   "the step's script runs go install github.com/sigstore/cosign/v3/cmd/cosign@main only inside if [[ \"${input_cosign_release}\" == \"main\" ]], which builds cosign from its main branch and exits; any other release is a bootstrap binary held to a SHA-256 the action commits, which then verifies the requested release against a public key whose SHA-256 the action commits too. Every step here names an exact cosign-release",
+	},
+}
+
+// categoryWriteFreeJob is the one reason an image that a pinned container
+// action names by a tag may be accepted: every job that runs it is held by the
+// audit to a token that writes nothing but its OIDC identity, to cache-mode
+// none and to reading no secret, so whatever a push to the tag puts there runs
+// with no write of this repository, no entry of the Actions cache to save or
+// restore, and no secret. The cache is held apart because permissions: does
+// not reach it: the runner hands every container action the job's runtime
+// token, which on a push or a schedule saves to the cache that later jobs on
+// main and under a release tag restore. The identity the job can still mint is
+// one the audit cannot follow to what accepts it, so the reason says why the
+// image is not named by its digest and which of the verifiers this repository
+// relies on accept that identity.
+const categoryWriteFreeJob = "write-free-job"
+
+// imageCategories are the reasons a declaration of a tag-named image may give,
+// kept apart from [categories] because each table's reasons answer a
+// different question.
+var imageCategories = map[string]string{
+	categoryWriteFreeJob: "every job that runs the image holds a token that writes nothing but its OIDC identity, runs with cache-mode none and reads no secret, which the audit checks at each of them; the reason says why the image is not named by its digest and which verifiers accept the identity the job can mint",
+}
+
+// declaredTaggedImages are the images that pinned container actions run by a
+// tag and that this repository accepts, keyed by the action without its
+// commit, one space, and the docker:// image without its tag or digest.
+//
+// The key leaves the commit and the tag out on purpose: a bump of the action
+// that moves its tag keeps the declaration, and the record shows the reviewer
+// of that bump the tag the new commit names, while a bump that moves the image
+// to another repository leaves the entry excusing nothing. An action of this
+// repository is never declared, since its image can be pinned where it is
+// written. An entry that excuses nothing is reported, on the terms every
+// declaration table in this repository is held to.
+var declaredTaggedImages = map[string]declaration{
+	"ossf/scorecard-action docker://ghcr.io/ossf/scorecard-action": {
+		category: categoryWriteFreeJob,
+		reason:   "scorecard.yml publishes its results to the OpenSSF results API, which takes a run's results only when every step of the Scorecard job is one it approves, and a step naming the image by its digest is not: the API's verify_workflow.go reads a step's name as everything before its @, so docker://ghcr.io/ossf/scorecard-action:v2.5.0@sha256:... is an unapproved step and leaves the API finding no Scorecard job at all, and it takes the image directly only by a tag, which pins nothing the action's commit does not. This action pinned by its commit is therefore the one form that publishes; it is also the form the action's README documents and the one Dependabot proposes a bump of, after the github-actions cooldown and with the tag the new commit names in the record's diff, while it does not update a docker:// step. The analysis job holds contents: read and id-token: write, runs with cache-mode: none, reads no secret and runs on pushes to main and on the weekly schedule only. The identity it can mint names scorecard.yml at refs/heads/main: npm, PyPI and nuget.org refuse it, since each trusted publisher names release.yml and the release environment, and so does every signature or attestation check this repository runs or documents, each of which names release.yml, every one it runs at a release tag; the MCP Registry accepts it, since its GitHub OIDC login grants io.github.jmrplens/* to a token from any workflow of any repository of the owner, which nothing on this side can narrow. The SARIF it writes reaches code scanning through a job of its own, which runs no code of the image and refuses a SARIF whose runs are not Scorecard's supply-chain category before upload-sarif reads it",
 	},
 }
 
@@ -334,9 +374,10 @@ func (k guardKey) String() string {
 	return fmt.Sprintf("%s step %d %s", k.action, k.step, k.rule)
 }
 
-// guardedAction is the spelling of an action a guarded key names: an owner
-// and a repository, and a directory inside it when the action is not at its
-// root, with no commit and nothing of this repository's own.
+// guardedAction is the spelling of an action a key of [declaredGuardedMatches]
+// or [declaredTaggedImages] names: an owner and a repository, and a directory
+// inside it when the action is not at its root, with no commit and nothing of
+// this repository's own.
 var guardedAction = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?$`)
 
 // parseGuardKey reads a key of [declaredGuardedMatches], and reports false for
@@ -369,11 +410,56 @@ func sortedGuardKeys(guarded map[string]guardedMatch) []string {
 // tableProblems holds every table to what this audit read, once every
 // workflow has been read: the secret table first, then the declarations of
 // run-time code, then those of unjudged actions, then those of guarded
-// matches.
+// matches, then those of tag-named images.
 func (a *supplyChainAudit) tableProblems() []string {
 	problems := append(a.secretProblems(), a.declarationProblems()...)
 	problems = append(problems, a.unjudgedDeclarationProblems()...)
-	return append(problems, a.guardedDeclarationProblems()...)
+	problems = append(problems, a.guardedDeclarationProblems()...)
+	return append(problems, a.taggedImageDeclarationProblems()...)
+}
+
+// taggedImageDeclarationProblems names every declaration of a tag-named image
+// that cannot be read as written, gives a category this command does not
+// define for one or no reason, or excused nothing, in a stable order.
+func (a *supplyChainAudit) taggedImageDeclarationProblems() []string {
+	keys := make([]string, 0, len(a.taggedImages))
+	for key := range a.taggedImages {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var problems []string
+	for _, key := range keys {
+		action, image, separated := strings.Cut(key, " ")
+		if !separated || !guardedAction.MatchString(action) || !isUntaggedImage(image) {
+			problems = append(problems, fmt.Sprintf(
+				"%s: %q is not an action without its commit and a docker:// image without its tag or digest, separated by one space",
+				declarationsFile, key,
+			))
+			continue
+		}
+		entry := a.taggedImages[key]
+		if imageCategories[entry.category] == "" {
+			problems = append(problems, fmt.Sprintf("%s: %q: the category %q is not one this command defines for a tag-named image",
+				declarationsFile, key, entry.category))
+		}
+		if strings.TrimSpace(entry.reason) == "" {
+			problems = append(problems, fmt.Sprintf("%s: %q gives no reason", declarationsFile, key))
+		}
+		if !a.taggedImagesUsed[key] {
+			problems = append(problems, fmt.Sprintf(
+				"%s: %q excuses nothing: no step runs that action naming that image by a tag", declarationsFile, key,
+			))
+		}
+	}
+	return problems
+}
+
+// isUntaggedImage reports whether image is spelled as a declaration of a
+// tag-named image names one: a docker:// reference with a name and no tag, no
+// digest and no white space.
+func isUntaggedImage(image string) bool {
+	return untaggedImage(image) == image && strings.HasPrefix(image, dockerScheme) &&
+		len(image) > len(dockerScheme) && !strings.ContainsFunc(image, unicode.IsSpace)
 }
 
 // guardedDeclarationProblems names every declaration of a guarded match that
