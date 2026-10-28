@@ -45,6 +45,7 @@ security:
       - any-glob-to-any-file:
           - SECURITY.md
           - PRIVACY.md
+          - docs/development/security-review-*.md
           - .gitguardian.yaml
           - .github/workflows/codeql.yml
           - .github/workflows/scorecard.yml
@@ -54,6 +55,7 @@ security:
           - cmd/audit_supply_chain/**
           - cmd/audit_image_vulns/**
           - cmd/reproduce_release/**
+          - cmd/audit_site_headers/**
           - cmd/server/authgate*.go
           - cmd/server/bearerguard*.go
           - internal/oauth/**
