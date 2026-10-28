@@ -605,6 +605,73 @@ const (
 	routeGroupVariableDelete = "DELETE " + routeGroupVariable
 )
 
+// The assignee row of doc/api/issues.md, as GitLab's page carries it on master
+// on 2026-10-27, and the route it documents.
+const (
+	rowIssueAssigneeIDs = "| `assignee_ids` | integer array | No | The IDs of the users to assign the issue to. Premium and Ultimate only.|"
+	routeIssueCreate    = "POST /projects/:id/issues"
+)
+
+// The approver row of doc/api/merge_requests.md, which the page writes the
+// same way for its three lists, as GitLab's page carries it on master on
+// 2026-10-27, and the routes it documents.
+const (
+	rowMergeRequestApproverIDs = "| `approver_ids[]` | integer array | No | Returns merge requests which have all users with the specified `id` as eligible approvers according to the approval rules. `None` returns merge requests with no eligible approvers. `Any` returns merge requests with at least one eligible approver. Premium and Ultimate only. |"
+	routeMergeRequestsGlobal   = "GET /merge_requests"
+	routeMergeRequestsProject  = "GET /projects/:id/merge_requests"
+	routeMergeRequestsGroup    = "GET /groups/:id/merge_requests"
+)
+
+// The new epic row of doc/api/notification_settings.md, which the page writes
+// the same way for the account-wide update and for the update it documents
+// for a group and a project in one table, as GitLab's page carries it on
+// master on 2026-10-27, and the routes it documents.
+const (
+	rowNotificationNewEpic    = "| `new_epic` | boolean | No | Turn on notifications when a new epic is created (in the Premium and Ultimate tier) |"
+	routeNotificationsGlobal  = "PUT /notification_settings"
+	routeNotificationsGroup   = "PUT /groups/:id/notification_settings"
+	routeNotificationsProject = "PUT /projects/:id/notification_settings"
+	routesNotificationsScoped = routeNotificationsGroup + "\n" + routeNotificationsProject
+)
+
+// The branch regex rows of doc/api/remote_mirrors.md, as GitLab's page
+// carries them on master on 2026-10-27, and the routes they document.
+const (
+	rowMirrorBranchRegexCreate = "| `mirror_branch_regex` | string | No | Regular expression for branch names to mirror. Only branches with names matching the regex are mirrored. Requires `only_protected_branches` to be disabled. Premium and Ultimate only. |"
+	rowMirrorBranchRegexUpdate = "| `mirror_branch_regex` | string | No | Regular expression for branch names to mirror. Only branches with names matching the regex are mirrored. Does not work with `only_protected_branches` enabled. Premium and Ultimate only. |"
+	routeRemoteMirrorCreate    = "POST /projects/:id/remote_mirrors"
+	routeRemoteMirrorUpdate    = "PUT /projects/:id/remote_mirrors/:mirror_id"
+)
+
+// The rows of doc/api/projects.md that issue 1240 lists, as GitLab's page
+// carries them on master on 2026-10-27, and the routes they document. The
+// create, the create for a user and the update write the rows they share the
+// same way.
+const (
+	rowProjectIncludeHidden            = "| `include_hidden` | boolean | No | Include hidden projects. _(administrators only)_ Premium and Ultimate only. |"
+	rowProjectRepositoryChecksumFailed = "| `repository_checksum_failed` | boolean | No | Limit projects where the repository checksum calculation has failed. Premium and Ultimate only. |"
+	rowProjectWikiChecksumFailed       = "| `wiki_checksum_failed` | boolean | No | Limit projects where the wiki checksum calculation has failed. Premium and Ultimate only. |"
+	rowProjectClassificationLabel      = "| `external_authorization_classification_label` | string | No | The classification label for the project. Premium and Ultimate only. |"
+	rowProjectGroupWithTemplates       = "| `group_with_project_templates_id` | integer | No | For group-level custom templates, specifies ID of group from which all the custom project templates are sourced. Leave empty for instance-level templates. Requires `use_custom_template` to be true. Premium and Ultimate only. |"
+	rowProjectMirrorTriggerBuilds      = "| `mirror_trigger_builds` | boolean | No | Pull mirroring triggers builds. Premium and Ultimate only. |"
+	rowProjectMirror                   = "| `mirror` | boolean | No | Enables pull mirroring in a project. Premium and Ultimate only. |"
+	rowProjectTemplateProjectID        = "| `template_project_id` | integer | No | When used with `use_custom_template`, project ID of a custom project template. Using a project ID is preferable to using `template_name` because `template_name` can be ambiguous. Premium and Ultimate only. |"
+	rowProjectUseCustomTemplate        = "| `use_custom_template` | boolean | No | Use either custom [instance](../administration/project_templates.md) or [group](../user/group/custom_project_templates.md) (with `group_with_project_templates_id`) project template. Premium and Ultimate only. |"
+	rowProjectTriggerApprovesDeploy    = "| `allow_pipeline_trigger_approve_deployment` | boolean | No | Set whether or not a pipeline triggerer is allowed to approve deployments. Premium and Ultimate only. |"
+	rowProjectAutoDuoCodeReview        = "| `auto_duo_code_review_enabled` | boolean | No | Enable automatic reviews by GitLab Duo on merge requests. See [GitLab Duo in merge requests](../user/project/merge_requests/duo_in_merge_requests.md#use-gitlab-duo-to-review-your-code). Ultimate only. |"
+	rowProjectCancellationRole         = "| `ci_restrict_pipeline_cancellation_role` | string | No | Set the [role required to cancel a pipeline or job](../ci/pipelines/settings.md#restrict-roles-that-can-cancel-pipelines-or-jobs). One of `developer`, `maintainer`, or `no_one`. Premium and Ultimate only. |"
+	rowProjectIssuesTemplate           = "| `issues_template` | string | No | Default description for new issues. Formatted as GitLab Flavored Markdown. Premium and Ultimate only. |"
+	rowProjectMergeRequestsTemplate    = "| `merge_requests_template` | string | No | Default description for new merge requests. Formatted as GitLab Flavored Markdown. Premium and Ultimate only. |"
+	rowProjectMirrorOverwrites         = "| `mirror_overwrites_diverged_branches` | boolean | No | Pull mirror overwrites diverged branches. Premium and Ultimate only. |"
+	rowProjectMirrorUserID             = "| `mirror_user_id` | integer | No | User responsible for all the activity surrounding a pull mirror event. _(administrators only)_ Premium and Ultimate only. |"
+	rowProjectOnlyMirrorProtected      = "| `only_mirror_protected_branches` | boolean | No | Only mirror protected branches. Premium and Ultimate only. |"
+	rowProjectPreventMergeWithoutJira  = "| `prevent_merge_without_jira_issue` | boolean | No | Set whether merge requests require an associated issue from Jira. Ultimate only. |"
+	routeProjectsList                  = "GET /projects"
+	routeProjectCreate                 = "POST /projects"
+	routeProjectCreateForUser          = "POST /projects/user/:user_id"
+	routeProjectUpdate                 = "PUT /projects/:id"
+)
+
 // TestRunMain_RealTable_AnswersTheRowsGitLabsSourceSettles drives the entry
 // point over a module root whose record names the actions of one page and
 // whose cache holds that page's sections, for each page whose rows issue 1240
@@ -715,6 +782,85 @@ func TestRunMain_RealTable_AnswersTheRowsGitLabsSourceSettles(t *testing.T) {
 				"ci_variable.group_update environment_scope": categoryNotGated,
 				"ci_variable.group_update filter":            categoryNotGated,
 				"ci_variable.group_delete filter":            categoryNotGated,
+			},
+		},
+		{
+			name:   "issues",
+			area:   "issues",
+			domain: "issues",
+			page:   endpointSection("New issue", routeIssueCreate, rowIssueAssigneeIDs),
+			record: []actionrequests.RecordAction{restRecord("issue.create", routeIssueCreate)},
+			want: map[string]string{
+				"issue.create assignee_ids": categoryValueLevelGate,
+			},
+		},
+		{
+			name:   "merge_requests",
+			area:   "merge_requests",
+			domain: "mergerequests",
+			page: endpointSection("List merge requests", routeMergeRequestsGlobal, rowMergeRequestApproverIDs) +
+				endpointSection("List project merge requests", routeMergeRequestsProject, rowMergeRequestApproverIDs) +
+				endpointSection("List group merge requests", routeMergeRequestsGroup, rowMergeRequestApproverIDs),
+			record: []actionrequests.RecordAction{
+				restRecord("merge_request.list_global", routeMergeRequestsGlobal),
+				restRecord("merge_request.list", routeMergeRequestsProject),
+				restRecord("merge_request.list_group", routeMergeRequestsGroup),
+			},
+			want: map[string]string{},
+		},
+		{
+			name:   "notification_settings",
+			area:   "notification_settings",
+			domain: "notifications",
+			page: endpointSection("Update global notification settings", routeNotificationsGlobal, rowNotificationNewEpic) +
+				endpointSection("Update group or project notification settings", routesNotificationsScoped, rowNotificationNewEpic),
+			record: []actionrequests.RecordAction{
+				restRecord("user.notification_global_update", routeNotificationsGlobal),
+				restRecord("user.notification_group_update", routeNotificationsGroup),
+				restRecord("user.notification_project_update", routeNotificationsProject),
+			},
+			want: map[string]string{},
+		},
+		{
+			name:   "remote_mirrors",
+			area:   "remote_mirrors",
+			domain: "projectmirrors",
+			page: endpointSection("Create a push mirror", routeRemoteMirrorCreate, rowMirrorBranchRegexCreate) +
+				endpointSection("Update a remote mirror's attributes", routeRemoteMirrorUpdate, rowMirrorBranchRegexUpdate),
+			record: []actionrequests.RecordAction{
+				restRecord("project.mirror_add", routeRemoteMirrorCreate),
+				restRecord("project.mirror_edit", routeRemoteMirrorUpdate),
+			},
+			want: map[string]string{
+				"project.mirror_add mirror_branch_regex":  categoryNotGated,
+				"project.mirror_edit mirror_branch_regex": categoryNotGated,
+			},
+		},
+		{
+			name:   "projects",
+			area:   "projects",
+			domain: "projects",
+			page: endpointSection("List all projects", routeProjectsList,
+				rowProjectIncludeHidden, rowProjectRepositoryChecksumFailed, rowProjectWikiChecksumFailed) +
+				endpointSection("Create a project", routeProjectCreate,
+					rowProjectClassificationLabel, rowProjectGroupWithTemplates, rowProjectMirrorTriggerBuilds, rowProjectMirror,
+					rowProjectTemplateProjectID, rowProjectUseCustomTemplate) +
+				endpointSection("Create a project for a user", routeProjectCreateForUser,
+					rowProjectClassificationLabel, rowProjectGroupWithTemplates, rowProjectMirrorTriggerBuilds, rowProjectMirror,
+					rowProjectUseCustomTemplate) +
+				endpointSection("Update a project", routeProjectUpdate,
+					rowProjectTriggerApprovesDeploy, rowProjectAutoDuoCodeReview, rowProjectCancellationRole, rowProjectClassificationLabel,
+					rowProjectIssuesTemplate, rowProjectMergeRequestsTemplate, rowProjectMirrorOverwrites, rowProjectMirrorTriggerBuilds,
+					rowProjectMirrorUserID, rowProjectMirror, rowProjectOnlyMirrorProtected, rowProjectPreventMergeWithoutJira),
+			record: []actionrequests.RecordAction{
+				restRecord("project.list", routeProjectsList),
+				restRecord("project.create", routeProjectCreate),
+				restRecord("project.create_for_user", routeProjectCreateForUser),
+				restRecord("project.update", routeProjectUpdate),
+			},
+			want: map[string]string{
+				"project.list include_hidden":                 categoryNotGated,
+				"project.update auto_duo_code_review_enabled": categoryValueLevelGate,
 			},
 		},
 	}

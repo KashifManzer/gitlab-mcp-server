@@ -1238,6 +1238,151 @@ func TestCentralTierFilter_CustomMemberRoles_AreOfferedFromTheTierGitLabHonorsTh
 	})
 }
 
+// TestCentralTierFilter_MergeRequestApproverFilter_IsOfferedFromPremium holds
+// the eligible approver filter of the three merge request lists to Premium
+// (issue 1240). Enterprise Edition applies it on every tier, but it matches
+// approval rules, which a project gets only through the approval rule routes,
+// refused without the Premium merge_request_approvers feature, so below
+// Premium it finds the rules left from a licensed time, and None answers every
+// merge request. The approved-by filters stay on Free, since approving is a
+// Free feature.
+func TestCentralTierFilter_MergeRequestApproverFilter_IsOfferedFromPremium(t *testing.T) {
+	assertInputsOfferedFrom(t, []tieredInput{
+		{name: "list_approver_ids", id: "merge_request.list", field: "approver_ids", from: edition.Premium},
+		{name: "list_global_approver_ids", id: "merge_request.list_global", field: "approver_ids", from: edition.Premium},
+		{name: "list_group_approver_ids", id: "merge_request.list_group", field: "approver_ids", from: edition.Premium},
+		{name: "list_approved_by_ids", id: "merge_request.list", field: "approved_by_ids", from: edition.Free},
+		{name: "list_global_approved_by_usernames", id: "merge_request.list_global", field: "approved_by_usernames", from: edition.Free},
+	})
+}
+
+// assertInputsOfferedOnNoTier builds the catalog of each tier and holds every
+// input in cases absent from every schema that serves its action, which is
+// what a parameter GitLab's route never reads must be. As in
+// [assertInputsOfferedFrom], a case whose action the Ultimate catalog does
+// not serve names no action and fails.
+func assertInputsOfferedOnNoTier(t *testing.T, cases []tieredInput) {
+	t.Helper()
+	tiers := []edition.Tier{edition.Free, edition.Premium, edition.Ultimate}
+	catalogs := make(map[edition.Tier]*actioncatalog.Catalog, len(tiers))
+	for _, tier := range tiers {
+		catalogs[tier] = mustBuildActionCatalog(t, nil, ActionCatalogOptions{Tier: tier, IncludeMCP: true})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, served := catalogs[edition.Ultimate].Action(tc.id); !served {
+				t.Fatalf("%s is not an action of the Ultimate catalog", tc.id)
+			}
+			for _, tier := range tiers {
+				if _, served := catalogs[tier].Action(tc.id); served && actionHasInputProp(t, catalogs[tier], tc.id, tc.field) {
+					t.Errorf("%s %s input schema offers %q, which its route never reads", tier, tc.id, tc.field)
+				}
+			}
+		})
+	}
+}
+
+// TestCentralTierFilter_EpicNotification_IsOfferedWhereGitLabTakesIt holds the
+// new epic notification flag to the scopes and the tier GitLab v19.5.0-ee
+// takes it at (issue 1240). Enterprise Edition declares new_epic for the
+// account-wide and the group settings and not for a project's
+// (EE::NotificationSetting::EMAIL_EVENTS_MAPPING), so a project's schema
+// offering it invited a flag Grape drops on every tier. Where it is declared
+// it is stored on every tier, but an epic exists only from Premium, so it
+// follows the Premium gate of the epic actions. The other event flags stay on
+// every tier and every scope.
+func TestCentralTierFilter_EpicNotification_IsOfferedWhereGitLabTakesIt(t *testing.T) {
+	assertInputsOfferedFrom(t, []tieredInput{
+		{name: "global_new_epic", id: "user.notification_global_update", field: "new_epic", from: edition.Premium},
+		{name: "group_new_epic", id: "user.notification_group_update", field: "new_epic", from: edition.Premium},
+		{name: "group_new_issue", id: "user.notification_group_update", field: "new_issue", from: edition.Free},
+		{name: "project_new_issue", id: "user.notification_project_update", field: "new_issue", from: edition.Free},
+	})
+	assertInputsOfferedOnNoTier(t, []tieredInput{
+		{name: "project_new_epic", id: "user.notification_project_update", field: "new_epic"},
+	})
+}
+
+// TestCentralTierFilter_ProjectSettings_AreOfferedFromTheTierGitLabHonorsThem
+// holds the project parameters GitLab's API pages mark for a paid tier to the
+// tier GitLab v19.5.0-ee honors them at (issue 1240). Each tagged one is
+// dropped or refused below its tier: the classification label, the
+// deployment approval by a pipeline trigger, the Jira issue requirement and
+// the pipeline cancellation role are deleted unless the instance's license
+// carries their feature (EE::API::Helpers::ProjectsHelpers#filter_attributes_using_license!);
+// a custom template needs the instance's custom_project_templates, without
+// which a template_project_id is refused; the issue and merge request
+// description templates are deleted unless the project carries
+// issuable_default_templates; and every pull mirror setting needs
+// admin_mirror, which needs the repository_mirrors feature: a create applies
+// mirror and mirror_trigger_builds only for a caller who has it
+// (EE::Projects::CreateService#setup_pull_mirroring), and an update deletes
+// every pull mirror attribute, the mirror's URL included, from a caller who
+// has not (verify_mirror_attrs!). repository_mirrors is also a registration
+// feature, which a Free self-managed Enterprise Edition instance has with
+// Service Ping and registration features turned on
+// (License.feature_available?), and the mirror settings take its license
+// tier all the same, as the pull mirror actions beside them, the group wiki
+// and the group webhooks already do. The built-in template name, the hidden
+// project filter, which an administrator uses on every tier, and the
+// automatic Duo code review stay on Free: the last follows the group Duo
+// settings, which stay on every tier with a description, since a Free group
+// with GitLab Credits keeps them on GitLab.com.
+func TestCentralTierFilter_ProjectSettings_AreOfferedFromTheTierGitLabHonorsThem(t *testing.T) {
+	cases := []tieredInput{
+		{name: "list_include_hidden", id: "project.list", field: "include_hidden", from: edition.Free},
+		{name: "update_allow_pipeline_trigger_approve_deployment", id: "project.update", field: "allow_pipeline_trigger_approve_deployment", from: edition.Premium},
+		{name: "update_ci_restrict_pipeline_cancellation_role", id: "project.update", field: "ci_restrict_pipeline_cancellation_role", from: edition.Premium},
+		{name: "update_external_authorization_classification_label", id: "project.update", field: "external_authorization_classification_label", from: edition.Premium},
+		{name: "update_issues_template", id: "project.update", field: "issues_template", from: edition.Premium},
+		{name: "update_merge_requests_template", id: "project.update", field: "merge_requests_template", from: edition.Premium},
+		{name: "update_import_url", id: "project.update", field: "import_url", from: edition.Premium},
+		{name: "update_mirror", id: "project.update", field: "mirror", from: edition.Premium},
+		{name: "update_mirror_trigger_builds", id: "project.update", field: "mirror_trigger_builds", from: edition.Premium},
+		{name: "update_mirror_branch_regex", id: "project.update", field: "mirror_branch_regex", from: edition.Premium},
+		{name: "update_mirror_overwrites_diverged_branches", id: "project.update", field: "mirror_overwrites_diverged_branches", from: edition.Premium},
+		{name: "update_mirror_user_id", id: "project.update", field: "mirror_user_id", from: edition.Premium},
+		{name: "update_only_mirror_protected_branches", id: "project.update", field: "only_mirror_protected_branches", from: edition.Premium},
+		{name: "update_prevent_merge_without_jira_issue", id: "project.update", field: "prevent_merge_without_jira_issue", from: edition.Ultimate},
+		{name: "update_auto_duo_code_review_enabled", id: "project.update", field: "auto_duo_code_review_enabled", from: edition.Free},
+	}
+	// project.create_for_user embeds the create input, so both creates are
+	// held to the same tiers.
+	for _, id := range []actioncatalog.ActionID{"project.create", "project.create_for_user"} {
+		cases = append(cases,
+			tieredInput{name: string(id) + "_external_authorization_classification_label", id: id, field: "external_authorization_classification_label", from: edition.Premium},
+			tieredInput{name: string(id) + "_use_custom_template", id: id, field: "use_custom_template", from: edition.Premium},
+			tieredInput{name: string(id) + "_template_project_id", id: id, field: "template_project_id", from: edition.Premium},
+			tieredInput{name: string(id) + "_group_with_project_templates_id", id: id, field: "group_with_project_templates_id", from: edition.Premium},
+			tieredInput{name: string(id) + "_mirror", id: id, field: "mirror", from: edition.Premium},
+			tieredInput{name: string(id) + "_mirror_trigger_builds", id: id, field: "mirror_trigger_builds", from: edition.Premium},
+			tieredInput{name: string(id) + "_template_name", id: id, field: "template_name", from: edition.Free},
+		)
+	}
+	assertInputsOfferedFrom(t, cases)
+}
+
+// TestCentralTierFilter_ProjectChecksumFilters_AreOfferedOnNoTier holds the
+// repository and wiki checksum filters out of every project list's schema
+// (issue 1240). GitLab's API page marks both Premium and Ultimate only, and
+// Enterprise Edition declares them on every route that takes the project
+// list filters (ee/lib/ee/api/helpers/projects_helpers.rb, at v19.5.0-ee),
+// but nothing reads them: the finder parameters the routes build carry
+// neither (EE::API::Helpers#project_finder_params_ee), so a list asked for
+// the failed checksums answered every project on every tier.
+func TestCentralTierFilter_ProjectChecksumFilters_AreOfferedOnNoTier(t *testing.T) {
+	var cases []tieredInput
+	for _, id := range []actioncatalog.ActionID{
+		"project.list", "project.list_forks", "project.list_user_projects", "project.list_user_contributed", "project.list_user_starred",
+	} {
+		cases = append(cases,
+			tieredInput{name: string(id) + "_repository_checksum_failed", id: id, field: "repository_checksum_failed"},
+			tieredInput{name: string(id) + "_wiki_checksum_failed", id: id, field: "wiki_checksum_failed"},
+		)
+	}
+	assertInputsOfferedOnNoTier(t, cases)
+}
+
 // TestCentralTierFilter_OutputSchemasArePrunedLenientlyPerTier is the output
 // half of the tier filter, across the three tiers built in one process.
 //
