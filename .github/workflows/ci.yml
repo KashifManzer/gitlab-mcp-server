@@ -1036,8 +1036,23 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
+      # release.yml's pypi job installs .github/requirements/pypi-publish.txt
+      # with the runner's own python3, since it sets up no Python, from
+      # wheels alone and in hash-checking mode (scripts/publish-pypi.sh).
+      # Nothing else installs the real lock before a release: the script
+      # tests stand in for pip, and Dependabot recompiles it under the Python
+      # its header names, which need not be the runner's. A lock that leaves
+      # out a requirement that interpreter needs, or pins a version with no
+      # wheel for it, is refused here on the pull request that brings it
+      # instead of in the release job. This step comes before setup-python,
+      # which puts another python3 first on PATH.
+      - name: Install the PyPI upload's lock with the runner's python3
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pypi-publish"
+          "$RUNNER_TEMP/pypi-publish/bin/python" -m pip install --require-hashes --only-binary :all: --quiet --disable-pip-version-check -r .github/requirements/pypi-publish.txt
+          "$RUNNER_TEMP/pypi-publish/bin/python" -m twine --version
       # Still needed by the script tests below. The auditor no longer is
-      # Python, so nothing here installs a package at run time any more.
+      # Python, so nothing installs a package for it any more.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.x"
@@ -1115,6 +1130,12 @@ jobs:
       # scripts/publish_npm_sh_test.py holds scripts/publish-npm.sh, run
       # against a stand-in npm, to publishing every package under the
       # dist-tag that decision hands it (issue 1323).
+      # scripts/publish_pypi_sh_test.py runs scripts/publish-pypi.sh against a
+      # stand-in python3, curl, dirname and venv, and holds it to installing
+      # from the hash-pinned requirements, attesting each wheel before it
+      # mints the upload token from the job's identity, handing each
+      # credential to the one process that needs it, and stopping a rehearsal
+      # before the mint (issue 1243).
       # shellcheck, bash, git, jq, zip, unzip and wget come from the runner
       # image.
       # Off CI a test skips when one is missing; here, where GitHub sets CI,
