@@ -21,6 +21,11 @@ const goreleaserAction = "goreleaser/goreleaser-action"
 // which the configuration's name follows.
 const readsConfig = "reads "
 
+// goreleaserTemplate opens the template GoReleaser fills in, from the run's
+// environment among other things, in its env lists and a build's flags, so a
+// value holding it is one only the run knows.
+const goreleaserTemplate = "{{"
+
 // goreleaserConfigNames are the files GoReleaser reads its configuration from
 // when no --config names one, in the order it tries them (cmd/config.go of the
 // release the release job pins).
@@ -53,8 +58,9 @@ var goreleaserSigners = []struct {
 var goreleaserBuilders = map[string]bool{"": true, "go": true}
 
 // goreleaserCommand is one command a GoReleaser configuration runs: where the
-// configuration writes it, the repository-relative directory GoReleaser runs
-// it in, its text, and the env list it runs with.
+// configuration writes it, the directory GoReleaser runs it in (relative to
+// the repository, or absolute when the configuration names one, which is
+// outside it), its text, and the env list it runs with.
 type goreleaserCommand struct {
 	env       any
 	subject   string
@@ -110,8 +116,10 @@ func (a *supplyChainAudit) followGoReleaser(at reach, with map[string]any, seen 
 // configuration's builds run, label naming the configuration: the GOFLAGS its
 // env list sets for everything it runs, and of every build a builder other
 // than go's, a tool other than the go command, an option on its flags the
-// go command is not run with here, and the GOFLAGS its own env list sets. What
-// the builds compile is the release itself, which no step runs.
+// go command is not run with here, and the GOFLAGS its own env list sets. The
+// flags and env of a build's overrides are held as the build's own are, since
+// GoReleaser merges them into the build for the target each names. What the
+// builds compile is the release itself, which no step runs.
 func goreleaserBuildProblems(label string, document map[string]any) []string {
 	problems := goFlagsInList(label+":env", document["env"])
 	builds, _ := document["builds"].([]any)
@@ -124,16 +132,32 @@ func goreleaserBuildProblems(label string, document map[string]any) []string {
 		for _, field := range []string{"tool", "gobinary"} {
 			problems = append(problems, goBinaryProblems(build+"."+field, entry[field])...)
 		}
-		var flags []string
-		listed, _ := entry["flags"].([]any)
-		for _, flag := range listed {
-			flags = append(flags, inputText(flag))
-		}
-		problems = append(problems, goOptionProblems(build+".flags", flags)...)
+		problems = append(problems, goOptionProblems(build+".flags", goreleaserFlags(entry["flags"]))...)
 		problems = append(problems, goFlagsInList(build+".env", entry["env"])...)
+		overrides, _ := entry["overrides"].([]any)
+		for at, rawOverride := range overrides {
+			override, _ := rawOverride.(map[string]any)
+			overridden := fmt.Sprintf("%s.overrides[%d]", build, at)
+			problems = append(problems, goOptionProblems(overridden+".flags", goreleaserFlags(override["flags"]))...)
+			problems = append(problems, goFlagsInList(overridden+".env", override["env"])...)
+		}
 	}
 	gomod, _ := document["gomod"].(map[string]any)
 	return append(problems, goBinaryProblems(label+":gomod.gobinary", gomod["gobinary"])...)
+}
+
+// goreleaserFlags is a flags value as GoReleaser reads it: a list, or one
+// string split into words, as its FlagArray splits one.
+func goreleaserFlags(value any) []string {
+	if text, ok := value.(string); ok {
+		return strings.Fields(text)
+	}
+	listed, _ := value.([]any)
+	flags := make([]string, 0, len(listed))
+	for _, flag := range listed {
+		flags = append(flags, inputText(flag))
+	}
+	return flags
 }
 
 // goBinaryProblems judges the program a GoReleaser setting names to build
@@ -162,14 +186,15 @@ func goFlagsInList(label string, value any) []string {
 }
 
 // goreleaserConfig is the configuration a GoReleaser run reads: the file its
-// command line names, relative to workdir, or the first of GoReleaser's names
-// workdir holds. problem says why there is none this audit can name.
+// command line names, relative to workdir unless it is absolute, which names
+// nothing in this repository, or the first of GoReleaser's names workdir
+// holds. problem says why there is none this audit can name.
 func (a *supplyChainAudit) goreleaserConfig(workdir, args string) (config, problem string) {
 	if match := goreleaserConfigFlag.FindStringSubmatch(args); match != nil {
 		if strings.Contains(match[1], "$") {
 			return "", readsConfig + match[1] + ", a value only the run knows"
 		}
-		return path.Join(workdir, match[1]), ""
+		return joinPath(workdir, match[1]), ""
 	}
 	for _, name := range goreleaserConfigNames {
 		candidate := path.Join(workdir, name)
@@ -196,11 +221,12 @@ func (a *supplyChainAudit) readRepositoryFile(relative string) (string, bool) {
 // image, every publisher, and the after hooks. A hook and a publisher run in
 // their dir when they name one, relative to workdir, an sbom in the dist
 // directory, and everything else in workdir, where GoReleaser itself runs: a
-// build's dir is where it compiles, not where its hooks run.
+// build's dir is where it compiles, not where its hooks run. An absolute dir
+// or dist stays absolute, and names nothing in this repository.
 func goreleaserCommands(config string, document map[string]any, workdir string) []goreleaserCommand {
 	dist := path.Join(workdir, "dist")
 	if written, ok := document["dist"].(string); ok {
-		dist = path.Join(workdir, written)
+		dist = joinPath(workdir, written)
 	}
 	before, _ := document["before"].(map[string]any)
 	commands := goreleaserHooks(nil, config+":before.hooks", before["hooks"], workdir)
@@ -282,10 +308,11 @@ func goreleaserHooks(commands []goreleaserCommand, subject string, value any, wo
 }
 
 // hookDirectory is the directory a hook or a publisher runs in: its dir,
-// relative to workdir, when it names one, and workdir otherwise.
+// relative to workdir unless it is absolute, which names nothing in this
+// repository, when it names one, and workdir otherwise.
 func hookDirectory(entry map[string]any, workdir string) string {
 	if dir, ok := entry["dir"].(string); ok {
-		return path.Join(workdir, dir)
+		return joinPath(workdir, dir)
 	}
 	return workdir
 }

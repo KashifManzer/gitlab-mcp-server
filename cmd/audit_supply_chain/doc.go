@@ -89,8 +89,9 @@
 // sbom in dist, anything else in its own dir or where GoReleaser runs), which
 // is how the go run of cmd/gen_third_party_notices in the release job's sboms
 // entry is judged; a build made by a builder other than go's or by a tool other
-// than the go command, an option on a build's flags rule 2 refuses on a
-// command line, and a GOFLAGS any of its env lists sets are findings too.
+// than the go command, an option on a build's flags or an override's, written
+// as a list or as one string, that rule 2 refuses on a command line, and a
+// GOFLAGS any of its env lists sets are findings too.
 //
 // Rule 2 refuses what it cannot read rather than passing over it: a script
 // reference that resolves to no readable file in the repository, one rooted in
@@ -99,6 +100,7 @@
 // or --eval, or reads more than one makefile, a make behind a wrapper written
 // in a way it does not read (env -C, xargs, eval), a go command behind one, a
 // go option it does not know, a package only the run knows, a GoReleaser
+// template in a GOFLAGS or in a build flag that is not an option, a GoReleaser
 // configuration it cannot find or parse, a secret the table does not declare
 // and an expression that reads every secret at once are each a finding. Its
 // tables are held to the tree as well: a secret the workflows no longer read,
@@ -153,10 +155,12 @@
 //     generates, which tells a reader nothing about what breaks or what to do
 //     when upgrading. Every file of that directory is the notes of one
 //     release, named vX.Y.Z.md, and carries the sections Summary, Breaking
-//     changes, Upgrading and Security as level-two headings, once each, in
-//     that order, each with something under it (None. where there is nothing
-//     to say), and nothing above the first; a heading inside a fenced code
-//     block is code. No line carries an em or en dash, a command that makes
+//     changes, Upgrading and Security as level-two headings, read as
+//     CommonMark reads them, once each, in that order, each with something
+//     under it (None. where there is nothing to say), and nothing above the
+//     first; a heading inside a fenced code block is code, and a level-one or
+//     an underlined heading, which the release body would show as well, is a
+//     finding. No line carries an em or en dash, a command that makes
 //     GitHub skip workflows, or a credit to an assistant, since the body is
 //     published under the maintainer's name and the text is the one most
 //     likely to be pasted into the pull request that moves VERSION.
@@ -192,23 +196,36 @@
 // image it pulls, which passes when named by its digest and is a finding when
 // named by a tag or by its name alone; a value whose last path segment ends in
 // Dockerfile or starts with Dockerfile., in any case, is built from the
-// action's files at its pin, and passes; and any other value, which the runner
-// refuses, is a finding, as is metadata that names no image. One that
+// action's files at its pin, with no --pull and no --build-arg, and every
+// image that Dockerfile has the build pull is held to its digest the same way:
+// each FROM that names neither scratch nor a stage an earlier FROM declares,
+// each COPY --from and RUN --mount from= that names an image, and the
+// frontend a syntax directive names (behind # or //, past a #! line, or as a
+// JSON file's syntax member), read as BuildKit reads the file (keywords in
+// any case, the escape directive, continuation lines, heredoc bodies
+// skipped) with the defaults of the global ARGs substituted, a variable no
+// default sets and a heredoc whose end the audit cannot name being findings;
+// the Dockerfile is read from the record for a pinned action and from the
+// workspace for one of this repository; and any other value, which the runner
+// refuses, is a finding, as is metadata that names no image. An image that
 // somebody else's action names can be accepted under write-free-job in
 // declarations.go, keyed by the action and the image without its tag, so a
 // bump that moves the tag keeps the declaration and one that moves the image
-// elsewhere does not; every job that runs it is then held to a token that
-// writes nothing but id-token, to cache-mode none and to reading no secret,
-// what the workflow hands down included, since whatever a push to the tag
-// puts there runs with the job's token, its secrets and the runtime token the
-// runner hands every container action, which permissions: does not reach and
-// which saves to the Actions cache on a push or a schedule unless cache-mode
-// is none. Its one entry is ossf/scorecard-action, whose action.yaml runs
+// elsewhere does not; every job that runs it is then held to a token, declared
+// by the job or its workflow, that writes nothing but id-token, to cache-mode
+// none and to reading no secret (an undeclared token is the repository's
+// default, a setting the tree does not hold), what the workflow hands down
+// included, since whatever a push to the tag puts there runs with the job's
+// token, its secrets and the runtime token the runner hands every container
+// action, which permissions: does not reach and which saves to the Actions
+// cache on a push or a schedule unless cache-mode is none. Its one entry is
+// ossf/scorecard-action, whose action.yaml runs
 // docker://ghcr.io/ossf/scorecard-action at its release tag.
 //
 // The record holds, for every pinned action a step reaches, the metadata file
-// at its commit, and the files of its directory a credentialed job's steps
-// read, each as its lines and in ASCII. It is written by -record, which runs
+// at its commit, the files of its directory a credentialed job's steps read,
+// and the Dockerfile a container action builds, each as its lines and in
+// ASCII. It is written by -record, which runs
 // the same walk fetching each file from raw.githubusercontent.com, so it holds
 // exactly what the audit reads, and is read offline by every other run, so the
 // gate needs no network. The default run holds the record to the pins: a pin
@@ -223,10 +240,10 @@
 //
 // What opening an action does not reach, by construction: a JavaScript action
 // runs the bundle committed at its pin, which is as pinned as its metadata and
-// is not read; a container action built from a Dockerfile pulls the images its
-// FROM lines name, which a registry can move and this audit does not open; and
-// a reusable workflow named by a job's uses: is not an action and is not
-// opened.
+// is not read; what a container action's Dockerfile fetches other than the
+// images its build pulls, a RUN line that downloads at build time and an ADD of
+// a URL or a git repository, is not read; and a reusable workflow named by a
+// job's uses: is not an action and is not opened.
 //
 // Usage:
 //

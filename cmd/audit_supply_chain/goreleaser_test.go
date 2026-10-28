@@ -10,6 +10,8 @@ import (
 	"maps"
 	"strings"
 	"testing"
+
+	yaml "go.yaml.in/yaml/v3"
 )
 
 // goreleaserConfig is a configuration that runs a command at every place
@@ -272,6 +274,163 @@ publishers:
 	}
 	if strings.Join(problems, "\n") != strings.Join(want, "\n") {
 		t.Errorf("checkCredentialedJob() =\n%s\nwant\n%s", strings.Join(problems, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// buildProblemsOf parses a GoReleaser configuration and returns what
+// goreleaserBuildProblems finds in it under the label cfg.
+func buildProblemsOf(t *testing.T, config string) []string {
+	t.Helper()
+
+	var document map[string]any
+	if err := yaml.Unmarshal([]byte(config), &document); err != nil {
+		t.Fatalf("yaml.Unmarshal(%q): %v", config, err)
+	}
+	return goreleaserBuildProblems("cfg", document)
+}
+
+// TestGoreleaserBuildProblems_Template_IsAValueOnlyTheRunKnows verifies that
+// a GoReleaser template in a GOFLAGS an env list sets, or in a build flag that
+// is not an option, is a value only the run knows, as a shell expansion is.
+//
+// GoReleaser fills in the templates of every env list and of a build's flags,
+// from the job's environment among other things, so GOFLAGS={{ .Env.EXTRA }}
+// or a flags entry {{ .Env.F }} becomes whatever the run hands it, -toolexec
+// included. Both passed with no finding while the audit looked only for $ and
+// a backtick. A template inside a go option's value is still accepted, since
+// GoReleaser hands each flags entry to go as one argument, so it cannot add an
+// option of its own.
+func TestGoreleaserBuildProblems_Template_IsAValueOnlyTheRunKnows(t *testing.T) {
+	t.Parallel()
+
+	runKnows := ", a value only the run knows" + cannotJudgeBuild
+	cases := []struct {
+		name   string
+		config string
+		want   []string
+	}{
+		{name: "GOFLAGS set to a template", config: "env: [\"GOFLAGS={{ .Env.EXTRA }}\"]\n", want: []string{"cfg:env: GOFLAGS is set to {{ .Env.EXTRA }}" + runKnows}},
+		{name: "GOFLAGS set to a template without spaces", config: "env: [\"GOFLAGS={{.Env.EXTRA}}\"]\n", want: []string{"cfg:env: GOFLAGS is set to {{.Env.EXTRA}}" + runKnows}},
+		{name: "a template in an option GOFLAGS passes", config: "env: [\"GOFLAGS=-tags={{ .Env.T }}\"]\n", want: []string{"cfg:env: GOFLAGS is set to -tags={{ .Env.T }}" + runKnows}},
+		{name: "GOFLAGS a build's env sets", config: "builds:\n  - env: [\"GOFLAGS={{ .Env.EXTRA }}\"]\n", want: []string{"cfg:builds[0].env: GOFLAGS is set to {{ .Env.EXTRA }}" + runKnows}},
+		{name: "a flag that is a template", config: "builds:\n  - flags: [-trimpath, \"{{ .Env.F }}\"]\n", want: []string{"cfg:builds[0].flags holds {{ .Env.F }}" + runKnows}},
+		{name: "a flag a template chooses", config: "builds:\n  - flags: [\"{{ if .IsSnapshot }}-race{{ end }}\"]\n", want: []string{"cfg:builds[0].flags holds {{ if .IsSnapshot }}-race{{ end }}" + runKnows}},
+		{name: "a template in the value of a flag", config: "builds:\n  - flags: [\"-tags={{ .Env.T }}\"]\n"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			problems := buildProblemsOf(t, testCase.config)
+			if strings.Join(problems, "\n") != strings.Join(testCase.want, "\n") {
+				t.Errorf("goreleaserBuildProblems() =\n%s\nwant\n%s", strings.Join(problems, "\n"), strings.Join(testCase.want, "\n"))
+			}
+		})
+	}
+}
+
+// TestGoreleaserBuildProblems_OverridesAndAFlagsString_AreHeldAsTheBuild
+// verifies that the flags and env of a build's overrides are held as the
+// build's own are, and that flags written as one string are read word by word.
+//
+// GoReleaser merges an override's flags over the build's and appends its env
+// for the target it names, and reads a flags string as the words it holds, so
+// -toolexec on an override or inside one string reached the go command while
+// the audit, reading only the build's flags list, found nothing.
+func TestGoreleaserBuildProblems_OverridesAndAFlagsString_AreHeldAsTheBuild(t *testing.T) {
+	t.Parallel()
+
+	toolexec := " passes -toolexec, which runs every tool of the build through a program this audit does not read" + cannotJudgeBuild
+	cases := []struct {
+		name   string
+		config string
+		want   []string
+	}{
+		{
+			name:   "an override's flags",
+			config: "builds:\n  - overrides:\n      - goos: linux\n        goarch: amd64\n        flags: [-toolexec=/tmp/w]\n",
+			want:   []string{"cfg:builds[0].overrides[0].flags" + toolexec},
+		},
+		{
+			name:   "an override's env",
+			config: "builds:\n  - overrides:\n      - goos: linux\n        goarch: amd64\n        env: [GOFLAGS=-toolexec=/tmp/w]\n",
+			want:   []string{"cfg:builds[0].overrides[0].env: GOFLAGS" + toolexec},
+		},
+		{name: "flags written as one string", config: "builds:\n  - flags: -trimpath -toolexec=/tmp/w\n", want: []string{"cfg:builds[0].flags" + toolexec}},
+		{name: "an override that changes nothing judged", config: "builds:\n  - overrides:\n      - goos: linux\n        goarch: amd64\n        flags: [-trimpath]\n        env: [CGO_ENABLED=0]\n"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			problems := buildProblemsOf(t, testCase.config)
+			if strings.Join(problems, "\n") != strings.Join(testCase.want, "\n") {
+				t.Errorf("goreleaserBuildProblems() =\n%s\nwant\n%s", strings.Join(problems, "\n"), strings.Join(testCase.want, "\n"))
+			}
+		})
+	}
+}
+
+// TestCheckCredentialedJob_GoReleaser_AbsolutePaths_AreOutsideTheRepository
+// verifies that an absolute --config, hook or publisher dir, or dist names
+// nothing in this repository, and is a finding rather than a file or package
+// of the checkout.
+//
+// goreleaser-action changes into workdir, and GoReleaser opens --config as
+// written and runs a hook or publisher with its dir, and an sbom with dist, as
+// the command's directory, so an absolute one is a path outside the checkout.
+// Joined onto workdir it lost its leading slash, and the audit judged the
+// file or package the checkout holds at that relative path instead: each case
+// below puts a harmless one there, and each passed with no finding.
+func TestCheckCredentialedJob_GoReleaser_AbsolutePaths_AreOutsideTheRepository(t *testing.T) {
+	t.Parallel()
+
+	const step = "wf.yml: job release: step 0: goreleaser-action "
+	const at = "wf.yml: job release: .goreleaser.yml:"
+	unresolved := ": go run ./clean names a package this audit cannot resolve (a value only the run knows, or a path outside this repository)" + cannotJudgeBuild
+	outside := "reads /abs/x.yml, which is not a readable file in this repository, so what it runs cannot be judged"
+	cases := []struct {
+		name   string
+		with   map[string]any
+		files  map[string]string
+		config string
+		want   string
+	}{
+		{name: "an absolute --config", with: map[string]any{"args": "release --config /abs/x.yml"}, files: map[string]string{"abs/x.yml": "version: 2\n"}, want: step + outside},
+		{
+			name: "an absolute -f under a workdir", with: map[string]any{"workdir": "release", "args": "release -f /abs/x.yml"},
+			files: map[string]string{"release/abs/x.yml": "version: 2\n"}, want: step + outside,
+		},
+		{name: "a hook's absolute dir", config: "builds:\n  - hooks:\n      pre:\n        - cmd: go run ./clean\n          dir: /cmd\n", want: at + "builds[0].hooks.pre[0]" + unresolved},
+		{name: "a publisher's absolute dir", config: "publishers:\n  - cmd: go run ./clean\n    dir: /cmd\n", want: at + "publishers[0]" + unresolved},
+		{
+			name: "an absolute dist, where an sbom runs", config: "dist: /cmd/x\nsboms:\n  - cmd: go\n    args: [run, ../clean]\n",
+			want: at + "sboms[0]: go run ../clean names a package this audit cannot resolve (a value only the run knows, or a path outside this repository)" + cannotJudgeBuild,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := goModuleRoot(t)
+			for name, content := range testCase.files {
+				writeFile(t, root, name, content)
+			}
+			if testCase.config != "" {
+				writeFile(t, root, ".goreleaser.yml", testCase.config)
+			}
+			job := map[string]any{
+				"permissions": map[string]any{"id-token": "write"},
+				"steps":       []any{goreleaserStep(testCase.with)},
+			}
+			problems := newAudit(root, tables{}).checkCredentialedJob("wf.yml", "release", job, nil)
+			if len(problems) != 1 || problems[0] != testCase.want {
+				t.Errorf("checkCredentialedJob() = %v, want exactly [%q]", problems, testCase.want)
+			}
+		})
 	}
 }
 

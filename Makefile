@@ -42,7 +42,7 @@ PKGS=./cmd/... ./internal/...
 # Keep in lockstep with MCP_PUBLISHER_VERSION in .github/workflows/release.yml:
 # this one validates the manifest, that one publishes it. check-server-json
 # refuses to run when the two disagree.
-MCP_PUBLISHER_VERSION=v1.8.1
+MCP_PUBLISHER_VERSION=v1.8.6
 # The publisher is installed once per pinned version into a directory named
 # after that version, so a stale binary can never validate with another
 # release, and CI caches that directory by version instead of resolving the
@@ -1535,14 +1535,14 @@ sync-npm-version:
 	node scripts/build-npm.mjs --sync-only --version "$$(tr -d '[:space:]' < VERSION)"
 
 ## validate-npm: build the npm packages and validate them inside a clean
-## node:22 container, so the check never installs anything on the host. Runs
+## node:24 container, so the check never installs anything on the host. Runs
 ## structural checks on all 7 packages plus a real install + MCP handshake for
 ## the container's native platform (linux-x64).
 ##   make validate-npm NPM_BINARIES=dist
 validate-npm:
 	@command -v docker >/dev/null || { echo "ERROR: Docker is required for isolated validation (or use validate-npm-local)"; exit 1; }
 	@test -n "$(NPM_BINARIES)" || { echo "ERROR: set NPM_BINARIES=<dir of release binaries>"; exit 1; }
-	@VER=$$(tr -d '[:space:]' < VERSION); 	docker run --rm 		-v "$(CURDIR):/work" -v "$(abspath $(NPM_BINARIES)):/binaries:ro" 		-w /work node:22 sh -euc '			node scripts/build-npm.mjs --binaries /binaries --version '"$$VER"' && 			node scripts/validate-npm.mjs --packages npm/packages --main npm/gitlab-mcp-server --version '"$$VER"
+	@VER=$$(tr -d '[:space:]' < VERSION); 	docker run --rm 		-v "$(CURDIR):/work" -v "$(abspath $(NPM_BINARIES)):/binaries:ro" 		-w /work node:24 sh -euc '			node scripts/build-npm.mjs --binaries /binaries --version '"$$VER"' && 			node scripts/validate-npm.mjs --packages npm/packages --main npm/gitlab-mcp-server --version '"$$VER"
 
 ## validate-npm-local: same validation without Docker, for the ephemeral CI
 ## runner (already disposable). Builds packages from NPM_BINARIES, then validates.
@@ -1627,10 +1627,10 @@ gen-nuget:
 ## token, binary magic and executable bit for all six, plus a real
 ## `dotnet tool install`, a `dnx` run and an MCP initialize handshake for the
 ## container's native platform. The image is pinned by digest because dnx's
-## behaviour is an SDK property (10.0.402 is what was verified); bump the
+## behaviour is an SDK property (10.0.403 is what was verified); bump the
 ## digest deliberately.
 ##   make validate-nuget NUGET_BINARIES=dist
-NUGET_SDK_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0.402@sha256:0d99ebf1ccad15037b5c98c9fe8979d6b8dbac23812feae2277a0b277b5c5ffa
+NUGET_SDK_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0.403@sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b
 validate-nuget:
 	@command -v docker >/dev/null || { echo "ERROR: Docker is required for isolated validation (or use validate-nuget-local)"; exit 1; }
 	@test -n "$(NUGET_BINARIES)" || { echo "ERROR: set NUGET_BINARIES=<dir of release binaries>"; exit 1; }
@@ -1678,7 +1678,7 @@ publish-nuget:
 # Pinned: the CLI has already changed its verb contract under this target
 # once (publish -> update, a new positional gitUrl); bump deliberately after
 # verifying `plugin update --dir` still holds.
-LOBEHUB_MARKET_CLI_VERSION := 0.0.42
+LOBEHUB_MARKET_CLI_VERSION := 0.0.44
 
 publish-lobehub: check-lhm-manifest
 	@command -v node >/dev/null || { echo "ERROR: Node.js >= 22 is required"; exit 1; }
