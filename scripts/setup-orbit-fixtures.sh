@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 José M. Requena Plens
+# SPDX-License-Identifier: MIT
+
 # setup-orbit-fixtures.sh — create reproducible Orbit knowledge-graph
 # fixtures in any GitLab.com group. Idempotent: re-running it on an
 # already-provisioned namespace is a no-op.
@@ -54,7 +57,9 @@ for arg in "$@"; do
     --mirror-cli) MIRROR_CLI=true ;;
     --skip-mirror) SKIP_MIRROR=true ;;
     -h|--help)
-      sed -n '2,44p' "$0"
+      # The usage comment, from its first line to the blank line that ends
+      # it, found by its text so that no line above it shifts what is shown.
+      sed -n '/^# setup-orbit-fixtures\.sh /,/^$/{/./p;}' "$0"
       exit 0
       ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;

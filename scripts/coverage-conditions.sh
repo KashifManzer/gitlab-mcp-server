@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 José M. Requena Plens
+# SPDX-License-Identifier: MIT
+
 # Run gobco over one package, over exactly the files the go command builds.
 #
 # gobco reads a package by handing every file whose name ends in .go to
@@ -9,7 +12,7 @@
 # function twice, once per platform, stops with a redeclaration panic before
 # anything is measured:
 #
-#   panic: probe_linux.go:5:6: peerStdinIsNull redeclared in this block
+#   panic: probe_linux.go:8:6: peerStdinIsNull redeclared in this block
 #
 # Three packages here are in that shape: cmd/server (peerStdinIsNull,
 # bindUnixSocket and isConnRefused, each declared once for Linux or Unix and
@@ -68,7 +71,7 @@
 # an export_test.go is for, is undefined there, and gobco panics before
 # anything is measured:
 #
-#   panic: action_specs_test.go:49:27: undefined: todos.PublishedActionIDs
+#   panic: action_specs_test.go:52:27: undefined: todos.PublishedActionIDs
 #
 # That was 27 packages here when the whole tree was first measured
 # (rillig/gobco#42, with the fix in review as rillig/gobco#43). The copy makes

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 José M. Requena Plens
+// SPDX-License-Identifier: MIT
+
 // docgo.go moves package comments into a doc.go of their own, which is the
 // one place the audit accepts them.
 
@@ -15,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/internal/fileheader"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/sourcewalk"
 )
 
@@ -132,7 +136,9 @@ func (h *packageDocHolder) moveToDocGo(dir string) error {
 		return fmt.Errorf("%s: package comment does not sit above the package clause", h.path)
 	}
 
-	docGo := append(append([]byte{}, h.src[docStart:docEnd]...), []byte("\npackage "+h.file.Name.Name+"\n")...)
+	// A new doc.go opens with the header every source file carries, which
+	// the holder keeps above where its comment was.
+	docGo := append(append([]byte(fileheader.Go), h.src[docStart:docEnd]...), []byte("\npackage "+h.file.Name.Name+"\n")...)
 	docGo, err := formatSource(docGo)
 	if err != nil {
 		return fmt.Errorf("format doc.go for %s: %w", dir, err)

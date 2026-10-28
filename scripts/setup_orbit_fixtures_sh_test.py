@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 José M. Requena Plens
+# SPDX-License-Identifier: MIT
+
 """Tests what scripts/setup-orbit-fixtures.sh asks GitLab for.
 
 The script provisions the Orbit live test fixtures on GitLab.com, and every
@@ -13,6 +16,8 @@ the script instead of passing. So is a namespace nested in a subgroup, the
 shape of the default jmrp-oss/orbit-fixtures: the project lookup sent the
 namespace's own slash unencoded, which GitLab answers 404, so the script tried
 to create a project that already existed and stopped when GitLab refused it.
+So is --help, which prints the script's usage comment and asks GitLab for
+nothing.
 
 Each case runs the real script with a stand-in curl first on PATH. It logs
 every request as its method and path, answers each from a table of routes
@@ -187,6 +192,17 @@ class SetupOrbitFixturesTest(unittest.TestCase):
         self.assertIn(API + "/projects/jmrp-oss%2Forbit-fixtures%2Fsecurity-fixtures", looked_up)
         self.assertEqual(self.requests("POST"), [])
         self.assertIn("project exists: jmrp-oss/orbit-fixtures/kg-fixtures (id=%d)" % KG_ID, result.stderr)
+
+    def test_help_prints_the_whole_usage_comment(self):
+        result = subprocess.run(["bash", SCRIPT, "--help"], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertTrue(lines[0].startswith("# setup-orbit-fixtures.sh "), lines[:3])
+        self.assertTrue(lines[-1].endswith("Re-runs are safe."), lines[-3:])
+        self.assertTrue(all(line.startswith("#") for line in lines), lines)
+        self.assertNotIn("Copyright", result.stdout)
+        self.assertNotIn("SPDX-License-Identifier", result.stdout)
+        self.assertEqual(self.requests("GET"), [])
 
 
 if __name__ == "__main__":
