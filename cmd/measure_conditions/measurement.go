@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -17,9 +16,34 @@ const (
 )
 
 // figurePattern is the line gobco ends its report on, read exactly as the
-// script reads it: a total of zero is no measurement, and the script refuses
-// it before it could be recorded as one.
-var figurePattern = regexp.MustCompile(`^Condition coverage: (\d+)/([1-9]\d*)$`)
+// script reads it: opened with the words of the mode it counted in, and a
+// total of zero is no measurement, which the script refuses before it could
+// be recorded as one.
+var figurePattern = regexp.MustCompile(`^(Condition coverage|Branch coverage): (\d+)/([1-9]\d*)$`)
+
+// coverageMode is one GOBCO_MODE scripts/coverage-conditions.sh reads: the
+// words gobco opens its figure with in that mode, and the sentence a summary
+// says what the figures count in.
+type coverageMode struct {
+	figure string
+	counts string
+}
+
+// coverageModes are the GOBCO_MODE values the script reads. condition is
+// gobco's default, which counts every atomic condition, each operand of &&
+// and || and each comparison wherever it is written. branch is gobco's
+// -branch, which counts the whole controlling condition of each if and each
+// for, and each case of a switch.
+var coverageModes = map[string]coverageMode{
+	"condition": {
+		figure: "Condition coverage",
+		counts: "gobco counts each condition twice, once per outcome, so a total is twice the number of conditions.",
+	},
+	"branch": {
+		figure: "Branch coverage",
+		counts: "gobco counts each decision twice, once per outcome: the whole condition of an `if` or a `for`, and each case of a `switch`, so a total is twice the number of decisions.",
+	},
+}
 
 // conditionPattern is a condition gobco names as not evaluated both ways, in
 // the three shapes its report writes one in, with the file first:
@@ -49,28 +73,34 @@ type condition struct {
 // measurement is what one run's output says: gobco's figure, the outcomes
 // evaluated of the outcomes there are, and the conditions it named.
 type measurement struct {
-	covered    string
-	total      string
+	covered    int
+	total      int
 	conditions []condition
 	held       int
 }
 
-// parseMeasurement reads the output of a run whose status says it measured.
+// parseMeasurement reads the output of a run whose status says it measured,
+// in the mode the runs were asked for, which is a key of coverageModes.
 //
-// The figure must be there, since the script refuses to pass a run without
-// one. A condition the script held is printed twice, once in gobco's report
-// and once indented under the gate's verdict, and is marked held. A held
-// line gobco's report does not name, or a status that disagrees with whether
+// The figure must be there in the words of the mode, since the script
+// refuses to pass a run without one; a figure in the other mode's words is
+// not the measurement asked for, and is passed over like any other line. A
+// condition the script held is printed twice, once in gobco's report and
+// once indented under the gate's verdict, and is marked held. A held line
+// gobco's report does not name, or a status that disagrees with whether
 // anything was held, means the output is not what the script writes, and is
 // refused rather than tabulated.
-func parseMeasurement(output string, status int) (measurement, error) {
+func parseMeasurement(output string, status int, mode string) (measurement, error) {
 	var found measurement
-	figure := false
+	label := coverageModes[mode].figure
+	figure := ""
 	heldLines := map[string]bool{}
 	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSuffix(line, "\r")
 		if match := figurePattern.FindStringSubmatch(line); match != nil {
-			found.covered, found.total, figure = match[1], match[2], true
+			if match[1] == label {
+				figure = line
+			}
 			continue
 		}
 		if rest, indented := strings.CutPrefix(line, heldIndent); indented {
@@ -89,8 +119,12 @@ func parseMeasurement(output string, status int) (measurement, error) {
 			})
 		}
 	}
-	if !figure {
-		return measurement{}, errors.New("the script's status says it measured, and its output carries no Condition coverage figure")
+	if figure == "" {
+		return measurement{}, fmt.Errorf("the script's status says it measured, and its output carries no %s figure", label)
+	}
+	var err error
+	if found.covered, found.total, err = readFigure(figure); err != nil {
+		return measurement{}, err
 	}
 	for i := range found.conditions {
 		if heldLines[found.conditions[i].text] {
@@ -105,6 +139,21 @@ func parseMeasurement(output string, status int) (measurement, error) {
 		return measurement{}, fmt.Errorf("the script exited %d and its gate held %d condition(s)", status, found.held)
 	}
 	return found, nil
+}
+
+// readFigure reads the two counts of a line figurePattern matched. A count
+// too large for an int is refused rather than wrapped, since a total summed
+// from it would be a number nobody measured; gobco prints counts of
+// conditions, so no real report comes near that.
+func readFigure(line string) (covered, total int, err error) {
+	match := figurePattern.FindStringSubmatch(line)
+	if covered, err = strconv.Atoi(match[2]); err != nil {
+		return 0, 0, fmt.Errorf("the figure %q does not fit a count: %w", line, err)
+	}
+	if total, err = strconv.Atoi(match[3]); err != nil {
+		return 0, 0, fmt.Errorf("the figure %q does not fit a count: %w", line, err)
+	}
+	return covered, total, nil
 }
 
 // lineBreak is a line break in a condition's code with the spaces and tabs

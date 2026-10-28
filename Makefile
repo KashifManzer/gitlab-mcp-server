@@ -1,5 +1,5 @@
 .PHONY: build build-all build-linux-amd64 build-linux-arm64 build-windows-amd64 build-windows-arm64 build-darwin-amd64 build-darwin-arm64 \
-	run brand brand-check brand-rasters ensure-mcp-publisher mcp-publisher-version test test-short test-race coverage-conditions coverage-mutants test-pkg test-integration test-e2e test-e2e-harness test-e2e-http test-e2e-stdio test-e2e-collector ensure-gotestsum test-e2e-docker test-e2e-docker-enterprise test-e2e-gitlab-com \
+	run brand brand-check brand-rasters ensure-mcp-publisher mcp-publisher-version test test-short test-race coverage-conditions coverage-conditions-tree coverage-mutants test-pkg test-integration test-e2e test-e2e-harness test-e2e-http test-e2e-stdio test-e2e-collector ensure-gotestsum test-e2e-docker test-e2e-docker-enterprise test-e2e-gitlab-com \
 	e2e-server-binary test-e2e-ce test-e2e-ee test-e2e-gitlab e2e-clean-orphans \
 	orbit-setup-fixtures orbit-wait-indexer orbit-run-live-tests orbit-ensure-token gen-orbit-record check-orbit-record \
 	coverage \
@@ -787,8 +787,16 @@ modeleval-probe:
 # to instrument; it runs gobco there, names the files it left out, whose
 # conditions this run does not measure, and removes the copy whatever
 # happens. The copy is of the module so that import paths, relative paths and
-# directory names stay the original's. A package gobco could already read, a
-# constraint on the platform alone included, is run where it is, as before.
+# directory names stay the original's. A package whose external test package
+# gobco cannot read is staged too. gobco type-checks that package against the
+# package's non-test files alone, so the copy makes each test file of the
+# package that declares no test (an export_test.go) a file of the package
+# behind //go:build gc, which go builds and gobco does not instrument; and
+# gobco bridges to it through an import of the package it may not find, so an
+# external test package that imports nothing of the package is given one,
+# until a gobco release fixes both (upstream-bugs entries 97 and 140). A
+# package gobco could already read, a constraint on the platform alone
+# included, is run where it is, as before.
 # TAGS names build tags for a package behind one (TAGS=e2e), passed to go list
 # and to gobco's go test alike, and a report that measured no condition (0/0)
 # is refused. GOBCO_GATE=all turns the report into the gate a touched package
@@ -802,6 +810,28 @@ modeleval-probe:
 coverage-conditions:
 	@test -n "$(PKG)" || { echo "usage: make coverage-conditions PKG=./cmd/gen_llms [TAGS=e2e]"; exit 2; }
 	@scripts/coverage-conditions.sh $(PKG) $(TAGS)
+
+# Where coverage-conditions-tree leaves each package's record and raw output,
+# how many packages it measures at once, and what gobco counts.
+CONDITIONS_RECORDS ?= dist/conditions-tree
+CONDITIONS_PARALLEL ?= 1
+CONDITIONS_MODE ?= condition
+
+## coverage-conditions-tree: condition or branch coverage (gobco) of every package under cmd/ and internal/, one row each and the total, written as the summary conditions.yml's tree dispatch writes. CONDITIONS_RECORDS keeps the records (dist/conditions-tree); CONDITIONS_PARALLEL packages run at once (1); CONDITIONS_MODE is condition or branch (condition).
+# Each package is measured by scripts/coverage-conditions.sh, the recipe
+# behind coverage-conditions, with GOBCO_GATE=all as the workflow's default,
+# which decides only which conditions the summary marks as held and moves no
+# figure, and GOBCO_MODE=$(CONDITIONS_MODE): condition is gobco's default,
+# every operand of && and || and every comparison, and branch is gobco's
+# -branch, the whole condition of each if and for and each switch case. The
+# summary goes to stdout and to summary.md beside the records. It is the
+# command docs/development/testing/README.md takes the recorded figures with,
+# so they can be taken again on any machine without a dispatch; that page
+# says how long each run behind them took, on how many cores and with how
+# many packages at a time.
+coverage-conditions-tree:
+	@mkdir -p "$(CONDITIONS_RECORDS)"
+	@bash -o pipefail -c 'go run ./cmd/measure_conditions tree -records "$(CONDITIONS_RECORDS)" -parallel "$(CONDITIONS_PARALLEL)" -mode "$(CONDITIONS_MODE)" -commit "$$(git rev-parse HEAD)" | tee "$(CONDITIONS_RECORDS)/summary.md"'
 
 ## coverage-mutants: mutation-test PKG with gremlins, INVERT_LOGICAL on so `&&`/`||` independence is checked. The gate on a changed package is Lived 0 and Not covered 0.
 # The recipe itself is scripts/coverage-mutants.sh. It moved out of this file

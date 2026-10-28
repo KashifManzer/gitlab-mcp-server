@@ -54,7 +54,7 @@
 | MCP Icons                 | 51 icons (50 domain + brand mark), each a 3-entry `[]mcp.Icon`: one SVG (base64 data URI, `Sizes: ["any"]`, `currentColor`) plus light/dark 16×16 lossless WebP fallbacks (`Theme`-tagged, `cmd/gen_icon_webp`) for clients that reject SVG. The brand mark is the generated "fan-out" (`cmd/gen_brand` → `brandmark_gen.go`), original artwork replacing the former tanuki |
 | Source files (tools)      | 788 non-test Go files under `internal/tools/`                                                                |
 | Test files (tools)        | 488 test files under `internal/tools/`                                                                       |
-| Go packages               | 306 in the module (`go list ./...`); 333 directories hold tracked `.go` files, the twenty-seven more being what `go list` leaves out: twenty-six `testdata` fixture packages (the two stand-in programs, the coverage audit's planted trees, the closed-server audit's planted module, the stand-in module the SDK route reader's tests read and the platform module the condition measurement's discovery lists) and `test/e2e/modeleval/internal/provider`, whose every file sits behind a build tag. 182 under `internal/tools/...` (the root package plus 181 sub-packages) |
+| Go packages               | 307 in the module (`go list ./...`); 334 directories hold tracked `.go` files, the twenty-seven more being what `go list` leaves out: twenty-six `testdata` fixture packages (the two stand-in programs, the coverage audit's planted trees, the closed-server audit's planted module, the stand-in module the SDK route reader's tests read and the platform module the condition measurement's discovery lists) and `test/e2e/modeleval/internal/provider`, whose every file sits behind a build tag. 182 under `internal/tools/...` (the root package plus 181 sub-packages) |
 
 ### Orbit live tests
 
@@ -102,7 +102,8 @@ gitlab-mcp-server/
 │   ├── gen_model_corpus/             # Model evaluation corpus breadth ledger
 │   ├── gen_model_results/            # Folds model evaluation shards into the committed record and results page
 │   ├── format_md_tables/             # Markdown pipe table formatter (make check-md-tables)
-│   ├── measure_conditions/           # Both ends of the cross-OS condition coverage workflow
+│   ├── measure_conditions/           # The cross-OS condition and branch coverage workflow and the whole-tree figures (make coverage-conditions-tree)
+│   ├── fuzz_targets/                 # The fuzz targets the weekly fuzz.yml runs with go test -fuzz
 │   ├── gen_action_catalog_manifest/  # Audited action catalog manifest
 │   ├── gen_api_live/                 # REST oracle evaluated from a booted GitLab: gitlab-api-live.json (make gen-api-live)
 │   ├── gen_action_grants/            # What each action sends and what a token needs for it (make gen-action-grants)
