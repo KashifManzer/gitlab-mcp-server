@@ -4,13 +4,14 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -107,14 +108,18 @@ type schemas struct {
 	byAction map[string]accepted
 }
 
+// osExit is os.Exit behind a variable, so a test can run main and read the
+// code it would exit with.
+var osExit = os.Exit
+
 func main() {
 	check := flag.Bool("check", false, "exit non-zero when a served description disagrees with the schemas")
 	uncovered := flag.Bool("uncovered", false, "name the enumeration lines the extraction rule refused instead of only counting them")
 	flag.Parse()
 
-	// os.Exit lives here, not in run: run is what the tests drive for its exit
-	// code, and an exit inside it would take the test binary with it.
-	os.Exit(run(*check, *uncovered))
+	// The exit lives here, not in run: run is what most tests drive for its
+	// exit code, and an exit inside it would take the test binary with it.
+	osExit(run(*check, *uncovered))
 }
 
 // run performs the audit and returns the process exit code.
@@ -172,18 +177,18 @@ func audit(served []*mcp.Tool, catalog *actioncatalog.Catalog) (findings []findi
 	}
 	// The line is part of the key, and the sort is stable, because six lines of
 	// one tool naming one wrong parameter tie on everything else: without it the
-	// same corpus printed those six in a different order from run to run.
-	sort.SliceStable(findings, func(i, j int) bool {
-		if findings[i].tool != findings[j].tool {
-			return findings[i].tool < findings[j].tool
-		}
-		if findings[i].kind != findings[j].kind {
-			return findings[i].kind < findings[j].kind
-		}
-		if findings[i].detail != findings[j].detail {
-			return findings[i].detail < findings[j].detail
-		}
-		return findings[i].line < findings[j].line
+	// same corpus printed those six in a different order from run to run. The
+	// key is compared with strings.Compare rather than with <, whose boundary
+	// mutant answers the same for every pair the comparator is asked about: two
+	// parts that differ order alike under < and <=, and two findings equal in
+	// every part are indistinguishable wherever they land.
+	slices.SortStableFunc(findings, func(a, b finding) int {
+		return cmp.Or(
+			strings.Compare(a.tool, b.tool),
+			strings.Compare(a.kind, b.kind),
+			strings.Compare(a.detail, b.detail),
+			strings.Compare(a.line, b.line),
+		)
 	})
 	return findings, lines, refused
 }
@@ -192,9 +197,10 @@ func audit(served []*mcp.Tool, catalog *actioncatalog.Catalog) (findings []findi
 //
 // A spelled value is judged against the property's published enum where there
 // is one, and otherwise against the value set the property's own description
-// spells. The second half exists because a numeric value set cannot be an enum
-// of strings: gitlab_member_role's base_access_level offered 5 in the prose
-// while its description said 10 to 50, and GitLab refuses 5.
+// spells. The second half exists because only an enum's string values are
+// folded (see addEnum), so a numeric value set, an integer enum included, is
+// held to its description: gitlab_member_role's base_access_level offered 5
+// in the prose while its description said 10 to 50, and GitLab refuses 5.
 func judge(toolName string, line enumeration, allowed accepted) []finding {
 	var found []finding
 	for _, param := range line.params {
@@ -344,8 +350,9 @@ func (a accepted) add(schema map[string]any) {
 }
 
 // addEnum folds one property's published enum into the accepted set, keeping
-// only its string values: a schema enum is a closed set of strings, and a
-// number in one is not a value any description spells.
+// only its string values. A numeric set is spelled as value=label pairs, which
+// labeledValues reads, so an integer enum, such as the one every access level
+// parameter publishes, is left to the property's own description.
 func (a accepted) addEnum(name string, property map[string]any) {
 	enum, ok := property["enum"].([]any)
 	if !ok {
@@ -533,10 +540,11 @@ func annotationValues(annotation string) []string {
 
 // labeledValues reads a "<value>=<label>" list as the values it names: the
 // longest run of comma-separated items, each naming a value and what it means,
-// that the text opens with or that one of its parentheticals holds. A schema
-// enum is a closed set of strings, so a numeric set such as an access level can
-// only be written this way, on both sides of the comparison: it is how a
-// description spells the set and how the prose offers it.
+// that the text opens with or that one of its parentheticals holds. Only an
+// enum's string values are folded, so a numeric set such as an access level is
+// read this way on both sides of the comparison, whether or not the schema
+// publishes it as an integer enum too: it is how a description spells the set
+// and how the prose offers it.
 //
 // The run ends at the first sentence break and at the first item that is not
 // such a pair, so "10=Guest, 50=Owner. 60=Admin is not valid" names the levels
