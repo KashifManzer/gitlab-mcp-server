@@ -537,3 +537,209 @@ func TestRunMain_RealTable_AnswersTheApprovalsMinimalAccessRow(t *testing.T) {
 		t.Errorf("stale = %+v, want none of the real table", rep.StaleParamDeclarations)
 	}
 }
+
+// requestTable opens a request table the way GitLab's API pages write one,
+// with the Required column that tells it from a response table.
+const requestTable = "| Attribute | Type | Required | Description |\n| --- | --- | --- | --- |\n"
+
+// endpointSection is one endpoint section of an API page: its heading, the
+// code block spelling its endpoint and a request table holding rows.
+func endpointSection(heading, endpoint string, rows ...string) string {
+	return "## " + heading + "\n\n```plaintext\n" + endpoint + "\n```\n\n" + requestTable + strings.Join(rows, "\n") + "\n\n"
+}
+
+// restRecord is the record of an action that sends the REST routes given.
+func restRecord(id string, routes ...string) actionrequests.RecordAction {
+	requests := make([]actionrequests.RecordRequest, len(routes))
+	for i, route := range routes {
+		requests[i] = actionrequests.RecordRequest{Kind: actionrequests.KindREST, Route: route}
+	}
+	return actionrequests.RecordAction{ID: id, Requests: requests}
+}
+
+// The rows of doc/api/groups.md that issue 1240 lists, as GitLab's page
+// carries them on master on 2026-10-27.
+const (
+	rowMembershipLock      = "| `membership_lock` | boolean | no | Users cannot be added to projects in this group. Premium and Ultimate only. |"
+	rowExtraMinutesLimit   = "| `extra_shared_runners_minutes_limit` | integer | no | Can be set by administrators only. Additional compute minutes for this group. GitLab Self-Managed, Premium and Ultimate only. |"
+	rowMinutesLimit        = "| `shared_runners_minutes_limit` | integer | no | Can be set by administrators only. Maximum number of monthly compute minutes for this group. Can be `nil` (default; inherit system default), `0` (unlimited), or `> 0`. GitLab Self-Managed, Premium and Ultimate only. |"
+	rowWikiAccessLevel     = "| `wiki_access_level` | string | no | The wiki access level. Can be `disabled`, `private`, or `enabled`. Premium and Ultimate only. |"
+	rowFileTemplateProject = "| `file_template_project_id` | integer | no | The ID of a project to load custom file templates from. Premium and Ultimate only. |"
+	rowPreventForking      = "| `prevent_forking_outside_group` | boolean | no | When enabled, users can not fork projects from this group to external namespaces. Premium and Ultimate only. |"
+	rowIPRestriction       = "| `ip_restriction_ranges` | string | no | Comma-separated list of IP addresses or subnet masks to restrict group access. Premium and Ultimate only. |"
+	rowEmailDomains        = "| `allowed_email_domains_list` | string | no | Comma-separated list of email address domains to allow group access. GitLab Premium and Ultimate only. |"
+	rowDuoFeatures         = "| `duo_features_enabled` | boolean | no | Indicates whether GitLab Duo features are enabled for this group. GitLab Self-Managed, Premium and Ultimate only. |"
+	rowLockDuoFeatures     = "| `lock_duo_features_enabled` | boolean | no | Indicates whether the GitLab Duo features enabled setting is enforced for all subgroups. GitLab Self-Managed, Premium and Ultimate only. |"
+	rowPipelineSucceeds    = "| `only_allow_merge_if_pipeline_succeeds` | boolean | no | Only allow merging merge requests if the pipeline succeeds. When enabled for a group, applies to all projects in the group. Premium and Ultimate only. |"
+	rowSkippedPipeline     = "| `allow_merge_on_skipped_pipeline` | boolean | no | Allow merging merge requests when the pipeline is skipped. Only applies when `only_allow_merge_if_pipeline_succeeds` is `true`. Premium and Ultimate only. |"
+	rowDiscussionsResolved = "| `only_allow_merge_if_all_discussions_are_resolved` | boolean | no | Only allow merging merge requests when all discussions are resolved. When enabled for a group, applies to all projects in the group. Premium and Ultimate only. |"
+	rowRepositoryStorage   = "| `repository_storage` | string | no | Filter by repository storage used by the group (administrators only). Premium and Ultimate only. |"
+	rowMarkedForDeletionOn = "| `marked_for_deletion_on` | date | no | Filter by date when group was marked for deletion. Introduced in GitLab 17.1. Premium and Ultimate only. |"
+	rowSecurityReports     = "| `with_security_reports` | boolean | no | Return only projects that have security reports artifacts present in any of their builds. Default is `false`. Ultimate only. |"
+	rowShareGroupAccess    = "| `group_access` | integer | yes | The default `access_level` to assign to the invited group. Possible values: `10` (Guest) to `50` (Owner). On Premium and Ultimate, `5` (Minimal access) is also valid when `id` is a top-level group. |"
+)
+
+// The custom role rows of doc/api/group_members.md, project_members.md and
+// group_ldap_links.md, and the Minimal access row the group member routes
+// carry beside them, as GitLab's pages carry them on master on 2026-10-27.
+const (
+	rowMemberAccessLevel   = "| `access_level` | integer | yes | A valid access level. Possible values: `10` (Guest) to `50` (Owner). On Premium and Ultimate, `5` (Minimal access) is also valid when `id` is a top-level group. |"
+	rowMemberRoleAdd       = "| `member_role_id` | integer | no | Ultimate only. The ID of a custom member role. |"
+	rowMemberRoleEdit      = "| `member_role_id` | integer | no | Ultimate only. The ID of a custom member role. If no value is specified, removes all roles. |"
+	rowLDAPLinkMemberRole  = "| `member_role_id` | integer | no | The ID of the member role. Ultimate only. |"
+	routeGroupMemberAdd    = "POST /groups/:id/members"
+	routeGroupMemberEdit   = "PUT /groups/:id/members/:user_id"
+	routeProjectMemberAdd  = "POST /projects/:id/members"
+	routeProjectMemberEdit = "PUT /projects/:id/members/:user_id"
+)
+
+// The rows of doc/api/group_level_variables.md, as GitLab's page carries them
+// on master on 2026-10-27, and the routes they document.
+const (
+	rowVariableFilter        = "| `filter` | hash | No | Filters results when multiple variables share the same key. Possible values: `[environment_scope]`. Premium and Ultimate only. |"
+	rowVariableScope         = "| `environment_scope` | string | No | The environment scope of a variable. Premium and Ultimate only. |"
+	routeGroupVariables      = "POST /groups/:id/variables"
+	routeGroupVariable       = "/groups/:id/variables/:key"
+	routeGroupVariableGet    = "GET " + routeGroupVariable
+	routeGroupVariableUpdate = "PUT " + routeGroupVariable
+	routeGroupVariableDelete = "DELETE " + routeGroupVariable
+)
+
+// TestRunMain_RealTable_AnswersTheRowsGitLabsSourceSettles drives the entry
+// point over a module root whose record names the actions of one page and
+// whose cache holds that page's sections, for each page whose rows issue 1240
+// read against GitLab's source. No finding of the page stays open: a row a
+// tier tag answered is not a finding at all, since the schema below its tier
+// no longer offers the parameter, and every other row is answered by the real
+// table with the category it gives, and no declaration of the table is stale.
+func TestRunMain_RealTable_AnswersTheRowsGitLabsSourceSettles(t *testing.T) {
+	cases := []struct {
+		name   string
+		area   string
+		page   string
+		domain string
+		record []actionrequests.RecordAction
+		want   map[string]string
+	}{
+		{
+			name:   "groups",
+			area:   "groups",
+			domain: "groups",
+			page: endpointSection("List groups", "GET /groups", rowRepositoryStorage, rowMarkedForDeletionOn) +
+				endpointSection("List projects", "GET /groups/:id/projects", rowSecurityReports) +
+				endpointSection("Create a group", "POST /groups", rowMembershipLock, rowExtraMinutesLimit, rowMinutesLimit, rowWikiAccessLevel) +
+				endpointSection("Update group attributes", "PUT /groups/:id",
+					rowExtraMinutesLimit, rowFileTemplateProject, rowMembershipLock, rowPreventForking, rowMinutesLimit,
+					rowIPRestriction, rowEmailDomains, rowWikiAccessLevel, rowDuoFeatures, rowLockDuoFeatures,
+					rowPipelineSucceeds, rowSkippedPipeline, rowDiscussionsResolved) +
+				// The share's Minimal access row is the page's other answer,
+				// and without it the read page would make that one stale.
+				endpointSection("Invite groups", "POST /groups/:id/share", rowShareGroupAccess),
+			record: []actionrequests.RecordAction{
+				restRecord("group.list", "GET /groups"),
+				restRecord("group.projects", "GET /groups/:id/projects"),
+				restRecord("group.create", "POST /groups"),
+				restRecord("group.update", "PUT /groups/:id"),
+				restRecord("group.share_with_group", "POST /groups/:id/share"),
+			},
+			want: map[string]string{
+				"group.share_with_group group_access":             categoryValueLevelGate,
+				"group.create membership_lock":                    categoryNotGated,
+				"group.create shared_runners_minutes_limit":       categoryNotGated,
+				"group.create extra_shared_runners_minutes_limit": categoryNotGated,
+				"group.update membership_lock":                    categoryNotGated,
+				"group.update shared_runners_minutes_limit":       categoryNotGated,
+				"group.update extra_shared_runners_minutes_limit": categoryNotGated,
+				"group.update duo_features_enabled":               categoryValueLevelGate,
+				"group.update lock_duo_features_enabled":          categoryValueLevelGate,
+				"group.list marked_for_deletion_on":               categoryNotGated,
+			},
+		},
+		{
+			name:   "group_members",
+			area:   "group_members",
+			domain: "groupmembers",
+			page: endpointSection("Add a group member", routeGroupMemberAdd, rowMemberAccessLevel, rowMemberRoleAdd) +
+				endpointSection("Update a group member", routeGroupMemberEdit, rowMemberAccessLevel, rowMemberRoleEdit),
+			record: []actionrequests.RecordAction{
+				restRecord("group.group_member_add", routeGroupMemberAdd),
+				restRecord("group.group_member_edit", routeGroupMemberEdit),
+			},
+			want: map[string]string{
+				"group.group_member_add access_level":    categoryValueLevelGate,
+				"group.group_member_edit access_level":   categoryValueLevelGate,
+				"group.group_member_edit member_role_id": categoryValueLevelGate,
+			},
+		},
+		{
+			name:   "project_members",
+			area:   "project_members",
+			domain: "members",
+			page: endpointSection("Add a member to a project", routeProjectMemberAdd, rowMemberRoleAdd) +
+				endpointSection("Update a member of a project", routeProjectMemberEdit, rowMemberRoleEdit),
+			record: []actionrequests.RecordAction{
+				restRecord("project.member_add", routeProjectMemberAdd),
+				restRecord("project.member_edit", routeProjectMemberEdit),
+			},
+			want: map[string]string{
+				"project.member_edit member_role_id": categoryValueLevelGate,
+			},
+		},
+		{
+			name:   "group_ldap_links",
+			area:   "group_ldap_links",
+			domain: "groupldap",
+			page:   endpointSection("Add an LDAP group link with CN or filter", "POST /groups/:id/ldap_group_links", rowLDAPLinkMemberRole),
+			record: []actionrequests.RecordAction{
+				restRecord("group.ldap_link_add", "POST /groups/:id/ldap_group_links"),
+			},
+			want: map[string]string{},
+		},
+		{
+			name:   "group_level_variables",
+			area:   "group_level_variables",
+			domain: "groupvariables",
+			page: endpointSection("Retrieve details of a group variable", routeGroupVariableGet, rowVariableFilter) +
+				endpointSection("Create a group variable", routeGroupVariables, rowVariableScope) +
+				endpointSection("Update a group variable", routeGroupVariableUpdate, rowVariableScope, rowVariableFilter) +
+				endpointSection("Delete a group variable", routeGroupVariableDelete, rowVariableFilter),
+			record: []actionrequests.RecordAction{
+				restRecord("ci_variable.group_get", routeGroupVariableGet),
+				restRecord("ci_variable.group_create", routeGroupVariables),
+				restRecord("ci_variable.group_update", routeGroupVariableUpdate),
+				restRecord("ci_variable.group_delete", routeGroupVariableDelete),
+			},
+			want: map[string]string{
+				"ci_variable.group_get filter":               categoryNotGated,
+				"ci_variable.group_create environment_scope": categoryValueLevelGate,
+				"ci_variable.group_update environment_scope": categoryNotGated,
+				"ci_variable.group_update filter":            categoryNotGated,
+				"ci_variable.group_delete filter":            categoryNotGated,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := fakeModuleRoot(t)
+			seedRecord(t, root, tc.record...)
+			seedDoc(t, apidocs.CacheDir(root), tc.area, tc.page)
+			t.Chdir(root)
+
+			rep := runReport(t, "-offline")
+			domain := findDomain(t, rep, tc.domain)
+			if domain.ParamFindings != nil {
+				t.Errorf("%s keeps open findings %+v, want every row answered", tc.domain, domain.ParamFindings)
+			}
+			got := map[string]string{}
+			for _, answered := range domain.ParamFindingsAnswered {
+				got[answered.Action+" "+answered.Param] = answered.Category
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("answered = %v, want %v", got, tc.want)
+			}
+			if rep.StaleParamDeclarations != nil {
+				t.Errorf("stale = %+v, want none of the real table", rep.StaleParamDeclarations)
+			}
+		})
+	}
+}

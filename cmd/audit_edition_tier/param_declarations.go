@@ -76,6 +76,30 @@ const (
 	// reasonMinimalAccessNeverOnAProject answers the project half of a page
 	// that documents a project and a group membership route in one table.
 	reasonMinimalAccessNeverOnAProject = "The page documents the project and the group route in one table, and the value the row's tier gates, 5 (Minimal access), is one a project grants on no tier: ProjectMember#access_level_inclusion takes Gitlab::Access.all_values, Guest to Owner (app/models/members/project_member.rb:65-70 and lib/gitlab/access.rb:54-56 at v19.5.0-ee). The schema offers no 5 (issue 1280)."
+	// reasonMembershipLockOnEveryTier answers the membership lock of a group
+	// create and update.
+	reasonMembershipLockOnEveryTier = "Enterprise Edition declares membership_lock on every tier (ee/lib/ee/api/helpers/groups_helpers.rb:25-26 at v19.5.0-ee), assigns it without a license check and enforces it on every tier (EE::Project#membership_locked?, ee/app/models/ee/project.rb:1168-1173, and EE::Members::CreateService#check_membership_lock!, ee/app/services/ee/members/create_service.rb:58-63). Only the settings page checks the member_lock license (ee/app/views/groups/_member_lock_setting.html.haml:1). Community Edition does not declare it (lib/api/helpers/groups_helpers.rb:54-55) and drops it, as it drops every Enterprise Edition parameter, which the tier model cannot tell from Free (issue 1240)."
+	// reasonComputeMinutesOnEveryTier answers the two compute minute limits of
+	// a group create and update.
+	reasonComputeMinutesOnEveryTier = "An administrator sets it on every tier: Enterprise Edition declares it (ee/lib/ee/api/helpers/groups_helpers.rb:29-30 at v19.5.0-ee), the services drop it only for a caller who is not an administrator (ee/app/services/ee/groups/create_service.rb:64-68 and ee/app/services/ee/groups/update_service.rb:80-86), and the quota applies to a top-level group on every tier (Ci::Minutes::Quota#enabled?, ee/app/models/ci/minutes/quota.rb:14-16). Community Edition does not declare it (lib/api/helpers/groups_helpers.rb:54-55), as it declares no Enterprise Edition parameter (issue 1240)."
+	// reasonDeletionDateFilterInCE answers the deletion date filter of the
+	// group list.
+	reasonDeletionDateFilterInCE = "Community Edition declares the filter (lib/api/groups.rb:37 at v19.5.0-ee, whose own description still says Premium and Ultimate), hands it to the finder (lib/api/groups.rb:70-76) and GroupsFinder applies it on every tier (app/finders/groups_finder.rb:123 and 158-162, Group.marked_for_deletion_on in app/models/group.rb:161-164) (issue 1240)."
+	// reasonCustomRoleRemovedOnEveryTier answers the custom role of a project
+	// and a group member edit.
+	reasonCustomRoleRemovedOnEveryTier = "A role ID needs Ultimate: GitLab deletes a member_role_id that is not null where the top-level group's custom_roles feature is not available (EE::Members::UpdateService#handle_member_role_assignment and #member_role_param_allowed?, ee/app/services/ee/members/update_service.rb:88-115 at v19.5.0-ee, and EE::Namespace#custom_roles_enabled?, ee/app/models/ee/namespace.rb:839-841). Null passes on every tier and is assigned with the rest of the params (app/services/members/update_service.rb:51), removing a custom role a member kept from a licensed time, and this server sends 0 as that null. The description says a role ID needs Ultimate and 0 removes one on every tier (issue 1240)."
+	// reasonVariableFilterOnEveryTier answers the filter of a group variable
+	// get, update and delete.
+	reasonVariableFilterOnEveryTier = "GitLab reads filter[environment_scope] on every tier and edition, though no route declares it: find_variable hands the raw params to Ci::VariablesFinder (lib/api/helpers/variables_helpers.rb:16-22 at v19.5.0-ee), which narrows the variables by it (app/finders/ci/variables_finder.rb:26-29), and the get, update and delete routes call it (lib/api/group_variables.rb:48, 135-136 and 172). A Free group can hold one key in several scopes, created on Community Edition, which keeps any scope, or in a licensed time, and the filter is what picks one of them (issue 1240)."
+	// reasonUpdateScopeIsTheFilter answers the environment scope of a group
+	// variable update, which this server sends as the filter.
+	reasonUpdateScopeIsTheFilter = "This action's environment_scope is the shorthand of filter.environment_scope and goes out as filter[environment_scope] (resolveScope in internal/tools/groupvariables), never as the body parameter the row describes, which moves a variable to another scope. The filter is read on every tier and edition (lib/api/group_variables.rb:135-136 and app/finders/ci/variables_finder.rb:26-29 at v19.5.0-ee) (issue 1240)."
+	// reasonVariableScopeOnCreate answers the environment scope of a group
+	// variable create.
+	reasonVariableScopeOnCreate = "A scope other than * needs Premium on Enterprise Edition, which deletes environment_scope where the group's group_scoped_ci_variables feature is not available (EE::API::Helpers::VariablesHelpers#filter_variable_parameters, ee/lib/ee/api/helpers/variables_helpers.rb:16-23 at v19.5.0-ee, and EE::Group#scoped_variables_available?, ee/app/models/ee/group.rb:631-633), so the variable applies to every environment. Community Edition declares the parameter and keeps it (lib/api/group_variables.rb:74 and lib/api/helpers/variables_helpers.rb:12-14), so a tag would take it from an instance that honors it; the description says which scopes need the tier (issue 1240)."
+	// reasonDuoNeedsAPaidTierOrAnAddOn answers the two Duo settings of a group
+	// update.
+	reasonDuoNeedsAPaidTierOrAnAddOn = "GitLab stores the setting on every Enterprise Edition tier (ee/lib/ee/api/helpers/groups_helpers.rb:102-107 at v19.5.0-ee), and GitLab Duo, which it switches, answers where the group's licensed AI features are available: Premium carries ai_chat, Ultimate ai_features, and a Free namespace has them only with a GitLab Credits add-on (EE::Group#licensed_ai_features_available?, ee/app/models/ee/group.rb:368-372, and EE::Namespace#has_active_gitlab_credits_add_on? on the root ancestor, ee/app/models/ee/namespace.rb:336-348). The response carries the setting only there (ee/lib/ee/api/entities/group.rb:47-56). A tag would take it from a Free namespace with credits, so the description says so instead (issue 1240)."
 )
 
 // declaredParamAnswers holds the answer to every parameter finding that is
@@ -87,11 +111,13 @@ const (
 // pages lists an entry that answered no finding as stale, which is the half that
 // needs GitLab's pages and therefore gates nothing.
 //
-// The seven entries are the Minimal access rows GitLab's pages gained after
-// the 19.5 release ("On Premium and Ultimate, 5 (Minimal access) is also
+// The first seven entries are the Minimal access rows GitLab's pages gained
+// after the 19.5 release ("On Premium and Ultimate, 5 (Minimal access) is also
 // valid when id is a top-level group"), which the access level work of issue
 // 1280 settled in the schemas: a group's description states the condition
-// beside the 5 it offers, and a project's enum leaves the 5 out.
+// beside the 5 it offers, and a project's enum leaves the 5 out. The rest are
+// the rows of issue 1240 that GitLab's source at v19.5.0-ee answers with
+// something other than a tier tag, one block per page.
 var declaredParamAnswers = map[string]paramDeclaration{
 	"access.approve_group access_level":    {Documented: tierPremium, Category: categoryValueLevelGate, Values: []int{5}, Reason: reasonMinimalAccessOnAGroup},
 	"access.invite_group access_level":     {Documented: tierPremium, Category: categoryValueLevelGate, Values: []int{5}, Reason: reasonMinimalAccessOnAGroup},
@@ -100,6 +126,25 @@ var declaredParamAnswers = map[string]paramDeclaration{
 	"group.share_with_group group_access":  {Documented: tierPremium, Category: categoryValueLevelGate, Values: []int{5}, Reason: reasonMinimalAccessOnAShare},
 	"access.approve_project access_level":  {Documented: tierPremium, Category: categoryGatedValueNotOffered, Values: []int{5}, Reason: reasonMinimalAccessNeverOnAProject},
 	"access.invite_project access_level":   {Documented: tierPremium, Category: categoryGatedValueNotOffered, Values: []int{5}, Reason: reasonMinimalAccessNeverOnAProject},
+
+	"group.create membership_lock":                    {Documented: tierPremium, Category: categoryNotGated, Reason: reasonMembershipLockOnEveryTier},
+	"group.update membership_lock":                    {Documented: tierPremium, Category: categoryNotGated, Reason: reasonMembershipLockOnEveryTier},
+	"group.create shared_runners_minutes_limit":       {Documented: tierPremium, Category: categoryNotGated, Reason: reasonComputeMinutesOnEveryTier},
+	"group.create extra_shared_runners_minutes_limit": {Documented: tierPremium, Category: categoryNotGated, Reason: reasonComputeMinutesOnEveryTier},
+	"group.update shared_runners_minutes_limit":       {Documented: tierPremium, Category: categoryNotGated, Reason: reasonComputeMinutesOnEveryTier},
+	"group.update extra_shared_runners_minutes_limit": {Documented: tierPremium, Category: categoryNotGated, Reason: reasonComputeMinutesOnEveryTier},
+	"group.list marked_for_deletion_on":               {Documented: tierPremium, Category: categoryNotGated, Reason: reasonDeletionDateFilterInCE},
+	"group.update duo_features_enabled":               {Documented: tierPremium, Category: categoryValueLevelGate, Reason: reasonDuoNeedsAPaidTierOrAnAddOn},
+	"group.update lock_duo_features_enabled":          {Documented: tierPremium, Category: categoryValueLevelGate, Reason: reasonDuoNeedsAPaidTierOrAnAddOn},
+
+	"group.group_member_edit member_role_id": {Documented: tierUltimate, Category: categoryValueLevelGate, Reason: reasonCustomRoleRemovedOnEveryTier},
+	"project.member_edit member_role_id":     {Documented: tierUltimate, Category: categoryValueLevelGate, Reason: reasonCustomRoleRemovedOnEveryTier},
+
+	"ci_variable.group_get filter":               {Documented: tierPremium, Category: categoryNotGated, Reason: reasonVariableFilterOnEveryTier},
+	"ci_variable.group_update filter":            {Documented: tierPremium, Category: categoryNotGated, Reason: reasonVariableFilterOnEveryTier},
+	"ci_variable.group_delete filter":            {Documented: tierPremium, Category: categoryNotGated, Reason: reasonVariableFilterOnEveryTier},
+	"ci_variable.group_update environment_scope": {Documented: tierPremium, Category: categoryNotGated, Reason: reasonUpdateScopeIsTheFilter},
+	"ci_variable.group_create environment_scope": {Documented: tierPremium, Category: categoryValueLevelGate, Reason: reasonVariableScopeOnCreate},
 }
 
 // answeredParamFinding is a finding a declaration answers, with the answer.
