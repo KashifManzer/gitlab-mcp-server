@@ -82,6 +82,15 @@ type HTTPEnvOverlay struct {
 	// with the flag layer's value, since that layer holds none: the caller
 	// sets [DefaultMaxFileSize].
 	UploadMaxFileSize *int64
+
+	// What the operator said about a plain HTTP listener off loopback: true
+	// declares that something in front of it encrypts the hop, which turns
+	// the startup warning about that listener into a line at INFO, and false
+	// is the hardened mode, which refuses to start it; nil is neither, and the
+	// listener is served with the warning. A container sets it here because
+	// the image's command already names --http-addr, and any argument after
+	// the image name replaces that command wholesale.
+	AllowPlaintextHTTP *bool
 }
 
 // envPresent reports whether name is set to a non-empty value, under either
@@ -169,6 +178,7 @@ func loadOverlayBooleans(o *HTTPEnvOverlay) error {
 		{"SAFE_MODE", &o.SafeMode},
 		{"EMBEDDED_RESOURCES", &o.EmbeddedResources},
 		{"IGNORE_SCOPES", &o.IgnoreScopes},
+		{"ALLOW_PLAINTEXT_HTTP", &o.AllowPlaintextHTTP},
 	} {
 		if !envPresent(b.name) {
 			continue

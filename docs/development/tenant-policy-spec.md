@@ -65,8 +65,8 @@ On stdio, process, entry and tenant are one. Over HTTP one tenant maps to one en
 credential per instance, one entry to one tenant or to unknown and to one owner for the
 life of its build, and one address to many tenants.
 
-A stdio process reads none of the settings only HTTP mode has, the pool, the stateful
-session, the drain, the authentication gate with its budgets, the OAuth verifier, the
+A stdio process reads none of the settings only HTTP mode has, the listener's plain
+HTTP opt-in, the pool, the stateful session, the drain, the authentication gate with its budgets, the OAuth verifier, the
 trusted origins and the discovery documents' bucket, so
 a row of one of them has no stdio key, and a stdio start names each such variable it
 finds set instead of refusing a value it would never use (issue 1171). The revalidation
@@ -830,6 +830,13 @@ and `unix` in `--trusted-proxies` trusts the socket's peer, so the proxy on it n
 caller as a TCP proxy does, and the host guard reads the same set. The two pairings that
 trust nobody refuse startup: a socket listener whose list names addresses and no `unix`,
 which used to start with its header inert, and `unix` on a TCP listener.
+
+The listener is judged once more at startup (`ADM-015`). A TCP listener another machine
+can reach that serves plain HTTP is served by default, with a warning, and in the hardened
+mode, `--allow-plaintext-http=false` or `GITLAB_MCP_ALLOW_PLAINTEXT_HTTP=false`, the process
+refuses to start it, so no caller's token crosses that hop in the clear. The row is keyed
+on the deployment, since only the operator sets it, and a value neither the flag package
+nor the overlay reads as a boolean refuses startup.
 
 Sixteen findings are answered, and stay in the list with their issues. F-03, the listing
 bucket with no process partner, is answered by `RTC-007`, the first of issue 951's three
