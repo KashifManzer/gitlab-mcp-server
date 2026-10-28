@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	yaml "go.yaml.in/yaml/v3"
 
@@ -122,29 +123,31 @@ var unlockedCode = []unlockedRule{
 		match:   regexpMatcher(cargoBinstall),
 		name:    "cargo-binstall",
 		display: `'\\bcargo[ -]binstall\\b'`,
-		why: "cargo binstall installs a prebuilt binary from a release asset or QuickInstall whatever version " +
-			"it names, which nothing committed here fixes (download the binary and hold it to a recorded SHA-256)",
+		why:     "cargo binstall installs a prebuilt binary from a release asset or QuickInstall whatever version it names, which nothing committed here fixes (download the binary and hold it to a recorded SHA-256)",
 	},
 	{
 		match:   cargoInstallUnlocked,
 		name:    "cargo-install",
 		display: `'\\bcargo\\s+install\\b'`,
-		why: "cargo install resolves a crate and its dependencies at run time unless its command carries " +
-			"--locked and an exact version or a --path",
+		why:     "cargo install resolves a crate and its dependencies at run time unless its command carries --locked and an exact version or a --path",
 	},
 	{
 		match:   goInstallUnpinned,
 		name:    "go-install",
 		display: `'\\bgo\\s+install\\b'`,
-		why: "go install at anything but an exact version or a full commit (a branch, a version query, " +
-			"a value only the run knows) resolves at run time",
+		why:     "go install at anything but an exact version or a full commit (a branch, a version query, a value only the run knows) resolves at run time",
+	},
+	{
+		match:   goRunAtVersion,
+		name:    "go-run-module",
+		display: `'\\bgo\\s+run\\b[^\\n]*@'`,
+		why:     "go run of a package at a version builds a module this checkout does not hold, which the job fetches when it runs (build the command from this module, or hand the job a binary held to a recorded SHA-256)",
 	},
 	{
 		match:   regexpMatcher(downloadInvokeExpression),
 		name:    "invoke-expression",
 		display: `'(?i)\\b(?:iex|invoke-expression)\\b'`,
-		why: "handing a download (iwr, irm, Invoke-WebRequest, Invoke-RestMethod, DownloadString) to " +
-			"Invoke-Expression on the same line runs unreviewed code",
+		why:     "handing a download (iwr, irm, Invoke-WebRequest, Invoke-RestMethod, DownloadString) to Invoke-Expression on the same line runs unreviewed code",
 	},
 }
 
@@ -155,10 +158,7 @@ var cargoBinstall = regexp.MustCompile(`(?m)\bcargo(?:[ \t]+binstall|-binstall(?
 // downloadInvokeExpression is a download PowerShell runs as code on the same
 // line: piped into Invoke-Expression, or handed to it as its argument.
 // PowerShell's names are case-insensitive, and so is the match.
-var downloadInvokeExpression = regexp.MustCompile(
-	`(?i)\b(?:iwr|irm|invoke-webrequest|invoke-restmethod)\b[^\n|]*\|\s*(?:iex|invoke-expression)\b` +
-		`|\b(?:iex|invoke-expression)\b[^\n]*\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring)\b`,
-)
+var downloadInvokeExpression = regexp.MustCompile(`(?i)\b(?:iwr|irm|invoke-webrequest|invoke-restmethod)\b[^\n|]*\|\s*(?:iex|invoke-expression)\b|\b(?:iex|invoke-expression)\b[^\n]*\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring)\b`)
 
 // cargoInstall and goInstall find an install and the rest of its line, which
 // installCommand cuts at the first shell separator so a word of the next
@@ -489,16 +489,20 @@ func unpinnedReason(reference string) string {
 // it names. A document that does not parse ends the reading there, leaving
 // the rest to the line scan; the failure itself is reported where the
 // document's structure is read.
+//
+// A stream holds at most one document per byte of it, which bounds the loop
+// whatever the decoder answers.
 func parsedUses(text string) []usesReference {
 	decoder := yaml.NewDecoder(strings.NewReader(text))
 	var found []usesReference
-	for {
+	for range len(text) {
 		var document yaml.Node
 		if decoder.Decode(&document) != nil {
-			return found
+			break
 		}
 		found = appendUsesKeys(found, &document)
 	}
+	return found
 }
 
 // appendUsesKeys appends every uses key under node whose value is a scalar.
@@ -600,6 +604,8 @@ type tables struct {
 	declarations map[string]declaration
 	unjudged     map[string]declaration
 	guarded      map[string]guardedMatch
+	scripts      map[string]scriptDeclaration
+	ports        map[int]string
 }
 
 // supplyChainAudit is one audit of one repository root: the tables it judges
@@ -612,7 +618,9 @@ type tables struct {
 // that runs make reads the same rules. store answers what a pinned action's
 // commit holds, and is nil in an audit built for one job rule's unit test;
 // reported holds the findings about an action that are made once however many
-// steps reach it.
+// steps reach it. toolFor names, for a job held only because it builds a tool
+// a credentialed job runs, that job, keyed by the workflow's label and the
+// job's id.
 type supplyChainAudit struct {
 	tables
 
@@ -622,6 +630,7 @@ type supplyChainAudit struct {
 	unjudgedUsed map[string]bool
 	guardedUsed  map[string]bool
 	reported     map[string]bool
+	toolFor      map[string]string
 	makefiles    map[string]map[string]*makeRule
 	root         string
 }
@@ -635,9 +644,25 @@ func newAudit(root string, declared tables) *supplyChainAudit {
 		unjudgedUsed: map[string]bool{},
 		guardedUsed:  map[string]bool{},
 		reported:     map[string]bool{},
+		toolFor:      map[string]string{},
 		makefiles:    map[string]map[string]*makeRule{},
 		root:         root,
 	}
+}
+
+// jobKey is how toolFor keys a job of a workflow.
+func jobKey(pathLabel, jobID string) string {
+	return pathLabel + "\x00" + jobID
+}
+
+// jobLabel is how a finding names a job rule 2 holds: by its id, and for a job
+// held only because it builds a tool, with the credentialed job that runs it.
+func (a *supplyChainAudit) jobLabel(pathLabel, jobID string) string {
+	label := pathLabel + ": job " + jobID
+	if consumer, builds := a.toolFor[jobKey(pathLabel, jobID)]; builds {
+		label += ", which builds a tool job " + consumer + " runs"
+	}
+	return label
 }
 
 // checkCredentialedJob reports everything a job holding a write credential runs
@@ -648,11 +673,18 @@ func (a *supplyChainAudit) checkCredentialedJob(pathLabel, jobID string, job, do
 }
 
 // judgeCredentialedJob is [supplyChainAudit.checkCredentialedJob] with what
-// the job has read already, which the walk through its actions shares.
+// the job has read already, which the walk through its actions shares. The
+// GOFLAGS the workflow's env sets is judged once for every job it reaches.
 func (a *supplyChainAudit) judgeCredentialedJob(pathLabel, jobID string, job, doc map[string]any, seen map[string]bool) []string {
 	var problems []string
+	if !a.reported["env "+pathLabel] {
+		a.reported["env "+pathLabel] = true
+		problems = goFlagsInEnv(pathLabel, doc["env"])
+	}
 	steps, _ := job["steps"].([]any)
-	jobLabel := pathLabel + ": job " + jobID
+	jobLabel := a.jobLabel(pathLabel, jobID)
+	_, toolOnly := a.toolFor[jobKey(pathLabel, jobID)]
+	problems = append(problems, goFlagsInEnv(jobLabel, job["env"])...)
 	for index, rawStep := range steps {
 		step, ok := rawStep.(map[string]any)
 		if !ok {
@@ -663,7 +695,8 @@ func (a *supplyChainAudit) judgeCredentialedJob(pathLabel, jobID string, job, do
 		with, _ := step["with"].(map[string]any)
 		where := fmt.Sprintf("%s: step %d", jobLabel, index)
 
-		problems = append(problems, checkStepAction(where, uses, with, doc)...)
+		problems = append(problems, checkStepAction(where, uses, with, doc, !toolOnly)...)
+		problems = append(problems, goFlagsInEnv(where, step["env"])...)
 
 		runSource, _ := step["run"].(string)
 		runText := stripComments(runSource)
@@ -673,7 +706,11 @@ func (a *supplyChainAudit) judgeCredentialedJob(pathLabel, jobID string, job, do
 			}
 		}
 		reached := reach{job: jobLabel, origin: where, directory: runDirectory(doc, job, step)}
+		problems = append(problems, a.judgeGoCommands(reached, runText)...)
 		problems = append(problems, a.followReferences(reached, runText, seen)...)
+		if uses == goreleaserAction {
+			problems = append(problems, a.followGoReleaser(reached, with, seen)...)
+		}
 	}
 	return problems
 }
@@ -702,16 +739,22 @@ func defaultRunDirectory(holder map[string]any) (string, bool) {
 }
 
 // checkStepAction applies the per-action rules: the checkout that must not
-// persist a credential, the GoReleaser binary that must be pinned, and the SBOM
+// persist a credential in a job whose token writes, the Go setup that must not
+// restore a cache, the GoReleaser binary that must be pinned, and the SBOM
 // action that must not be here at all.
-func checkStepAction(where, uses string, with, doc map[string]any) []string {
+func checkStepAction(where, uses string, with, doc map[string]any, writes bool) []string {
 	var problems []string
-	if uses == "actions/checkout" && !persistCredentialsDisabled(with) {
+	if writes && uses == checkoutAction && !inputFalse(with, "persist-credentials") {
 		problems = append(problems, where+": actions/checkout must set persist-credentials: false — "+
 			"the job's write-capable token would otherwise sit in .git/config "+
 			"while the rest of the steps run")
 	}
-	if uses == "goreleaser/goreleaser-action" {
+	if uses == "actions/setup-go" && !inputFalse(with, "cache") {
+		problems = append(problems, where+": actions/setup-go must set cache: false: "+
+			"the module and build caches it would restore were saved by whichever run wrote them last, "+
+			"and nothing this job checks covers what they hold")
+	}
+	if uses == goreleaserAction {
 		raw, ok := with["version"]
 		if !ok {
 			raw = ""
@@ -734,10 +777,11 @@ func checkStepAction(where, uses string, with, doc map[string]any) []string {
 	return problems
 }
 
-// persistCredentialsDisabled reports whether a checkout step turned the
-// credential off, accepting either the boolean or the string GitHub allows.
-func persistCredentialsDisabled(with map[string]any) bool {
-	switch value := with["persist-credentials"].(type) {
+// inputFalse reports whether a step set an input to false, accepting either
+// the boolean or the string GitHub allows: a checkout that turned its
+// credential off, a Go setup that turned its cache off.
+func inputFalse(with map[string]any, input string) bool {
+	switch value := with[input].(type) {
 	case bool:
 		return !value
 	case string:
@@ -758,8 +802,13 @@ func persistCredentialsDisabled(with map[string]any) bool {
 // jobOrder carries the document order when the caller parsed a file; a document
 // built in a test carries none, and the keys are then sorted so the findings
 // are still deterministic.
+//
+// A job that builds a tool a credentialed job runs is held to the same rules,
+// however long the chain of builders, since what it builds runs with that
+// job's credential (see [supplyChainAudit.heldJobs]).
 func (a *supplyChainAudit) checkWorkflowJobs(pathLabel string, doc map[string]any, jobOrder []string) []string {
 	jobs, _ := doc["jobs"].(map[string]any)
+	held := a.heldJobs(pathLabel, doc, jobs, jobOrder)
 	var problems []string
 	for _, jobID := range orderedKeys(jobs, jobOrder) {
 		job, ok := jobs[jobID].(map[string]any)
@@ -767,17 +816,14 @@ func (a *supplyChainAudit) checkWorkflowJobs(pathLabel string, doc map[string]an
 			continue
 		}
 		names, wholesale := jobSecrets(doc, job)
-		credentialed := isCredentialed(doc, job) || len(wholesale) > 0
 		for _, name := range names {
 			a.secretsRead[name] = true
-			declared, known := a.secrets[name]
-			if !known {
+			if _, known := a.secrets[name]; !known {
 				problems = append(problems, fmt.Sprintf(
 					"%s: job %s: reads secrets.%s, which the secret table does not declare: say whether it can write and where",
 					pathLabel, jobID, name,
 				))
 			}
-			credentialed = credentialed || !known || declared.writes
 		}
 		for _, expression := range wholesale {
 			problems = append(problems, fmt.Sprintf(
@@ -786,12 +832,66 @@ func (a *supplyChainAudit) checkWorkflowJobs(pathLabel string, doc map[string]an
 			))
 		}
 		seen := map[string]bool{}
+		credentialed := held[jobID]
 		if credentialed {
 			problems = append(problems, a.judgeCredentialedJob(pathLabel, jobID, job, doc, seen)...)
+			problems = append(problems, a.toolArtifactProblems(pathLabel, jobID, job, jobs, jobOrder)...)
 		}
 		problems = append(problems, a.checkJobActions(pathLabel, jobID, job, doc, credentialed, seen)...)
 	}
 	return problems
+}
+
+// holdsCredential reports whether a job holds a write credential: through its
+// permissions or the workflow's, or through a secret it reads that the table
+// says can write, does not declare, or hands over with every other secret at
+// once, since the audit cannot say what such a read holds.
+func (a *supplyChainAudit) holdsCredential(doc, job map[string]any) bool {
+	names, wholesale := jobSecrets(doc, job)
+	held := isCredentialed(doc, job) || len(wholesale) > 0
+	for _, name := range names {
+		declared, known := a.secrets[name]
+		held = held || !known || declared.writes
+	}
+	return held
+}
+
+// heldJobs returns the jobs of a workflow rule 2 holds: every job holding a
+// write credential, and every job that builds a tool one of those runs, and
+// so on down the chain, since a tool's builder decides what the job running it
+// runs and the SHA-256 it publishes vouches for whatever it built. A job held
+// only as a builder is recorded in toolFor with the first job found to run its
+// tool, which names it in its findings.
+func (a *supplyChainAudit) heldJobs(pathLabel string, doc, jobs map[string]any, order []string) map[string]bool {
+	held := map[string]bool{}
+	var queue []string
+	for _, id := range orderedKeys(jobs, order) {
+		if job, ok := jobs[id].(map[string]any); ok && a.holdsCredential(doc, job) {
+			held[id] = true
+			queue = append(queue, id)
+		}
+	}
+	for index := 0; index < len(queue); index++ {
+		consumer := queue[index]
+		job, _ := jobs[consumer].(map[string]any)
+		steps, _ := job["steps"].([]any)
+		for _, raw := range steps {
+			step, _ := raw.(map[string]any)
+			uses, _ := step["uses"].(string)
+			if name, _, _ := strings.Cut(uses, "@"); name != downloadArtifactAction {
+				continue
+			}
+			with, _ := step["with"].(map[string]any)
+			for _, builder := range toolBuilders(jobs, order, consumer, with) {
+				if !held[builder] {
+					held[builder] = true
+					a.toolFor[jobKey(pathLabel, builder)] = consumer
+					queue = append(queue, builder)
+				}
+			}
+		}
+	}
+	return held
 }
 
 // orderedKeys returns the keys of jobs, preferring the document order in order
@@ -989,7 +1089,8 @@ func auditWith(root string, declared tables, store *actionStore) ([]string, erro
 	if err != nil {
 		return nil, err
 	}
-	return append(problems, checkInstallers(installSh, installPS1)...), nil
+	problems = append(problems, checkInstallers(installSh, installPS1)...)
+	return append(problems, scriptProblems(scriptsInTree(root), declared)...), nil
 }
 
 // auditWorkflows applies the pinning rule and the credentialed-job rules to
@@ -1040,10 +1141,11 @@ func recordAndAudit(root string, declared tables, stdout io.Writer) ([]string, e
 // every file of a public repository at a commit there, with no token.
 const rawContentBase = "https://raw.githubusercontent.com"
 
-// recordClient is the HTTP client -record fetches with, bounded so a host
-// that stops answering ends the run rather than hanging it.
+// recordClient is the HTTP client -record fetches with, each request bounded
+// at thirty seconds so a host that stops answering ends the run rather than
+// hanging it.
 func recordClient() *http.Client {
-	return &http.Client{Timeout: recordFetchTimeout}
+	return &http.Client{Timeout: 30 * time.Second}
 }
 
 // newRecordFetcher is a seam over how -record reaches the network, so a test
@@ -1252,7 +1354,7 @@ func run(args []string, stdout, stderr io.Writer, declared tables) int {
 		return 1
 	}
 	fmt.Fprint(stdout, "supply-chain audit passed: pinned actions, locked release jobs, "+
-		"stated cooldowns, current security policy, signature-verifying installers\n")
+		"stated cooldowns, current security policy, signature-verifying installers, declared scripts\n")
 	return 0
 }
 

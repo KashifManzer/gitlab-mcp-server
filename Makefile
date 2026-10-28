@@ -1,7 +1,6 @@
 .PHONY: build build-all build-linux-amd64 build-linux-arm64 build-windows-amd64 build-windows-arm64 build-darwin-amd64 build-darwin-arm64 \
 	run brand brand-check brand-rasters ensure-mcp-publisher mcp-publisher-version test test-short test-race coverage-conditions coverage-mutants test-pkg test-integration test-e2e test-e2e-harness test-e2e-http test-e2e-stdio test-e2e-collector ensure-gotestsum test-e2e-docker test-e2e-docker-enterprise test-e2e-gitlab-com \
 	e2e-server-binary test-e2e-ce test-e2e-ee test-e2e-gitlab e2e-clean-orphans \
-	validate-http-stateless validate-http-stateless-docker \
 	orbit-setup-fixtures orbit-wait-indexer orbit-run-live-tests orbit-ensure-token gen-orbit-record check-orbit-record \
 	coverage \
 	modeleval-ce modeleval-ee modeleval-probe \
@@ -385,14 +384,6 @@ test-e2e-collector: ensure-gotestsum e2e-server-binary
 	  --format testdox \
 	  --junitfile $(E2E_REPORT_DIR)/e2e-collector-junit.xml \
 	  -- -tags collectore2e -count=1 -timeout 900s ./test/e2e/collector/'
-
-## validate-http-stateless: smoke-validate stateless streamable HTTP with the compiled binary (reads GITLAB_URL, GITLAB_TOKEN from .env)
-validate-http-stateless:
-	scripts/validate-http-stateless.sh binary
-
-## validate-http-stateless-docker: smoke-validate stateless streamable HTTP with the Docker image
-validate-http-stateless-docker:
-	scripts/validate-http-stateless.sh docker
 
 ## test-e2e-docker: the ephemeral GitLab CE run under its older name; an alias of test-e2e-ce.
 # It used to carry a Docker lifecycle of its own, written out here, that ran
@@ -955,10 +946,12 @@ golangci-lint:
 	golangci-lint run --build-tags $(GO_ANALYSIS_TAGS) $(GO_ANALYSIS_PKGS)
 
 ## govulncheck: scan Go dependencies for known CVEs using call-graph analysis.
-## Only reports vulnerabilities where the vulnerable function is actually called.
+## Only reports vulnerabilities where the vulnerable function is actually called,
+## and its exit status is the gate: no advisory is accepted, so there is no list
+## to hold beside it (docs/development/static-analysis.md).
 ## Docs: https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck
 govulncheck:
-	./scripts/govulncheck.sh -tags $(GO_ANALYSIS_TAGS) $(GO_ANALYSIS_PKGS)
+	govulncheck -tags $(GO_ANALYSIS_TAGS) $(GO_ANALYSIS_PKGS)
 
 ## check-binary-vulns: build every target .goreleaser.yml names and hold each binary to the vulnerability database at module grain, which is how a scanner reading a shipped binary or its SBOM judges it.
 ## Fails on an advisory cmd/audit_binary_vulns/declarations.go does not accept, and on a declaration that no longer matches anything.
@@ -1063,7 +1056,7 @@ analyze:
 	run_check "[2/31] golangci-lint fmt" golangci-lint fmt --diff; \
 	run_check "[3/31] golangci-lint run" golangci-lint run --build-tags $(GO_ANALYSIS_TAGS) $(GO_ANALYSIS_PKGS); \
 	run_check "[4/31] constants nothing reads" go run ./cmd/audit_dead_consts/ -check; \
-	run_check "[5/31] govulncheck" ./scripts/govulncheck.sh -tags $(GO_ANALYSIS_TAGS) $(GO_ANALYSIS_PKGS); \
+	run_check "[5/31] govulncheck" govulncheck -tags $(GO_ANALYSIS_TAGS) $(GO_ANALYSIS_PKGS); \
 	run_check "[6/31] markdownlint" npx markdownlint-cli2 "**/*.{md,mdx}" "#plan" "#node_modules"; \
 	run_check "[7/31] test-goroutine aborts" go run ./cmd/audit_test_goroutines --check; \
 	run_check "[8/31] case loops without subtests" go run ./cmd/audit_test_subtests --check; \
