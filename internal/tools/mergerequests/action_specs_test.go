@@ -228,17 +228,18 @@ func TestActionSpecs_ListGlobal_SaysWhatAnOmittedScopeReturns(t *testing.T) {
 	}
 }
 
-// TestActionSpecs_CancelAutoMerge_SaysTheRefusalNeedsAKnownRelease verifies
+// TestActionSpecs_CancelAutoMerge_SaysTheRefusalNeedsAnAvailableRoute verifies
 // the usage line of the auto-merge cancel on the one thing it promises about
 // a merge request with nothing to cancel. The handler sends cancel_auto_merge,
 // which refuses that, only when it knows the instance runs 19.5 or later: an
 // instance whose version endpoint did not answer or refused the token is sent
 // the deprecated route, which answers with the merge request as it is. A line
 // promising the refusal on every 19.5 instance told a fine-grained token
-// without Metadata: Read the opposite of what it gets.
-func TestActionSpecs_CancelAutoMerge_SaysTheRefusalNeedsAKnownRelease(t *testing.T) {
+// without Metadata: Read the opposite of what it gets. A node that has not
+// received the new route also uses the deprecated route after its 404.
+func TestActionSpecs_CancelAutoMerge_SaysTheRefusalNeedsAnAvailableRoute(t *testing.T) {
 	usage := mergeRequestSpecsByTool(t, ActionSpecs(testutil.NewTestClient(t, testutil.ForbiddenHandler(t))))["gitlab_mr_cancel_auto_merge"].Usage
-	for _, fragment := range []string{"known to run GitLab 19.5 or later", "is refused", "version cannot be read", "merge request as it is"} {
+	for _, fragment := range []string{"known to run GitLab 19.5 or later", "cancel_auto_merge is available", "is refused", "version cannot be read", "route answers 404 uses the deprecated route", "merge request as it is"} {
 		t.Run(fragment, func(t *testing.T) {
 			if !strings.Contains(usage, fragment) {
 				t.Errorf("Usage = %q, want it to carry %q", usage, fragment)

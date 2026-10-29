@@ -20,8 +20,8 @@
 
 | Metric                                                |  Value |
 | ----------------------------------------------------- | -----: |
-| Total test functions                                  | 22,715 |
-| Unit test functions                                   | 21,048 |
+| Total test functions                                  | 22,720 |
+| Unit test functions                                   | 21,053 |
 | E2E test functions                                    |  1,667 |
 | cmd test functions                                    |  5,299 |
 | Test files (internal/)                                |    742 |
@@ -39,7 +39,7 @@
 | -------------------------------------- | -----: | ----: |
 | `TestFunc_Scenario` (2-part)           | 13,626 | 60.0% |
 | `TestFunc` (no underscore)             |    909 |  4.0% |
-| `TestFunc_Scenario_Expected` (3+ part) |  8,180 | 36.0% |
+| `TestFunc_Scenario_Expected` (3+ part) |  8,185 | 36.0% |
 
 ## Test Distribution
 
@@ -49,10 +49,10 @@
 | ----------------------- | -------------: | ---------: | ----------------------------------------------------------------------------------------------- |
 | Core packages           |          4,171 |        253 | shared runtime packages such as config, GitLab client, OAuth, resources, prompts, and utilities |
 | Tools orchestration     |            433 |         16 | registration, meta-tool dispatch, safe mode, validation, markdown, and routing tests            |
-| Tool sub-packages (181) |         11,145 |        473 | domain-specific GitLab tool handlers                                                            |
+| Tool sub-packages (181) |         11,150 |        473 | domain-specific GitLab tool handlers                                                            |
 | E2E integration         |          1,667 |        435 | build-tagged; only test/e2e/gitlab and test/e2e/orbit need a real instance                      |
 | cmd packages            |          5,299 |        401 | server entry point and developer command utilities                                              |
-| **Total**               |     **22,715** |  **1,578** |                                                                                                 |
+| **Total**               |     **22,720** |  **1,578** |                                                                                                 |
 
 ### Core Packages
 
@@ -100,7 +100,7 @@
 | Sub-package       | Tests | Coverage | Tools |
 | ----------------- | ----: | -------: | ----: |
 | projects          |   499 |   100.0% |    57 |
-| mergerequests     |   345 |   100.0% |    30 |
+| mergerequests     |   350 |   100.0% |    30 |
 | dynamic           |   324 |   100.0% |     2 |
 | groups            |   318 |   100.0% |    37 |
 | issues            |   296 |   100.0% |    21 |
@@ -239,7 +239,7 @@
 | markdown                |         10 |          1 |   100.0% |         1 |
 | memberroles             |         58 |          4 |   100.0% |         6 |
 | members                 |         77 |          3 |   100.0% |         6 |
-| mergerequests           |        345 |          5 |   100.0% |        30 |
+| mergerequests           |        350 |          5 |   100.0% |        30 |
 | mergetrains             |         27 |          2 |   100.0% |         4 |
 | metadata                |          9 |          1 |   100.0% |         1 |
 | milestones              |         97 |          2 |   100.0% |         9 |
@@ -313,7 +313,7 @@
 | wikis                   |         74 |          2 |   100.0% |         6 |
 | workitems               |        141 |          6 |   100.0% |         6 |
 | workitemsavedviews      |         63 |          4 |   100.0% |         7 |
-| **Total**               | **11,145** |    **473** |          | **1,195** |
+| **Total**               | **11,150** |    **473** |          | **1,195** |
 
 </details>
 

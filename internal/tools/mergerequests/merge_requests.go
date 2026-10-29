@@ -1967,7 +1967,9 @@ const (
 // ([cancelAutoMergeRoute]). An instance older than that, or one whose release
 // is not known because its version endpoint did not answer or refused this
 // token, is sent the deprecated cancel_merge_when_pipeline_succeeds, as every
-// instance used to be.
+// instance used to be. A 404 from cancel_auto_merge also falls back to that
+// route: during a rolling upgrade, the node answering the cancel may be older
+// than the one that answered the version read. Other failures are not retried.
 //
 // The deprecated route does not send the merge request back. Its Grape
 // annotation names API::Entities::MergeRequest, which is what the API
@@ -1990,13 +1992,19 @@ func CancelAutoMerge(ctx context.Context, client *gitlabclient.Client, input Get
 		return Output{}, toolutil.ErrRequiredInt64(opCancelAutoMerge, "merge_request_iid")
 	}
 	if client.AtLeast(ctx, cancelAutoMergeSinceMajor, cancelAutoMergeSinceMinor) {
-		//gitlab:request alternatives: an instance on 19.5 or later is sent cancel_auto_merge and the deprecated route below is not sent
+		//gitlab:request alternatives: an instance on 19.5 or later is sent cancel_auto_merge in place of the deprecated route below, which it is sent only after cancel_auto_merge answered 404
 		return cancelAutoMergeRoute(ctx, client, input)
 	}
+	//gitlab:request alternatives: an instance older than 19.5, or one whose release is not known, is sent the deprecated route instead of cancel_auto_merge
+	return cancelMergeWhenPipelineSucceedsRoute(ctx, client, input)
+}
+
+// cancelMergeWhenPipelineSucceedsRoute uses the deprecated route for an older
+// or unknown release, or a node that has not received cancel_auto_merge yet.
+func cancelMergeWhenPipelineSucceedsRoute(ctx context.Context, client *gitlabclient.Client, input GetInput) (Output, error) {
 	// The capture rides its own context so the fall-back Get below starts from
 	// the caller's, with a capture of its own.
 	callCtx, captured := gitlabclient.WithResponseCapture(ctx)
-	//gitlab:request alternatives: an instance older than 19.5, or one whose release is not known, is sent the deprecated route instead of cancel_auto_merge
 	mr, _, err := client.GL().MergeRequests.CancelMergeWhenPipelineSucceeds(string(input.ProjectID), input.MRIID, gl.WithContext(callCtx))
 	if err != nil {
 		return Output{}, cancelAutoMergeFailure(err, http.StatusMethodNotAllowed, http.StatusNotAcceptable)
@@ -2012,15 +2020,21 @@ func CancelAutoMerge(ctx context.Context, client *gitlabclient.Client, input Get
 
 // cancelAutoMergeRoute cancels an auto-merge through cancel_auto_merge, the
 // route GitLab 19.5 added, which answers with the merge request, so nothing is
-// read back.
+// read back. Only a 404 falls back to the deprecated route, whose error is
+// reported if it also fails.
 //
 // client-go has no method for it yet (gitlab-org/api/client-go!3101 adds
 // MergeRequests.CancelAutoMerge, and no release carries it), so the request is
 // the handler's own, the way invites.postInvitation makes one; it moves to the
 // method in its own change once a client-go release carries it.
 func cancelAutoMergeRoute(ctx context.Context, client *gitlabclient.Client, input GetInput) (Output, error) {
-	return postCancelAutoMerge(ctx, client,
+	out, err := postCancelAutoMerge(ctx, client,
 		fmt.Sprintf("projects/%s/merge_requests/%d/cancel_auto_merge", gl.PathEscape(string(input.ProjectID)), input.MRIID))
+	if toolutil.IsHTTPStatus(err, http.StatusNotFound) {
+		//gitlab:request optional: the deprecated route is sent only when cancel_auto_merge answered 404, as an older node does during a rolling upgrade
+		return cancelMergeWhenPipelineSucceedsRoute(ctx, client, input)
+	}
+	return out, err
 }
 
 // postCancelAutoMerge posts the cancel to path and converts the merge request
