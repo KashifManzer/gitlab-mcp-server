@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unicode/utf8"
 
@@ -183,18 +184,21 @@ func TestOrbit_QuerySpec_TeachesGQL(t *testing.T) {
 		{name: "description refuses OR", text: description, want: "never OR"},
 		{name: "description gives an aggregation", text: description, want: "count(mr) AS mr_count"},
 		{name: "description names where the vocabulary comes from", text: description, want: "orbit.schema lists the entities, properties and relationship types"},
-		{name: "description says what an object gets", text: description, want: "GitLab.com refuses it while it reads queries as GQL"},
+		{name: "description says the JSON DSL is gone", text: description, want: "The JSON query DSL GitLab.com read before is gone"},
 		{name: "description keeps the parameter required", text: description, want: ",required"},
 		{name: "value source names GQL", text: guidance.ValueSource, want: "GQL text"},
 		{name: "value source points at the language", text: guidance.ValueSource, want: "orbit.dsl"},
 		{name: "value source points at the schema", text: guidance.ValueSource, want: "orbit.schema"},
 		{name: "confusions bound a node", text: confusions, want: "LIMIT bounds nothing"},
 		{name: "confusions give the colon", text: confusions, want: "Written without it, -[IN_PROJECT]-> declares a variable"},
-		{name: "confusions refuse OR", text: confusions, want: "OR, XOR, DISTINCT, count(*), OPTIONAL MATCH, WITH and UNION are refused"},
+		{name: "confusions refuse OR", text: confusions, want: "OR, XOR, RETURN DISTINCT, count(*), OPTIONAL MATCH, WITH and UNION are refused"},
+		{name: "confusions page with SKIP and LIMIT", text: confusions, want: "A page is SKIP and LIMIT"},
+		{name: "confusions name a shortest path's relationship types", text: confusions, want: "a wildcard -[*1..3]-> is refused"},
+		{name: "description pages with SKIP and LIMIT", text: description, want: "SKIP takes 0 to 10000 and LIMIT 1 to 1000"},
 		{name: "confusions negate a list", text: confusions, want: "NOT p.visibility_level IN [...]"},
 		{name: "confusions keep -- for neighbors", text: confusions, want: "The undirected -- is for the neighbors of one node"},
 		{name: "confusions give a shortest path", text: confusions, want: "ANY SHORTEST"},
-		{name: "confusions say what an object gets", text: confusions, want: "answered compile_error while it reads GQL"},
+		{name: "confusions say what an object gets", text: confusions, want: "the JSON DSL GitLab.com removed, and is answered compile_error at line 1, column 1"},
 	}
 	for _, tt := range served {
 		t.Run(tt.name, func(t *testing.T) {
@@ -235,8 +239,9 @@ func TestOrbit_QuerySpec_TeachesGQL(t *testing.T) {
 
 // TestOrbit_QueryResponseFormat_NamesTheThreeFormats verifies that the schema
 // description of orbit.query's response_format names the three formats
-// POST /orbit/query takes, gql among them, and that the actions reading the
-// other routes, which take two, still say raw or llm.
+// POST /orbit/query takes, gql among them, that orbit.dsl, whose MCP tool
+// takes two, says raw or llm, and that the two actions GitLab now answers
+// through GraphQL say every value returns the one structured shape.
 func TestOrbit_QueryResponseFormat_NamesTheThreeFormats(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -244,8 +249,9 @@ func TestOrbit_QueryResponseFormat_NamesTheThreeFormats(t *testing.T) {
 		want  string
 	}{
 		{name: "query", input: reflect.TypeFor[QueryInput](), want: "raw (structured JSON, the default here), llm (compact text) or gql (the result as a graph pattern table)"},
-		{name: "status", input: reflect.TypeFor[StatusInput](), want: "Response format: raw or llm"},
-		{name: "graph_status", input: reflect.TypeFor[GraphStatusInput](), want: "Response format: raw or llm"},
+		{name: "dsl", input: reflect.TypeFor[DSLInput](), want: "Response format: raw or llm"},
+		{name: "status", input: reflect.TypeFor[StatusInput](), want: "every value returns the same output"},
+		{name: "graph_status", input: reflect.TypeFor[GraphStatusInput](), want: "every value returns the same output"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -313,20 +319,19 @@ func TestOrbit_DSLSpec_DescribesGQL(t *testing.T) {
 	}
 }
 
-// TestOrbit_QuerySchema_TakesTextOrAnObjectOnEverySurface verifies that the
-// query parameter is served as a string or an object on every surface that
-// carries a schema: the individual tool, and the meta tool's per-action schema
-// in its full and compact modes. A Go field typed any reflects as no type at
-// all, which the compact mode would serve as an empty schema, and the type
-// override is what says both forms are taken; a schema typed object alone, as
-// it was until issue 1414, refuses the GQL text GitLab.com reads before the
-// handler sees it.
-func TestOrbit_QuerySchema_TakesTextOrAnObjectOnEverySurface(t *testing.T) {
+// TestOrbit_QuerySchema_TakesTextOnEverySurface verifies that the query
+// parameter is served as a string on every surface that carries a schema: the
+// individual tool, and the meta tool's per-action schema in its full and
+// compact modes, with the GQL example where the mode keeps examples. GitLab's
+// query route declares the query a String, and refuses an object as "query is
+// invalid" since gitlab-org/gitlab!261947 removed the JSON DSL on 2026-10-27;
+// the schema took a string or an object until then (issue 1414).
+func TestOrbit_QuerySchema_TakesTextOnEverySurface(t *testing.T) {
 	client, err := gitlabclient.NewClientWithToken("https://gitlab.com", "tok", false)
 	if err != nil {
 		t.Fatalf("NewClientWithToken() error: %v", err)
 	}
-	want := []any{"string", "object"}
+	want := "string"
 
 	tool, err := toolutil.IndividualToolFromSpecs(ActionSpecs(client), "gitlab_orbit_query", toolutil.IndividualToolProjectionOptions{Description: "Run an Orbit query."})
 	if err != nil {
@@ -401,24 +406,36 @@ func TestOrbit_MetaFullSchema_AcceptsGQLText(t *testing.T) {
 	}
 }
 
-// TestOrbit_DSLRoute_ReadsTheQueryCommandWhileTheDSLRouteAnswers404 verifies
-// the orbit.dsl route as a caller meets it: GitLab.com answers 404 at
-// GET /orbit/schema/dsl since it turned GQL on, and the route serves the
-// query command's grammar instead, its card ending on the action that lists
-// the entities a query names, rather than the "Orbit is not enabled" card the
-// retired route's 404 produced (issue 1414).
-func TestOrbit_DSLRoute_ReadsTheQueryCommandWhileTheDSLRouteAnswers404(t *testing.T) {
-	routes := newOrbitSpecsByTool(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v4/orbit/schema/dsl":
-			testutil.RespondJSON(w, http.StatusNotFound, `{"code":5,"message":"Orbit request failed"}`)
-		case "/api/v4/orbit/agent/commands":
-			testutil.RespondJSON(w, http.StatusOK, agentCommandsRaw)
-		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
-			http.Error(w, "unexpected path", http.StatusInternalServerError)
-		}
+// TestOrbit_MetaFullSchema_RefusesAJSONObject verifies the other half: a query
+// written as a JSON object, the JSON DSL GitLab.com removed on 2026-10-27, is
+// refused before anything is sent, since the query parameter is a string,
+// rather than reaching GitLab to be answered "query is invalid".
+func TestOrbit_MetaFullSchema_RefusesAJSONObject(t *testing.T) {
+	restore := toolutil.SetMetaParamSchemaModeScoped(toolutil.MetaParamSchemaFull)
+	t.Cleanup(restore)
+	session := newOrbitMetaSession(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("handler should not be called for a query written as an object: %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
 	}))
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "gitlab_orbit",
+		Arguments: map[string]any{"action": "query", "params": map[string]any{"query": map[string]any{"query_type": "traversal"}}},
+	})
+	if err == nil && !result.IsError {
+		t.Fatalf("gitlab_orbit query with a JSON object = %#v, want it refused", result.Content)
+	}
+}
+
+// TestOrbit_DSLRoute_ReadsTheQueryCommandFromTheMCPEndpoint verifies the
+// orbit.dsl route as a caller meets it: GitLab.com answers 404 at the two
+// REST routes this action read before (GET /orbit/schema/dsl since issue 1414,
+// GET /orbit/agent/commands since gitlab-org/gitlab!266009), and the route
+// serves the query command's grammar from list_commands of the Orbit MCP
+// endpoint, its card ending on the action that lists the entities a query
+// names.
+func TestOrbit_DSLRoute_ReadsTheQueryCommandFromTheMCPEndpoint(t *testing.T) {
+	routes := newOrbitSpecsByTool(t, orbitSourcesHandler(t))
 
 	result, err := routes["gitlab_orbit_dsl"].Handler(t.Context(), map[string]any{})
 	if err != nil {
@@ -443,18 +460,21 @@ func TestOrbit_DSLRoute_ReadsTheQueryCommandWhileTheDSLRouteAnswers404(t *testin
 
 // TestOrbit_QueryRoute_SendsGQLTextAndExplainsARefusedObject verifies the
 // orbit.query route as a caller meets it: GQL text passed as the query
-// argument reaches GitLab as the body's query string, and a JSON object that
-// GitLab.com refuses for its language is answered with the hint that it reads
-// a query as GQL text.
+// argument reaches GitLab as the body's query string, a JSON query written as
+// text, which GitLab.com refuses for its language, is answered with the hint
+// that it reads a query as GQL text, and a JSON object is refused before
+// anything is sent, since the query is text.
 func TestOrbit_QueryRoute_SendsGQLTextAndExplainsARefusedObject(t *testing.T) {
+	var sent atomic.Int32
 	routes := newOrbitSpecsByTool(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent.Add(1)
 		var got struct {
-			Query any `json:"query"`
+			Query string `json:"query"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
-		if _, isObject := got.Query.(map[string]any); isObject {
+		if got.Query == projectByIDObjectText {
 			testutil.RespondJSON(w, http.StatusBadRequest, `{"code":"compile_error","message":"schema violation: Orbit query syntax at line 1, column 1: expected Statement"}`)
 			return
 		}
@@ -468,9 +488,15 @@ func TestOrbit_QueryRoute_SendsGQLTextAndExplainsARefusedObject(t *testing.T) {
 	if _, err := route.Handler(t.Context(), map[string]any{"query": projectByIDGQL}); err != nil {
 		t.Fatalf("Route.Handler() with GQL text error: %v", err)
 	}
-	_, err := route.Handler(t.Context(), map[string]any{"query": projectByIDObject()})
+	_, err := route.Handler(t.Context(), map[string]any{"query": projectByIDObjectText})
 	if err == nil || !strings.Contains(err.Error(), "GitLab.com reads a query as GQL text, not as a JSON object") {
-		t.Fatalf("Route.Handler() with an object error = %v, want the hint that GitLab.com reads GQL", err)
+		t.Fatalf("Route.Handler() with JSON text error = %v, want the hint that GitLab.com reads GQL", err)
+	}
+	if _, err = route.Handler(t.Context(), map[string]any{"query": map[string]any{"query_type": "traversal"}}); err == nil {
+		t.Fatal("Route.Handler() with a JSON object error = nil, want it refused")
+	}
+	if got := sent.Load(); got != 2 {
+		t.Fatalf("requests sent = %d, want 2: the GQL text and the JSON text, and none for the object", got)
 	}
 }
 
@@ -592,11 +618,7 @@ func TestOrbit_RegisterMeta_UsesActionSpecs(t *testing.T) {
 //
 // The test creates a meta-tool session and calls the status action, asserting a non-error result.
 func TestOrbit_RegisterMeta_CallThroughMCP(t *testing.T) {
-	session := newOrbitMetaSession(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		testutil.AssertRequestMethod(t, r, http.MethodGet)
-		testutil.AssertRequestPath(t, r, "/api/v4/orbit/status")
-		testutil.RespondJSON(w, http.StatusOK, `{"status":"healthy","version":"0.5.0"}`)
-	}))
+	session := newOrbitMetaSession(t, orbitSourcesHandler(t))
 
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "gitlab_orbit",
@@ -615,32 +637,7 @@ func TestOrbit_RegisterMeta_CallThroughMCP(t *testing.T) {
 //
 // The test iterates all canonical tool routes, invokes each handler, and asserts a non-nil result.
 func TestOrbit_ActionSpecs_CallAllRoutes(t *testing.T) {
-	routes := newOrbitSpecsByTool(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v4/orbit/status":
-			testutil.AssertRequestMethod(t, r, http.MethodGet)
-			testutil.RespondJSON(w, http.StatusOK, `{"status":"healthy","version":"0.5.0"}`)
-		case "/api/v4/orbit/schema":
-			testutil.AssertRequestMethod(t, r, http.MethodGet)
-			testutil.RespondJSON(w, http.StatusOK, `{"schema_version":"1.0"}`)
-		case "/api/v4/orbit/tools":
-			testutil.AssertRequestMethod(t, r, http.MethodGet)
-			testutil.RespondJSON(w, http.StatusOK, `[{"name":"query_graph","description":"Execute graph queries","parameters":{"type":"object"}}]`)
-		case "/api/v4/orbit/agent/commands":
-			testutil.AssertRequestMethod(t, r, http.MethodGet)
-			testutil.RespondJSON(w, http.StatusOK, agentCommandsRaw)
-		case "/api/v4/orbit/query":
-			testutil.AssertRequestMethod(t, r, http.MethodPost)
-			testutil.RespondJSON(w, http.StatusOK, `{"result":[],"query_type":"traversal","row_count":0}`)
-		case "/api/v4/orbit/graph_status":
-			testutil.AssertRequestMethod(t, r, http.MethodGet)
-			testutil.RespondJSON(w, http.StatusOK, `{"projects":{"indexed":1,"total_known":1},"indexing":{"state":"indexed"}}`)
-		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
-			http.Error(w, "unexpected path", http.StatusInternalServerError)
-			return
-		}
-	}))
+	routes := newOrbitSpecsByTool(t, orbitSourcesHandler(t))
 
 	tests := []struct {
 		name string
@@ -722,23 +719,27 @@ func TestOrbit_ActionSpecs_NotFoundReturnsInformationalResult(t *testing.T) {
 
 // TestOrbit_ActionSpecs_ForbiddenStaysAnError verifies that the not-found
 // wrapper every Orbit route carries converts a 404 and nothing else: a 403
-// keeps its Knowledge Graph access hint and reaches the caller as the error it
-// is, rather than as the "Orbit is not enabled" card, which would send a
-// caller with the wrong token off to check feature flags.
+// reaches the caller as the error it is, rather than as the not-found card.
+// On the query route and the MCP endpoint, which GitLab.com answers 403 for an
+// account Orbit is not served to since its general availability, it keeps the
+// hint naming what Orbit needs; on the GraphQL endpoint, which answers an Orbit
+// field it does not serve with null instead, a 403 is about the token or the
+// account and carries no Orbit hint.
 func TestOrbit_ActionSpecs_ForbiddenStaysAnError(t *testing.T) {
 	routes := newOrbitSpecsByTool(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		testutil.RespondJSON(w, http.StatusForbidden, `{"message":"403 Forbidden"}`)
 	}))
 
 	tests := []struct {
-		name string
-		args map[string]any
+		name     string
+		args     map[string]any
+		wantHint bool
 	}{
 		{name: "gitlab_orbit_status", args: map[string]any{}},
 		{name: "gitlab_orbit_schema", args: map[string]any{}},
-		{name: "gitlab_orbit_tools", args: map[string]any{}},
-		{name: "gitlab_orbit_dsl", args: map[string]any{}},
-		{name: "gitlab_orbit_query", args: map[string]any{"query": projectByIDGQL}},
+		{name: "gitlab_orbit_tools", args: map[string]any{}, wantHint: true},
+		{name: "gitlab_orbit_dsl", args: map[string]any{}, wantHint: true},
+		{name: "gitlab_orbit_query", args: map[string]any{"query": projectByIDGQL}, wantHint: true},
 		{name: "gitlab_orbit_graph_status", args: map[string]any{"full_path": "gitlab-org/gitlab"}},
 	}
 
@@ -752,8 +753,8 @@ func TestOrbit_ActionSpecs_ForbiddenStaysAnError(t *testing.T) {
 			if err == nil {
 				t.Fatalf("Route.Handler() = %#v with nil error, want the forbidden error", result)
 			}
-			if !strings.Contains(err.Error(), "Knowledge Graph enabled") {
-				t.Fatalf("Route.Handler() error = %q, want the Knowledge Graph access hint", err)
+			if got := strings.Contains(err.Error(), orbitUnavailableHint); got != tt.wantHint {
+				t.Fatalf("Route.Handler() error = %q, carries the Orbit availability hint = %t, want %t", err, got, tt.wantHint)
 			}
 			if _, notFound := result.(orbitNotFoundOutput); notFound {
 				t.Fatalf("Route.Handler() = %#v, want no not-found card for a 403", result)
