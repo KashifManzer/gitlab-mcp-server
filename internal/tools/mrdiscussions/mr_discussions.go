@@ -470,34 +470,32 @@ func buildLinePositionOptions(p *DiffLinePositionInput) *gl.LinePositionOptions 
 // validatePosition fetches the MR diff and validates that the given position
 // refers to a line actually present in the diff. This prevents 400/500 errors
 // from GitLab when commenting on out-of-range lines and provides actionable
-// error messages explaining what went wrong. When the diff cannot be listed
-// the check is skipped and the write that follows is judged by GitLab, for
-// the reasons [toolutil.MergeRequestDiffsForPositionCheck] gives.
+// error messages explaining what went wrong. When the diff cannot be listed,
+// or cannot be shown to be the one the position's SHAs name, the check is
+// skipped and the write that follows is judged by GitLab, for the reasons
+// [toolutil.MergeRequestDiffForPositionCheck] gives.
 func validatePosition(ctx context.Context, client *gitlabclient.Client, projectID string, mrIID int64, pos *DiffPosition) error {
-	diffs, ok := toolutil.MergeRequestDiffsForPositionCheck(ctx, client, projectID, mrIID)
-	if !ok {
-		return nil
-	}
-
 	targetPath := pos.NewPath
 	if targetPath == "" {
 		targetPath = pos.OldPath
 	}
-	var fileDiff string
-	for _, d := range diffs {
-		if d.NewPath == targetPath || d.OldPath == targetPath {
-			fileDiff = d.Diff
-			break
-		}
+	fileDiff, ok := toolutil.MergeRequestDiffForPositionCheck(ctx, client, projectID, mrIID, targetPath, gl.MergeRequestDiffRefs{
+		BaseSha: pos.BaseSHA, StartSha: pos.StartSHA, HeadSha: pos.HeadSHA,
+	})
+	if !ok {
+		return nil
 	}
-	if fileDiff == "" {
+	if fileDiff == nil {
 		return fmt.Errorf(
 			"file %q is not in the merge request diff. Inline comments can only be placed on changed files. "+
 				"Omit the position parameter to create a general (non-inline) discussion instead", targetPath,
 		)
 	}
 
-	lines := toolutil.ParseDiffLines(fileDiff)
+	if fileDiff.Diff == "" {
+		return nil
+	}
+	lines := toolutil.ParseDiffLines(fileDiff.Diff)
 	return toolutil.ValidateDiffPosition(lines, pos.NewLine, pos.OldLine)
 }
 
