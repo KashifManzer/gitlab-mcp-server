@@ -15,7 +15,7 @@ import (
 )
 
 // hintGraphStatus is the next step the status card ends on, whichever of its
-// three shapes it takes: cluster health says nothing about one namespace.
+// two shapes it takes: cluster health says nothing about one namespace.
 const hintGraphStatus = "inspect indexing status for a namespace or project"
 
 // orbitNotFoundOutput is returned by MCP Orbit tools when the requested resource or feature is not found (HTTP 404).
@@ -51,49 +51,31 @@ func formatOrbitNotFound(out orbitNotFoundOutput) *mcp.CallToolResult {
 	)
 }
 
-// FormatStatusMarkdown renders Orbit cluster health as the card of one object:
-// whether the caller reaches the graph at all, the cluster's own health, and
-// the subsystems as a nested collection.
-//
-// Two of those rows were missing, and both are the answer to the question the
-// action is asked. "Available to you" is the user-level access flag, which is
-// what separates a healthy cluster the caller cannot query from one they can;
-// "Error" is what the backend says when it cannot reach the gRPC cluster, which
-// is exactly the case where "Status: unknown" alone explains nothing.
+// FormatStatusMarkdown renders the health of the Orbit service as the card of
+// one object: the overall state and version, then the components as a nested
+// collection. A user Orbit is not available to never reaches the card: GitLab
+// answers that user's status with null, which [Status] reports as an error.
 func FormatStatusMarkdown(out StatusOutput) string {
 	var b strings.Builder
 	c := toolutil.NewCard(&b, "Orbit Status")
-	facts := readStatus(out)
 
-	if facts.formattedText != "" {
-		c.Fence("", "text", facts.formattedText)
-		c.End(toolutil.HintAction(orbitActionGraphStatus, hintGraphStatus))
-		return b.String()
-	}
-
-	if out.User == nil && facts.empty() {
+	if out.Status == "" && out.Version == "" && len(out.Components) == 0 {
 		c.Note("No Orbit status data returned.")
 		c.End(toolutil.HintAction(orbitActionGraphStatus, hintGraphStatus))
 		return b.String()
 	}
 
-	if out.User != nil {
-		c.Bool("Available to you", out.User.Available)
-	}
-	c.Field("Status", facts.status)
-	c.Field("Version", facts.version)
-	c.Time("Timestamp", facts.timestamp)
-	c.Field("Error", facts.systemError)
+	c.Field("Status", out.Status)
+	c.Field("Version", out.Version)
 
-	if len(facts.components) > 0 {
-		table := c.Table("Components", "Component", "Status", "Replicas")
-		for _, component := range facts.components {
-			// Both come back from the Knowledge Graph API as free strings, and
-			// nothing in this repository constrains either.
+	if len(out.Components) > 0 {
+		table := c.Table("Components", "Component", "Status")
+		for _, component := range out.Components {
+			// Both come back from GitLab's GraphQL API as a free string and an
+			// enum this repository does not constrain.
 			table.Row(
 				toolutil.EscapeMdTableCell(component.Name),
 				toolutil.EscapeMdTableCell(component.Status),
-				replicaCell(component.Replicas),
 			)
 		}
 	}
@@ -102,71 +84,10 @@ func FormatStatusMarkdown(out StatusOutput) string {
 	return b.String()
 }
 
-// statusFacts is the cluster health one status response carried, read from
-// whichever of its two shapes carried it.
-type statusFacts struct {
-	formattedText string
-	status        string
-	version       string
-	timestamp     string
-	systemError   string
-	components    []StatusComponent
-}
-
-// empty reports whether the response said nothing about the cluster at all.
-func (f statusFacts) empty() bool {
-	return f.status == "" && f.version == "" && f.timestamp == "" && f.systemError == "" && len(f.components) == 0
-}
-
-// readStatus reads the cluster health out of the response.
-//
-// Orbit answers in two shapes: the flat one fills the top-level fields, and the
-// nested one leaves them empty and fills System instead. Reading only the flat
-// fields rendered "no status data" for every nested answer, including the one
-// that carries the backend error.
-func readStatus(out StatusOutput) statusFacts {
-	facts := statusFacts{
-		formattedText: out.FormattedText,
-		status:        out.Status,
-		version:       out.Version,
-		timestamp:     out.Timestamp,
-		components:    out.Components,
-	}
-	if out.System == nil {
-		return facts
-	}
-	facts.systemError = out.System.Error
-	if facts.formattedText == "" {
-		facts.formattedText = out.System.FormattedText
-	}
-	if facts.status == "" {
-		facts.status = out.System.Status
-	}
-	if facts.version == "" {
-		facts.version = out.System.Version
-	}
-	if facts.timestamp == "" {
-		facts.timestamp = out.System.Timestamp
-	}
-	if len(facts.components) == 0 {
-		facts.components = out.System.Components
-	}
-	return facts
-}
-
-// replicaCell renders a subsystem's ready and desired replica counts, or
-// nothing for a stateless subsystem GitLab sends none for.
-func replicaCell(replicas *StatusReplicas) string {
-	if replicas == nil {
-		return ""
-	}
-	return strconv.FormatInt(replicas.Ready, 10) + "/" + strconv.FormatInt(replicas.Desired, 10)
-}
-
-// FormatSchemaMarkdown renders the Knowledge Graph ontology as the card of one
-// object: the version and the three type counts, then the domains as a nested
-// collection. The compact text GitLab answers the llm format with is the whole
-// response, so it is rendered as the card's body instead.
+// FormatSchemaMarkdown renders the Knowledge Graph schema as the card of one
+// object: the three type counts, then the domains as a nested collection. The
+// compact text GitLab answers the llm format with is the whole response, so it
+// is rendered as the card's body instead.
 //
 // Its next steps lead to the query language and then to a query. They used to
 // lead to orbit.tools for "the live query and tool manifest", which is the
@@ -192,16 +113,14 @@ func FormatSchemaMarkdown(out SchemaOutput) string {
 		c.End(dslHint, queryHint)
 		return b.String()
 	}
-	c.Field("Schema version", out.SchemaVersion)
 	c.Int("Domains", int64(len(out.Domains)))
 	c.Int("Nodes", int64(len(out.Nodes)))
 	c.Int("Edges", int64(len(out.Edges)))
 	if len(out.Domains) > 0 {
-		table := c.Table("Domains", "Domain", "Description", "Nodes")
+		table := c.Table("Domains", "Domain", "Nodes")
 		for _, domain := range out.Domains {
 			table.Row(
 				toolutil.EscapeMdTableCell(domain.Name),
-				toolutil.EscapeMdTableCell(domain.Description),
 				toolutil.EscapeMdTableCell(strings.Join(domain.NodeNames, ", ")),
 			)
 		}
@@ -223,51 +142,18 @@ func FormatSchemaMarkdown(out SchemaOutput) string {
 	hints := []string{dslHint}
 	if len(out.Nodes) > 0 && len(expanded) == 0 {
 		hints = append(hints, toolutil.HintAction(orbitActionSchema,
-			"read the properties and edges of the node types a query reads: name them in expand, or set format=llm for the whole ontology as compact text"))
+			"read the properties of the node types a query reads: name them in expand, or set format=llm for the schema as compact text"))
 	}
 	c.End(append(hints, queryHint)...)
 	return b.String()
 }
 
-// schemaNode is the part of one ontology node the schema card renders, read
-// from the definition client-go leaves undecoded. The three lists stay nil
-// when GitLab sent no key for them, which is what tells a node answered
-// without expand from an expanded one: the recorded answers carry
-// properties and both edge lists only on the nodes named in expand.
-type schemaNode struct {
-	Name          string           `json:"name"`
-	Domain        string           `json:"domain"`
-	Description   string           `json:"description"`
-	IncomingEdges []string         `json:"incoming_edges"`
-	OutgoingEdges []string         `json:"outgoing_edges"`
-	Properties    []schemaProperty `json:"properties"`
-}
-
-// schemaProperty is one property of an expanded node: the name a query
-// filters or returns, its type, and the values an enum takes.
-type schemaProperty struct {
-	Name       string   `json:"name"`
-	DataType   string   `json:"data_type"`
-	Nullable   bool     `json:"nullable"`
-	EnumValues []string `json:"enum_values"`
-}
-
-// expandedNodes returns the nodes GitLab answered expanded, in the order it
-// sent them. A definition that does not decode into [schemaNode] is left to
-// the structured output, which carries it as it came, rather than rendered
-// from a guess.
-func expandedNodes(nodes []any) []schemaNode {
-	var expanded []schemaNode
-	for _, raw := range nodes {
-		var node schemaNode
-		data, err := json.Marshal(raw)
-		if err == nil {
-			err = json.Unmarshal(data, &node)
-		}
-		if err != nil {
-			continue
-		}
-		if node.Properties != nil || node.IncomingEdges != nil || node.OutgoingEdges != nil {
+// expandedNodes returns the nodes the schema carries properties for, which
+// are the ones named in expand, in the order GitLab sent them.
+func expandedNodes(nodes []SchemaNode) []SchemaNode {
+	var expanded []SchemaNode
+	for _, node := range nodes {
+		if len(node.Properties) > 0 {
 			expanded = append(expanded, node)
 		}
 	}
@@ -275,17 +161,14 @@ func expandedNodes(nodes []any) []schemaNode {
 }
 
 // writeSchemaNode writes one expanded node as a section of the schema card:
-// its domain, description and edges as rows, and its properties as a nested
-// collection.
-func writeSchemaNode(c *toolutil.Card, node schemaNode) {
+// its domain, description, key and label as rows, and its properties as a
+// nested collection.
+func writeSchemaNode(c *toolutil.Card, node SchemaNode) {
 	section := c.Section("Node " + node.Name)
 	section.Field("Domain", node.Domain)
 	section.Field("Description", node.Description)
-	section.Field("Incoming edges", strings.Join(node.IncomingEdges, ", "))
-	section.Field("Outgoing edges", strings.Join(node.OutgoingEdges, ", "))
-	if len(node.Properties) == 0 {
-		return
-	}
+	section.Field("Primary key", node.PrimaryKey)
+	section.Field("Label field", node.LabelField)
 	table := section.Table("Properties", "Property", "Type", "Nullable", "Values")
 	for _, property := range node.Properties {
 		table.Row(
@@ -403,9 +286,23 @@ func FormatQueryMarkdown(out QueryOutput) string {
 	return b.String()
 }
 
+// hintAccessGate is the one next step of a group GitLab.com serves no index
+// for because of its access: a query would be refused the same way, and the
+// cluster's health says nothing about one group's access.
+const hintAccessGate = "Orbit access is set on the top-level group on GitLab.com: a license or a running trial there serves the index, which this status shows once it does"
+
 // FormatGraphStatusMarkdown renders Orbit indexing status as the card of one
-// object: how much is indexed, how the last run went, and the per-domain node
-// counts as a nested collection.
+// object: whether Orbit is on, the top-level group's Orbit access and trial,
+// how much is indexed, how the last run went, and the per-domain node counts
+// as a nested collection.
+//
+// Since Orbit's general availability GitLab.com serves a group's index under
+// LICENSED or TRIAL_ACTIVE access, and answers a top-level group with no
+// access it serves an index under with its access and no index. The card then
+// says so in a line of its own ([graphStatusAccessNote]), since a missing index
+// reads as an empty graph to a model that has not read the access row, and its
+// next step leads to the access rather than to a query GitLab would refuse. An
+// index GitLab answered all the same keeps the card of any other index.
 func FormatGraphStatusMarkdown(out GraphStatusOutput) string {
 	var b strings.Builder
 	c := toolutil.NewCard(&b, "Orbit Graph Status")
@@ -413,24 +310,30 @@ func FormatGraphStatusMarkdown(out GraphStatusOutput) string {
 		toolutil.HintAction(orbitActionQuery, "query the graph once indexing reaches a healthy state"),
 		toolutil.HintAction(orbitActionStatus, "check the cluster itself when indexing never starts"),
 	}
-
-	if out.FormattedText != "" {
-		c.Fence("", "text", out.FormattedText)
-		c.End(hints...)
-		return b.String()
+	if out.Access != nil && !out.Access.Serves() && !out.HasIndex() {
+		hints = []string{hintAccessGate}
 	}
 
+	if out.Enabled != nil {
+		c.Bool("Orbit enabled", *out.Enabled)
+	}
+	c.Time("Enabled at", out.EnabledAt)
+	writeGraphStatusAccess(c, out.Access, out.Trial)
 	if out.Projects != nil {
 		c.Int("Indexed projects", out.Projects.Indexed)
 		c.Int("Total known projects", out.Projects.TotalKnown)
+		c.Int("Projects not indexed", out.Projects.NotIndexed)
 		c.Int("Projects out of indexing attempts", out.Projects.Gaps)
 	}
 	if out.Indexing != nil {
 		c.Field("Indexing state", out.Indexing.State)
-		c.Time("Last started at", out.Indexing.LastStartedAt)
 		c.Time("Last completed at", out.Indexing.LastCompletedAt)
-		c.Count("Last duration (ms)", out.Indexing.LastDurationMs)
-		c.Field("Last error", out.Indexing.LastError)
+		if len(out.Indexing.Areas) > 0 {
+			table := c.Table("Areas", "Area", "State")
+			for _, area := range out.Indexing.Areas {
+				table.Row(toolutil.EscapeMdTableCell(area.Name), toolutil.EscapeMdTableCell(area.State))
+			}
+		}
 	}
 	if len(out.Domains) > 0 {
 		table := c.Table("Domains", "Domain", "Counts")
@@ -441,8 +344,73 @@ func FormatGraphStatusMarkdown(out GraphStatusOutput) string {
 			)
 		}
 	}
+	c.Note(graphStatusAccessNote(out))
 	c.End(hints...)
 	return b.String()
+}
+
+// writeGraphStatusAccess writes the top-level group's Orbit access as rows and
+// its trial as a nested object, each as GitLab spelled it, and nothing for a
+// subgroup or a project, for which GitLab answers both null.
+func writeGraphStatusAccess(c *toolutil.Card, access *GraphStatusAccess, trial *GraphStatusTrial) {
+	if access != nil {
+		c.Field("Orbit access", access.State)
+		c.Field("Access reason", access.Reason)
+		c.Field("Turn-on denial reason", access.TurnOnDenialReason)
+	}
+	if trial == nil {
+		return
+	}
+	sub := c.Sub("Orbit trial")
+	sub.Field("State", trial.State)
+	sub.Time("Expires on", trial.ExpiresOn)
+	if trial.Credits != nil {
+		sub.Field("Credits remaining", formatCredits(trial.Credits.Remaining))
+		sub.Field("Credits total", formatCredits(trial.Credits.Total))
+	}
+	if trial.Offer != nil {
+		if trial.Offer.DurationDays != nil {
+			sub.Int("Offered trial days", *trial.Offer.DurationDays)
+		}
+		sub.Field("Offered trial credits", formatCredits(trial.Offer.InitialCredits))
+	}
+}
+
+// formatCredits renders a credit count GitLab sends as a Float, with no
+// trailing zeros, or nothing when GitLab sent null. Zero is written, since a
+// trial with no credits left is an answer.
+func formatCredits(credits *float64) string {
+	if credits == nil {
+		return ""
+	}
+	return strconv.FormatFloat(*credits, 'f', -1, 64)
+}
+
+// graphStatusAccessNote is the line the card ends on when the top-level group's
+// Orbit access explains its index: an index missing under a state GitLab.com
+// serves none under, an index missing under one it does (Orbit off, or else
+// the causes GitLab's description of the field gives for null), or an index a
+// trial serves, which ends. It is empty for any other index, and for a
+// subgroup or a project, which carry no access.
+func graphStatusAccessNote(out GraphStatusOutput) string {
+	access := out.Access
+	switch {
+	case access == nil:
+		return ""
+	case out.HasIndex():
+		if access.State == AccessTrialActive {
+			return "Orbit is served on a trial, which ends on its last day or when its credits run out."
+		}
+		return ""
+	case !access.Serves():
+		return "Orbit access is " + toolutil.EscapeMdTableCell(access.State) +
+			": GitLab.com serves a group's Orbit index and queries under LICENSED or TRIAL_ACTIVE access, " +
+			"so the index is missing here because of the access, not because the graph is empty."
+	case out.Enabled != nil && !*out.Enabled:
+		return "The group has Orbit access and Orbit is off for it, which is why GitLab answered no index."
+	}
+	return "The group has Orbit access and GitLab answered no index, which GitLab answers when Orbit is off for the top-level group, " +
+		"is not available to the token's user, or the user is below the Reporter role there."
 }
 
 // domainCounts renders one domain's node counts as the "Name: count" list the

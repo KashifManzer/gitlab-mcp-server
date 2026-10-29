@@ -3,11 +3,27 @@
 
 //go:build orbitlive
 
-// Package orbit contains live integration tests against the experimental
-// GitLab Orbit Knowledge Graph API on GitLab.com. The tests hit the real
-// https://gitlab.com/api/v4/orbit/* endpoints (no httptest mocks) and
-// exercise every public orbit handler in internal/tools/orbit plus the
-// query language surface end-to-end.
+// Package orbit contains live integration tests against the GitLab Orbit
+// Knowledge Graph on GitLab.com. The tests reach the real sources each handler
+// in internal/tools/orbit reads (no httptest mocks): GitLab's GraphQL API for
+// the status, the schema and a namespace's indexing status, the Orbit MCP
+// endpoint at https://gitlab.com/api/v4/orbit/mcp for the tool list, the query
+// language and the schema's compact text, and POST /api/v4/orbit/query, the one
+// Orbit REST route of the six these handlers used that GitLab.com still serves
+// after removing the others on 2026-10-27 and -28.
+//
+// # Access
+//
+// Since Orbit's general availability on 2026-10-29, GitLab.com answers a
+// namespace's indexing status and a query only for a top-level group with the
+// orbit_promo add-on or a running Orbit trial; the plan no longer counts. The
+// fixture namespace lost it at 09:22 UTC that day. The service status, the
+// schema, the tool list and the query language answered without it until
+// about 09:32 UTC, so those subtests run whenever GitLab.com answers them, and
+// every subtest that needs the fixture namespace runs under
+// [requireOrbitServed], which skips with GitLab's answer when Orbit is not
+// served there. The top-level group's Orbit access and trial answer either
+// way, since they are what says which, so [testOrbitLiveAccess] always runs.
 //
 // # Build tag
 //
@@ -43,16 +59,16 @@
 // orbit.dsl describes from the query_graph command GitLab.com publishes: one
 // MATCH ... RETURN statement, every node labeled and at least one bounded by
 // its id or a literal property, a relationship type after a colon, WHERE with
-// AND and NOT, aggregates aliased to be sorted by, and ANY SHORTEST for a
-// path. Each was answered 200 by GitLab.com against the fixture namespace,
-// then plens1, on 2026-10-17, and each was again on 2026-10-26 against
-// jmrp-oss/orbit-fixtures but two, which GitLab.com has refused since: PAGE
-// (issue 1527) and a shortest path that names no relationship type (issue
-// 1528). A query GitLab cannot compile fails its subtest by name
+// AND and NOT, aggregates aliased to be sorted by, SKIP and LIMIT for a page,
+// and ANY SHORTEST over named relationship types for a path. Each was answered
+// 200 by GitLab.com against jmrp-oss/orbit-fixtures on 2026-10-26, or on
+// 2026-10-29 for the two GitLab.com changed in between: PAGE gave way to SKIP
+// and LIMIT (issue 1527), and a shortest path must name its relationship types
+// (issue 1528). A query GitLab cannot compile fails its subtest by name
 // ([liveQuery]), and TestOrbitLiveGitLabCom_DSL fails when GitLab.com stops
-// describing the query command as GQL (issue 1414). A query written as a
-// JSON object, the JSON DSL this suite used until then, is refused, and a
-// subtest holds what a caller is told about it.
+// describing the query command as GQL (issue 1414). A query written in the
+// JSON DSL this suite used until then, which GitLab.com removed on
+// 2026-10-27, is refused, and a subtest holds what a caller is told about it.
 //
 // No project, user or namespace id is written down: each is found by its
 // path in the fixture namespace, since re-provisioning the fixtures gives
@@ -91,6 +107,7 @@ import (
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil/e2erelease"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/actiongrants"
 	orbit "github.com/jmrplens/gitlab-mcp-server/v3/internal/tools/orbit" // the package under test, imported from outside it (see Layout above)
+	"github.com/jmrplens/gitlab-mcp-server/v3/internal/toolutil"
 )
 
 // liveGitLabComURL is the base URL for the real GitLab.com REST API
@@ -302,8 +319,82 @@ func testOrbitLiveGitLabComDiscovery(t *testing.T) {
 	namespace := orbitFixturesNamespace()
 	testOrbitLiveReadOnlyHandlers(t, client)
 	testOrbitLiveDSLHandlers(t, client)
-	testOrbitLiveQueryHandlers(t, client, namespace)
-	testOrbitLiveGraphStatusHandlers(t, client, namespace)
+	testOrbitLiveAccess(t, client, namespace)
+	t.Run("FixtureNamespace", func(t *testing.T) {
+		requireOrbitServed(t, client, namespace)
+		testOrbitLiveQueryHandlers(t, client, namespace)
+		testOrbitLiveGraphStatusHandlers(t, client, namespace)
+	})
+}
+
+// requireOrbitServed skips the test unless GitLab.com serves Orbit for the
+// fixture namespace to this token, which since Orbit's general availability
+// takes the orbit_promo add-on or a running trial on its top-level group. It
+// asks the indexing status, the cheapest answer that needs the namespace, and
+// skips on the answers GitLab gives an account Orbit is not served to: null
+// where the status is read ([orbit.ErrOrbitUnavailable]), 403, and, for a
+// fixture namespace that is itself a top-level group, its access with no
+// index beside it. Any other failure fails the test, since it says something
+// about the handler.
+func requireOrbitServed(t *testing.T, client *gitlabclient.Client, namespace string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := orbit.GraphStatus(ctx, client, orbit.GraphStatusInput{FullPath: namespace})
+	switch {
+	case err == nil && !out.HasIndex():
+		t.Skipf("GitLab.com answers no Orbit index for %s to this token (Orbit access %s); since 2026-10-29 that takes the orbit_promo add-on or an Orbit trial on its top-level group", namespace, accessState(out.Access))
+	case err == nil:
+		return
+	case errors.Is(err, orbit.ErrOrbitUnavailable), toolutil.IsHTTPStatus(err, http.StatusForbidden):
+		t.Skipf("GitLab.com does not serve Orbit for %s to this token (%v); since 2026-10-29 that takes the orbit_promo add-on or an Orbit trial on its top-level group", namespace, err)
+	default:
+		t.Fatalf("orbit.GraphStatus(%s): %v", namespace, err)
+	}
+}
+
+// accessState names an Orbit access state for a skip or a summary, and what its
+// absence means: GitLab reports access for a top-level group alone, to a token
+// with the Owner role there.
+func accessState(access *orbit.GraphStatusAccess) string {
+	if access == nil {
+		return "not reported, which GitLab does for a subgroup, a project, and a token below the Owner role"
+	}
+	if access.Reason == "" {
+		return access.State
+	}
+	return access.State + " (" + access.Reason + ")"
+}
+
+// testOrbitLiveAccess exercises [GraphStatus] on the fixture namespace's
+// top-level group, the one namespace GitLab answers Orbit access and trial for.
+// It runs whether or not GitLab.com serves Orbit there, since the access is
+// the answer that says which: a group without access is answered with its
+// access and no index rather than refused. It needs the fixture account to
+// own the group, since GitLab answers the access to the Owner role alone. It
+// does not hold the index to the access state: GitLab decides the index from
+// the add-on and the trial it recorded, and the state partly from
+// CustomersDot, so an index can come under TRIAL_STATUS_UNAVAILABLE or a
+// trial that has just ended, and the summary reports both.
+func testOrbitLiveAccess(t *testing.T, client *gitlabclient.Client, namespace string) {
+	t.Helper()
+	topLevel, _, _ := strings.Cut(namespace, "/")
+	summarize(t, "GraphStatus_top_level_access", func(ctx context.Context) (any, error) {
+		out, err := orbit.GraphStatus(ctx, client, orbit.GraphStatusInput{FullPath: topLevel})
+		if err != nil {
+			return nil, err
+		}
+		if out.Access == nil {
+			return nil, fmt.Errorf("GitLab.com answered no Orbit access for the top-level group %s, which it reports to a token that can read the group's Orbit setting, the Owner role", topLevel)
+		}
+		indexed := out.HasIndex()
+		trial := "<nil>"
+		if out.Trial != nil {
+			trial = out.Trial.State
+		}
+		return fmt.Sprintf("group=%s access=%s turn_on_denial_reason=%s trial=%s indexed=%t",
+			topLevel, accessState(out.Access), out.Access.TurnOnDenialReason, trial, indexed), nil
+	})
 }
 
 // testOrbitLiveReadOnlyHandlers exercises [Status], [Schema], and
@@ -325,11 +416,7 @@ func testOrbitLiveReadOnlyHandlers(t *testing.T, client *gitlabclient.Client) {
 		if err != nil {
 			return nil, err
 		}
-		domainCount := len(out.Domains)
-		nodeCount := len(out.Nodes)
-		edgeCount := len(out.Edges)
-		return fmt.Sprintf("schema_version=%s domains=%d nodes=%d edges=%d",
-			out.SchemaVersion, domainCount, nodeCount, edgeCount), nil
+		return fmt.Sprintf("domains=%d nodes=%d edges=%d", len(out.Domains), len(out.Nodes), len(out.Edges)), nil
 	})
 
 	summarize(t, "Tools", func(ctx context.Context) (any, error) {
@@ -497,25 +584,30 @@ func testOrbitLiveQueryHandlers(t *testing.T, client *gitlabclient.Client, names
 		"MATCH path = ANY SHORTEST (mr:MergeRequest {source_branch: '"+fixtureBranch+"'})-[:IN_PROJECT*1..2]->"+
 			"(p:Project {full_path: '"+projectPath(namespace, kgFixturesProjectPath)+"'}) RETURN path"))
 
-	summarize(t, "Query_as_a_JSON_object_is_refused_with_the_GQL_hint", func(ctx context.Context) (any, error) {
-		// The JSON DSL this suite and orbit.query taught until issue 1414. It
-		// reaches GitLab as written, and GitLab.com, reading GQL, answers
-		// compile_error; the caller is told GitLab.com reads a query as GQL
-		// text, with an example. The account is held by its code and by this
-		// server's hint, never by GitLab's prose, which is the GQL parser's
-		// wording rather than Workhorse's contract; the summary carries the
-		// prose to the run's log instead.
-		_, err := orbit.Query(ctx, client, orbit.QueryInput{
-			Query: map[string]any{
-				"query_type": "traversal",
-				"nodes": []any{map[string]any{
-					"id": "p", "entity": "Project",
-					"filters": map[string]any{"full_path": projectPath(namespace, kgFixturesProjectPath)},
-				}},
-			},
+	summarize(t, "Query_as_JSON_DSL_text_is_refused_with_the_GQL_hint", func(ctx context.Context) (any, error) {
+		// The JSON DSL this suite and orbit.query taught until issue 1414,
+		// which gitlab-org/gitlab!261947 removed on 2026-10-27, written as the
+		// text a client that serializes a nested object sends. orbit.query
+		// takes text alone since then, so it reaches GitLab as written, and
+		// GitLab.com parses it as GQL and answers compile_error; the caller is
+		// told GitLab.com reads a query as GQL text, with an example. The
+		// account is held by its code and by this server's hint, never by
+		// GitLab's prose, which is the GQL parser's wording rather than
+		// Workhorse's contract; the summary carries the prose to the run's log
+		// instead.
+		dsl, err := json.Marshal(map[string]any{
+			"query_type": "traversal",
+			"nodes": []any{map[string]any{
+				"id": "p", "entity": "Project",
+				"filters": map[string]any{"full_path": projectPath(namespace, kgFixturesProjectPath)},
+			}},
 		})
+		if err != nil {
+			return nil, err
+		}
+		_, err = orbit.Query(ctx, client, orbit.QueryInput{Query: string(dsl)})
 		if err == nil {
-			return nil, errors.New("GitLab.com ran a query written as a JSON object, which it stopped reading on 2026-10-15: read orbit.dsl, GitLab.com may have turned GQL off again")
+			return nil, errors.New("GitLab.com ran a query written in the JSON DSL, which it removed on 2026-10-27: read orbit.dsl")
 		}
 		for _, want := range []string{"{code: compile_error}", "GitLab.com reads a query as GQL text, not as a JSON object"} {
 			if !strings.Contains(err.Error(), want) {
@@ -545,7 +637,7 @@ func testOrbitLiveGraphStatusHandlers(t *testing.T, client *gitlabclient.Client,
 		if out.Indexing != nil {
 			state = out.Indexing.State
 		}
-		return fmt.Sprintf("projects=%s indexing.state=%s", projects, state), nil
+		return fmt.Sprintf("projects=%s indexing.state=%s access=%s", projects, state, accessState(out.Access)), nil
 	})
 
 	summarize(t, "GraphStatus_namespace_id", func(ctx context.Context) (any, error) {
@@ -573,6 +665,7 @@ func testOrbitLiveGraphStatusHandlers(t *testing.T, client *gitlabclient.Client,
 func TestOrbitLiveGitLabCom_ShapeDiscovery(t *testing.T) {
 	client := newLiveClient(t)
 	namespace := orbitFixturesNamespace()
+	requireOrbitServed(t, client, namespace)
 
 	summarize(t, "Aggregation_with_filter", queryRun(client,
 		"MATCH (p:Project) WHERE "+underNamespace(namespace)+" RETURN count(p) AS count_projects"))
@@ -593,24 +686,37 @@ func TestOrbitLiveGitLabCom_ShapeDiscovery(t *testing.T) {
 		return queryRun(client, "MATCH (p:Project {id: "+ids[0]+"})--(n) RETURN n")(ctx)
 	})
 
-	summarize(t, "PathFinding_any_relationship", queryRun(client,
-		"MATCH path = ANY SHORTEST (mr:MergeRequest {source_branch: '"+fixtureBranch+"'})-[*1..3]->"+
+	// A shortest path names its relationship types since GitLab.com began
+	// refusing a wildcard (issue 1528): "shortest paths require named
+	// relationship types", measured 2026-10-29.
+	summarize(t, "PathFinding_named_relationship", queryRun(client,
+		"MATCH path = ANY SHORTEST (b:Branch {name: 'main'})-[:IN_PROJECT*1..2]->"+
 			"(p:Project {full_path: '"+projectPath(namespace, kgFixturesProjectPath)+"'}) RETURN path"))
+}
 
-	// Schema with the default response format (handler omits the
-	// response_format parameter so the API applies its own default, raw).
+// TestOrbitLiveGitLabCom_SchemaFormats holds the schema to both of its
+// sources: GitLab's GraphQL API for the structured answer, under either input
+// name of the format and with none, and the get_graph_schema command of the
+// Orbit MCP endpoint for the compact text. Neither needs the fixture
+// namespace, so it runs whether or not GitLab.com serves Orbit there.
+func TestOrbitLiveGitLabCom_SchemaFormats(t *testing.T) {
+	client := newLiveClient(t)
+
 	summarize(t, "Schema_default_format", func(ctx context.Context) (any, error) {
-		out, err := orbit.Schema(ctx, client, orbit.SchemaInput{})
+		return liveRawSchema(ctx, client, orbit.SchemaInput{})
+	})
+	summarize(t, "Schema_expand", func(ctx context.Context) (any, error) {
+		out, err := orbit.Schema(ctx, client, orbit.SchemaInput{Expand: []string{"Project"}})
 		if err != nil {
 			return nil, err
 		}
-		return fmt.Sprintf("schema_version=%s domains=%d nodes=%d edges=%d",
-			out.SchemaVersion, len(out.Domains), len(out.Nodes), len(out.Edges)), nil
+		for _, node := range out.Nodes {
+			if node.Name == "Project" && len(node.Properties) > 0 {
+				return fmt.Sprintf("Project properties=%d", len(node.Properties)), nil
+			}
+		}
+		return nil, fmt.Errorf("schema expanded on Project carried no Project properties: %+v", out.Nodes)
 	})
-
-	// Schema with each format named explicitly, under each input name. The
-	// format must reach GitLab as response_format: sent as format, which
-	// Grape reserves, it was answered 406 whatever its value.
 	summarize(t, "Schema_raw_via_format", func(ctx context.Context) (any, error) {
 		return liveRawSchema(ctx, client, orbit.SchemaInput{Format: "raw"})
 	})
@@ -632,10 +738,10 @@ func liveRawSchema(ctx context.Context, client *gitlabclient.Client, input orbit
 	if err != nil {
 		return nil, err
 	}
-	if out.SchemaVersion == "" || len(out.Domains) == 0 {
-		return nil, fmt.Errorf("raw schema = %+v, want the structured ontology", out)
+	if len(out.Domains) == 0 || len(out.Nodes) == 0 || len(out.Edges) == 0 {
+		return nil, fmt.Errorf("raw schema = %+v, want the structured schema", out)
 	}
-	return fmt.Sprintf("schema_version=%s domains=%d", out.SchemaVersion, len(out.Domains)), nil
+	return fmt.Sprintf("domains=%d nodes=%d edges=%d", len(out.Domains), len(out.Nodes), len(out.Edges)), nil
 }
 
 // liveLLMSchema asks for the compact text ontology and fails unless it came
@@ -668,13 +774,7 @@ func TestOrbitLiveGitLabCom_DetectTier_IsPaidWhereOrbitIsServed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	status, err := orbit.Status(ctx, client, orbit.StatusInput{})
-	if err != nil {
-		t.Fatalf("orbit.Status: %v", err)
-	}
-	if status.User == nil || !status.User.Available {
-		t.Skip("GitLab.com does not serve Orbit to this token, so its answer says nothing about the tier")
-	}
+	requireOrbitServed(t, client, orbitFixturesNamespace())
 	if tier := client.DetectTier(ctx); tier < edition.Premium {
 		t.Errorf("DetectTier() = %v for a token GitLab.com serves Orbit to, want Premium or higher: "+
 			"Orbit is served only to a member of a group whose top-level group's plan is paid", tier)
@@ -809,6 +909,7 @@ func TestOrbitLiveGitLabCom_ReadAPIToken_PassesTheQueryScopeCheck(t *testing.T) 
 	if err != nil {
 		t.Fatalf("NewClientWithToken: %v", err)
 	}
+	requireOrbitServed(t, client, orbitFixturesNamespace())
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	out, err := orbit.Query(ctx, client, readAPIQuery())
@@ -914,6 +1015,7 @@ func testOrbitLiveFixtures(t *testing.T) {
 	t.Helper()
 	client := newLiveClient(t)
 	namespace := orbitFixturesNamespace()
+	requireOrbitServed(t, client, namespace)
 
 	summarize(t, "Project_kg_fixtures_by_path", queryRun(client,
 		projectByPath(namespace, kgFixturesProjectPath, "p.id, p.full_path, p.name")))
@@ -956,8 +1058,8 @@ func testOrbitLiveFixtures(t *testing.T) {
 // the live fixture namespace: comparison and string predicates, a list
 // membership, multi-node patterns with a relationship type, aggregations
 // grouped by a property and by a node with their ORDER BY, sum, max and avg,
-// ORDER BY on a property, the virtual diff and content properties, PAGE,
-// an id range, the incoming neighbors of one relationship type, the
+// ORDER BY on a property, the virtual diff and content properties, SKIP and
+// LIMIT, an id range, the incoming neighbors of one relationship type, the
 // properties of every neighbor, and the ontology procedure. Each subtest is
 // informational: it PASSes as long as the API accepts the statement and
 // returns a valid envelope, even if row_count=0 (the data may not match the
@@ -974,6 +1076,7 @@ func testOrbitLiveFeatureCoverage(t *testing.T) {
 	t.Helper()
 	client := newLiveClient(t)
 	namespace := orbitFixturesNamespace()
+	requireOrbitServed(t, client, namespace)
 	testOrbitLiveFeatureCoveragePredicatesAndTraversal(t, client, namespace)
 	testOrbitLiveFeatureCoverageAggregation(t, client, namespace)
 	testOrbitLiveFeatureCoverageVirtualAndMeta(t, client, namespace)
@@ -1026,7 +1129,7 @@ func testOrbitLiveFeatureCoverageAggregation(t *testing.T, client *gitlabclient.
 }
 
 // testOrbitLiveFeatureCoverageVirtualAndMeta exercises ORDER BY, the virtual
-// diff and content properties, PAGE, an id range, the incoming neighbors of
+// diff and content properties, SKIP and LIMIT, an id range, the incoming neighbors of
 // one relationship type, the properties of every neighbor, and the ontology
 // procedure.
 func testOrbitLiveFeatureCoverageVirtualAndMeta(t *testing.T, client *gitlabclient.Client, namespace string) {
@@ -1040,10 +1143,10 @@ func testOrbitLiveFeatureCoverageVirtualAndMeta(t *testing.T, client *gitlabclie
 	summarize(t, "Traversal_file_with_content_property", queryRun(client,
 		"MATCH (f:File) WHERE f.path ENDS WITH 'models.py' RETURN f.id, f.path, f.language, f.content LIMIT 1"))
 
-	// The first page omits AFTER; the next one would pass the
-	// pagination.next_cursor this answer carries.
-	summarize(t, "Traversal_page", queryRun(client,
-		"MATCH (p:Project) WHERE "+underNamespace(namespace)+" RETURN p.id, p.full_path ORDER BY p.id PAGE 1"))
+	// A page is SKIP and LIMIT since GitLab.com retired PAGE and AFTER
+	// (issue 1527): the second project of the namespace by id.
+	summarize(t, "Traversal_skip_limit", queryRun(client,
+		"MATCH (p:Project) WHERE "+underNamespace(namespace)+" RETURN p.id, p.full_path ORDER BY p.id SKIP 1 LIMIT 1"))
 
 	summarize(t, "Traversal_id_range", func(ctx context.Context) (any, error) {
 		ids, err := fixtureProjectIDs(ctx, client, namespace)
