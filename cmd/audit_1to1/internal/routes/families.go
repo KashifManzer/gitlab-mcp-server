@@ -4,7 +4,6 @@
 package routes
 
 import (
-	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -105,31 +104,14 @@ func patternMatches(pattern, path string) bool {
 	return len(got) == len(want)
 }
 
-// The issues the tracked rows name, one per catalog domain, each tracking
-// every route of its domain the table declares tracked.
-const (
-	// issuePipelineRoutes tracks the pipeline routes no action reaches.
-	issuePipelineRoutes = 1604
-	// issueGroupRoutes tracks the group routes no action reaches.
-	issueGroupRoutes = 1605
-)
-
-// routeFamilies answers the routes no action reaches that no rule and no
-// inherited decision answers.
-var routeFamilies = []routeFamily{
-	{
-		Methods: []string{http.MethodGet}, Pattern: "/pipelines", Category: categoryTracked, Issue: issuePipelineRoutes, Routes: 1,
-		Reason: "lists the pipelines the authenticated user triggered, across every project (gitlab-api-live.json, 19.5.0-ee); client-go v3.30.0 has no method for it and no action lists them",
-	},
-	{
-		Methods: []string{http.MethodGet, http.MethodPost}, Pattern: "/groups/*/placeholder_reassignments", Category: categoryTracked, Issue: issueGroupRoutes, Routes: 2,
-		Reason: "a group owner reads the placeholder users an import left to reassign and reassigns them from a CSV file (gitlab-api-live.json, 19.5.0-ee); client-go v3.30.0 has no method for either and no action reaches them",
-	},
-}
+// familySubject opens a problem of the family table, before the label of the
+// row it is about.
+const familySubject = "family "
 
 // declares decides a route a family row answers, the first row that matches
-// answering it and a second that matches too being a problem of the table.
-// It reports whether the route is decided.
+// answering it and a second that matches too being a problem of the table,
+// and so is a tracked row over a route a decision of acceptedMissingMethods
+// settles. It reports whether the route is decided.
 func (j *judge) declares(method, path string, verdict *Route) bool {
 	var matched []int
 	for index, family := range j.in.families {
@@ -141,13 +123,19 @@ func (j *judge) declares(method, path string, verdict *Route) bool {
 		return false
 	}
 	for _, other := range matched[1:] {
-		j.problems = append(j.problems, "family "+j.in.families[other].label()+" answers "+verdict.Route+", which family "+j.in.families[matched[0]].label()+" answers too")
+		j.problems = append(j.problems, familySubject+j.in.families[other].label()+" answers "+verdict.Route+", which "+familySubject+j.in.families[matched[0]].label()+" answers too")
 	}
 	family := j.in.families[matched[0]]
 	j.familyRoutes[matched[0]] = append(j.familyRoutes[matched[0]], verdict.Route)
 	verdict.Class, verdict.Family = ClassDeclared, family.label()
 	verdict.Category, verdict.Reason, verdict.Issue = family.Category, family.Reason, family.Issue
 	verdict.Actions = slices.Clone(family.Actions)
+	for _, decision := range verdict.Adjudications {
+		if family.Category == categoryTracked && settlingAdjudications[decision.Category] {
+			j.problems = append(j.problems, familySubject+family.label()+" tracks "+verdict.Route+", and "+decision.Method+" is decided "+decision.Category+
+				", which says the route needs no action of its own: an action still to implement is no method acceptedMissingMethods settles")
+		}
+	}
 	return true
 }
 
@@ -155,7 +143,7 @@ func (j *judge) declares(method, path string, verdict *Route) bool {
 // it: what it lacks, the number of routes it answers against the number it
 // pins, and a client-protocol row over a route client-go sends.
 func (j *judge) familyProblems(family routeFamily, answered []string) []string {
-	label := "family " + family.label()
+	label := familySubject + family.label()
 	var out []string
 	for _, need := range j.familyNeeds(family) {
 		out = append(out, label+": "+need)
