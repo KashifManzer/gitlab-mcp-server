@@ -63,11 +63,90 @@ type widgetAPI struct {
 
 type notStruct int
 
+type innerBase struct {
+	*gl.Inner
+	Archived bool ~json:"archived"~
+}
+
+type innerResponse struct {
+	innerBase
+	Raw   bool  ~json:"raw"~
+	Count int64 ~json:"count"~
+}
+
+type looped struct {
+	*looped
+	gl.Inner
+	Loop bool ~json:"loop"~
+}
+
+type loopedBase struct {
+	*loopedBase
+	Loop bool ~json:"loop"~
+}
+
+type loopedMirror struct {
+	loopedBase
+	Count int64 ~json:"count"~
+}
+
+type tokenBase struct {
+	*gl.PtrEmbedded
+}
+
+type twoRoots struct {
+	innerBase
+	tokenBase
+}
+
+type threeRoots struct {
+	*gl.Inner
+	tokenBase
+	gl.Embedded
+}
+
+type rawOther struct {
+	Raw bool ~json:"raw"~
+}
+
+type innerOnly struct {
+	gl.Inner
+}
+
+type shadowed struct {
+	innerOnly
+	rawOther
+}
+
+type Labels []string
+
+type tagged struct {
+	gl.Inner
+	extra       ~json:"payload"~
+	*deeper     ~json:"-"~
+	gl.Embedded ~json:"embedded"~
+	Labels
+	notStruct
+}
+
+type taggedOnly struct {
+	gl.Inner ~json:"inner"~
+	Raw bool ~json:"raw"~
+}
+
 var (
-	widgets []*widgetAPI
-	one     *mirror
-	number  notStruct
-	options *gl.Options
+	widgets   []*widgetAPI
+	one       *mirror
+	number    notStruct
+	options   *gl.Options
+	responses []innerResponse
+	loops     *looped
+	mirrors   loopedMirror
+	roots     twoRoots
+	direct    threeRoots
+	shadows   shadowed
+	tags      tagged
+	tagOnly   taggedOnly
 )
 `
 
@@ -126,19 +205,101 @@ func TestSupersetOf_AStructEmbeddingClientGo_NeedsAPredicatePerKeyItCarriesBesid
 	}
 }
 
+// TestSupersetOf_ClientGoEmbeddedThroughAStructOfItsOwn_IsTheRoot verifies
+// that a client-go struct embedded below a struct of the package's own the
+// decoded struct embeds is its root, since the keys of both reach the JSON
+// at the decoded struct's depth: the key the struct of its own carries
+// beside it and the one the decoded struct adds each need a LacksKey, and a
+// key the decoded struct carries the way the root models it shadows it. A
+// struct that embeds itself through a pointer is read once, beside a
+// client-go struct or not.
+func TestSupersetOf_ClientGoEmbeddedThroughAStructOfItsOwn_IsTheRoot(t *testing.T) {
+	sdk := standInSDK(t)
+	local := localPackage(t, sdk)
+	cases := []struct {
+		name string
+		want Superset
+	}{
+		{name: "responses", want: Superset{
+			Type: "local.innerResponse", Root: "Inner", Keys: []string{"archived", "count", "raw"},
+			Needs: []string{"LacksKey{Inner, archived}", "LacksKey{Inner, count}", "shadows raw, which Inner models as bool"},
+		}},
+		{name: "loops", want: Superset{
+			Type: "local.looped", Root: "Inner", Keys: []string{"loop"},
+			Needs: []string{"LacksKey{Inner, loop}"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := SupersetOf(sdk, local.Scope().Lookup(tc.name).Type())
+			if !ok || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("SupersetOf(%s) = %+v, %v, want %+v", tc.name, got, ok, tc.want)
+			}
+		})
+	}
+}
+
+// TestSupersetOf_TheKeysOfEveryStructItEmbeds_AreItsOwn verifies the keys a
+// struct carries through what it embeds, the way encoding/json writes
+// them: a client-go struct beside the root, embedded below a struct of the
+// package's own or directly, carries the keys the root lacks (one both
+// carry alike needs nothing, as widgetAPI's Embedded shows); a key a struct
+// of the package's own carries the way the root does shadows it when the
+// decoded struct embeds the root, even through another of its own; and an
+// embedded field its tag names, or that holds no struct, is a key of its
+// own, while one tagged "-" or of an unexported type that is no struct is
+// never written.
+func TestSupersetOf_TheKeysOfEveryStructItEmbeds_AreItsOwn(t *testing.T) {
+	sdk := standInSDK(t)
+	local := localPackage(t, sdk)
+	cases := []struct {
+		name string
+		want Superset
+	}{
+		{name: "roots", want: Superset{
+			Type: "local.twoRoots", Root: "Inner", Keys: []string{"archived", "token"},
+			Needs: []string{"LacksKey{Inner, archived}", "LacksKey{Inner, token}"},
+		}},
+		{name: "direct", want: Superset{
+			Type: "local.threeRoots", Root: "Inner", Keys: []string{"page", "token"},
+			Needs: []string{"LacksKey{Inner, page}", "LacksKey{Inner, token}"},
+		}},
+		{name: "shadows", want: Superset{
+			Type: "local.shadowed", Root: "Inner", Keys: []string{"raw"},
+			Needs: []string{"shadows raw, which Inner models as bool"},
+		}},
+		{name: "tags", want: Superset{
+			Type: "local.tagged", Root: "Inner", Keys: []string{"Labels", "embedded", "payload"},
+			Needs: []string{"LacksKey{Inner, Labels}", "LacksKey{Inner, embedded}", "LacksKey{Inner, payload}"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := SupersetOf(sdk, local.Scope().Lookup(tc.name).Type())
+			if !ok || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("SupersetOf(%s) = %+v, %v, want %+v", tc.name, got, ok, tc.want)
+			}
+		})
+	}
+}
+
 // TestSupersetOf_WhatIsNoSuperset_ReportsNone verifies the values a raw
 // request can carry that the rule does not judge: client-go's own struct, a
 // struct of the package's own that embeds none of client-go's (whose pairing
-// only its entry's predicates say), a named type that is no struct and an
-// interface.
+// only its entry's predicates say), one that embeds a struct of its own
+// embedding itself and nothing of client-go's, one whose client-go struct
+// its tag names, which encoding/json writes as an object of its own, a
+// named type that is no struct and an interface.
 func TestSupersetOf_WhatIsNoSuperset_ReportsNone(t *testing.T) {
 	sdk := standInSDK(t)
 	local := localPackage(t, sdk)
 	cases := map[string]types.Type{
-		"client-go's own struct": local.Scope().Lookup("options").Type(),
-		"a mirror":               local.Scope().Lookup("one").Type(),
-		"a named non-struct":     local.Scope().Lookup("number").Type(),
-		"an interface":           types.Universe.Lookup("any").Type(),
+		"client-go's own struct":  local.Scope().Lookup("options").Type(),
+		"a mirror":                local.Scope().Lookup("one").Type(),
+		"a mirror embedding loop": local.Scope().Lookup("mirrors").Type(),
+		"a named client-go field": local.Scope().Lookup("tagOnly").Type(),
+		"a named non-struct":      local.Scope().Lookup("number").Type(),
+		"an interface":            types.Universe.Lookup("any").Type(),
 	}
 	for name, carried := range cases {
 		t.Run(name, func(t *testing.T) {

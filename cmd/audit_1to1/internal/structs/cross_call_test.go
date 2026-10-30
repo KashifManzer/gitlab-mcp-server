@@ -277,6 +277,184 @@ func TokenConst(c *gl.Client, in TokenConstInput) error {
 	return withToken(token{search: "x"}, func(t token) error { return sendToken(c, t) })
 }
 
+// protectOf builds the protection out of the intermediate.
+func protectOf(f filter) *gl.ProtectOptions { return &gl.ProtectOptions{Name: &f.search} }
+
+// protectRead carries an intermediate and the helper that builds the
+// protection from it.
+type protectRead struct {
+	f     filter
+	build func(filter) *gl.ProtectOptions
+}
+
+type MixedInput struct {
+	Search string ~json:"search"~
+}
+
+// Mixed fills the intermediate from its input for the list, and with
+// constants for the protection: in a literal, in a local, beside a closure
+// whose parameter is the intermediate and beside the helper named as a
+// value. Only the list is built for its input.
+func Mixed(c *gl.Client, in MixedInput) error {
+	if _, err := c.Widgets.ListWidgets(optionsOf(filter{search: in.Search})); err != nil {
+		return err
+	}
+	fixed := filter{search: "x"}
+	_ = c.Widgets.Protect(1, protectOf(fixed))
+	_ = c.Widgets.Protect(1, protectOf(filter{search: "y"}))
+	_ = protectRead{f: filter{search: "v"}, build: protectOf}
+	return scoped(filter{search: "z"}, func(f filter) error { return c.Widgets.Protect(1, protectOf(f)) })
+}
+
+// split hands back the intermediate it is handed and another it fills with
+// constants.
+func split(f filter) (filter, filter) { return f, filter{search: "x"} }
+
+type SplitInput struct {
+	Search string ~json:"search"~
+}
+
+// Split takes two intermediates from one call: only the first holds its
+// input, so the protection built from the second is built for none of it.
+func Split(c *gl.Client, in SplitInput) error {
+	held, fixed := split(filter{search: in.Search})
+	if _, err := c.Widgets.ListWidgets(optionsOf(held)); err != nil {
+		return err
+	}
+	return c.Widgets.Protect(1, protectOf(fixed))
+}
+
+// flip hands its two intermediates back in each other's place.
+func flip(x, y filter) (filter, filter) { return y, x }
+
+// swap hands its two intermediates back in each other's place, through
+// another function's results and through named results and a bare return.
+func swap(a, b filter) (first, second filter) {
+	if a.search == "" {
+		return flip(a, b)
+	}
+	first, second = b, a
+	return
+}
+
+// pick hands back what the function it is handed does, which it cannot
+// read, or what it does itself when handed none, or two intermediates of
+// constants.
+func pick(f filter, from func(filter) (filter, filter)) (filter, filter) {
+	if f.search == "" {
+		return split(filter{search: "y"})
+	}
+	if from == nil {
+		return pick(f, split)
+	}
+	return from(f)
+}
+
+type PickInput struct {
+	Search string ~json:"search"~
+}
+
+// Pick takes two intermediates whose places nothing it reads tells apart,
+// so each holds its input.
+func Pick(c *gl.Client, in PickInput) error {
+	_, fixed := pick(filter{search: in.Search}, nil)
+	return c.Widgets.Protect(1, protectOf(fixed))
+}
+
+type SwapInput struct {
+	Search string ~json:"search"~
+}
+
+// Swap hands its input in the first place and takes it back in the second.
+func Swap(c *gl.Client, in SwapInput) error {
+	fixed, held := swap(filter{search: in.Search}, filter{search: "x"})
+	if err := c.Widgets.Protect(1, protectOf(fixed)); err != nil {
+		return err
+	}
+	_, err := c.Widgets.ListWidgets(optionsOf(held))
+	return err
+}
+
+// constant calls the function its caller passes with an intermediate of its
+// own, filled with constants, whatever it is handed.
+func constant(f filter, protect func(filter) error) error {
+	if f.search == "" {
+		return nil
+	}
+	return protect(filter{search: "w"})
+}
+
+type ConstantInput struct {
+	Search string ~json:"search"~
+}
+
+// Constant fills the intermediate from its input beside a closure the
+// function it is handed to calls with constants alone, so the protection is
+// built for none of its input.
+func Constant(c *gl.Client, in ConstantInput) error {
+	return constant(filter{search: in.Search}, func(f filter) error { return c.Widgets.Protect(1, protectOf(f)) })
+}
+
+// relay hands the function its caller passes on to another, which calls it.
+func relay(f filter, list func(filter) error) error { return scoped(f, list) }
+
+type RelayInput struct {
+	Search string ~json:"search"~
+}
+
+// Relay hands its closure to a function that hands it on, so whoever calls
+// it is out of sight and the closure holds the intermediate beside it.
+func Relay(c *gl.Client, in RelayInput) error {
+	return relay(filter{search: in.Search}, func(f filter) error {
+		_, err := c.Widgets.ListWidgets(optionsOf(f))
+		return err
+	})
+}
+
+type IndirectInput struct {
+	Search string ~json:"search"~
+}
+
+// Indirect hands its closure to a function held in a variable, whose body
+// is out of sight, so the closure holds the intermediate beside it.
+func Indirect(c *gl.Client, in IndirectInput) error {
+	call := scoped
+	return call(filter{search: in.Search}, func(f filter) error {
+		_, err := c.Widgets.ListWidgets(optionsOf(f))
+		return err
+	})
+}
+
+// ignore names neither of its parameters, so it calls neither.
+func ignore(filter, func(filter) error) error { return nil }
+
+type IgnoredInput struct {
+	Search string ~json:"search"~
+}
+
+// Ignored hands its closure to a function that never calls it, so the
+// protection it builds is built for none of its input.
+func Ignored(c *gl.Client, in IgnoredInput) error {
+	return ignore(filter{search: in.Search}, func(f filter) error { return c.Widgets.Protect(1, protectOf(f)) })
+}
+
+type HeldInput struct {
+	Search string ~json:"search"~
+}
+
+// Held fills the intermediate from its input into a local, copies it into
+// another, and hands the protection helper each one a loop over them binds.
+func Held(c *gl.Client, in HeldInput) error {
+	held := filter{search: in.Search}
+	var copied = held
+	for _, each := range []filter{copied} {
+		if err := c.Widgets.Protect(1, protectOf(each)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type ForkInput struct {
 	Search string ~json:"search"~
 }
@@ -347,11 +525,22 @@ func callerPairs(pkg *packages.Package) []string {
 // deep, or a struct of arguments the handler fills and a shared body reads,
 // and each pair says it was found through the caller. An intermediate the
 // handler fills from its input carries the input on: into the parameter of a
-// closure, into a helper named as a value beside it, and into a helper that
-// sends the options itself. A function that takes an input and references no
-// method builds for its caller, whether the caller hands it its own input or
-// a literal of the builder's. A handler that hands the helper constants, or
-// an intermediate filled with them, one that sends nothing taking the
+// closure, into a helper named as a value beside it, into a helper that
+// sends the options itself, and through a local, a copy of it and a loop
+// over them. A function of the package that hands back several results is
+// read through its body, so only the result it hands the intermediate back
+// in holds it, whether its value, a named result or another function's
+// result, and each does when it hands back what nothing read tells apart (a
+// function value's results, its own); and a closure it is handed holds the
+// intermediate only where it calls the closure with it, never when it names
+// no parameter to call, and wherever it hands the closure on or is itself
+// out of sight. A function that takes an input and references no
+// method builds for its caller, whether the caller hands it its own input
+// or a literal of the builder's. A handler that hands the helper constants,
+// or an
+// intermediate filled with them (even one whose type the same handler fills
+// from its input elsewhere, in a literal, a local, beside a closure or
+// beside a helper named as a value), one that sends nothing taking the
 // struct, one that calls a handler, one whose input no model sends, one
 // whose input has no name, and the calls that name no function pair nothing.
 func TestCollectCallerInputs_AHelperBuildsTheOptions_PairsThemWithTheInputOfItsCaller(t *testing.T) {
@@ -364,9 +553,16 @@ func TestCollectCallerInputs_AHelperBuildsTheOptions_PairsThemWithTheInputOfItsC
 		"ChainInput v3.ListWidgetsOptions caller",
 		"ForkInput v3.ListWidgetsOptions caller",
 		"GroupForkInput v3.ListWidgetsOptions caller",
+		"HeldInput v3.ProtectOptions caller",
+		"IndirectInput v3.ListWidgetsOptions caller",
 		"ListInput v3.ListWidgetsOptions caller",
+		"MixedInput v3.ListWidgetsOptions caller",
+		"PickInput v3.ProtectOptions caller",
+		"RelayInput v3.ListWidgetsOptions caller",
 		"RunInput v3.ListWidgetsOptions caller",
 		"ScopedInput v3.ListWidgetsOptions caller",
+		"SplitInput v3.ListWidgetsOptions caller",
+		"SwapInput v3.ListWidgetsOptions caller",
 		"TokenInput v3.ListWidgetsOptions caller",
 		"TokenLitInput v3.ListWidgetsOptions caller",
 	}
