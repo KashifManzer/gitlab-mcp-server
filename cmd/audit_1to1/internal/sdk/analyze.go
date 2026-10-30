@@ -10,6 +10,8 @@ import (
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/enums"
 	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/shared"
+	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/structs"
+	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/waits"
 )
 
 // Service and operation statuses.
@@ -30,32 +32,113 @@ type report struct {
 	// EnumFields lists the fields of an SDK enum type the actions expose,
 	// each held against the SDK's constant set (R-ENUM).
 	EnumFields []enums.Finding `json:"enum_fields"`
-	// StaleDeclarations joins the three tables' stale entries: a service
-	// declaration, a GraphQL decision or an enum exemption that no longer
-	// describes the code.
+	// OptionStructs holds every client-go struct a request a handler sends
+	// carries to an input, and every copy of one struct into another to the
+	// fields the two share.
+	OptionStructs optionStructsReport `json:"option_structs"`
+	// UpstreamWaits holds every workaround waiting on client-go to the
+	// predicate that says it is still needed, and every raw request,
+	// request option written by hand and body edit the walk finds to an
+	// entry that answers it.
+	UpstreamWaits upstreamWaitsReport `json:"upstream_waits"`
+	// Captures holds every struct a tool package decodes off a captured
+	// response to the client-go structs decoded from the same response,
+	// every key both read to a declaration that says why it is read twice,
+	// and every such struct paired with none to why it has no SDK half.
+	Captures capturesReport `json:"captures"`
+	// Identifiers holds every integer a handler hands a client-go parameter
+	// of type any, by name or through a method value, to what the live API
+	// record says the placeholder it fills takes, lists every method value
+	// the walk does not follow, and every integer parameter of client-go
+	// that narrows a placeholder taking a name or a path.
+	Identifiers identifiersReport `json:"identifiers"`
+	// StaleDeclarations joins the seven tables' stale entries: a service
+	// declaration, a GraphQL decision, an enum exemption, an option struct
+	// declaration, an upstream wait, a capture declaration or an identifier
+	// declaration that no longer describes the code.
 	StaleDeclarations []string `json:"stale_declarations,omitempty"`
 }
 
 type reportSummary struct {
-	SDKServices          int `json:"sdk_services"`
-	ServicesCovered      int `json:"services_covered"`
-	ServicesDeclared     int `json:"services_declared"`
-	ServicesUndeclared   int `json:"services_undeclared"`
-	GraphQLOperations    int `json:"graphql_operations"`
-	GraphQLAdjudicated   int `json:"graphql_adjudicated"`
-	GraphQLUnadjudicated int `json:"graphql_unadjudicated"`
-	EnumFields           int `json:"enum_fields"`
-	EnumFieldsWithGaps   int `json:"enum_fields_with_gaps"`
-	EnumMissingValues    int `json:"enum_missing_values"`
-	EnumExtraValues      int `json:"enum_extra_values"`
-	StaleDeclarations    int `json:"stale_declarations"`
+	SDKServices             int `json:"sdk_services"`
+	ServicesCovered         int `json:"services_covered"`
+	ServicesDeclared        int `json:"services_declared"`
+	ServicesUndeclared      int `json:"services_undeclared"`
+	GraphQLOperations       int `json:"graphql_operations"`
+	GraphQLAdjudicated      int `json:"graphql_adjudicated"`
+	GraphQLUnadjudicated    int `json:"graphql_unadjudicated"`
+	EnumFields              int `json:"enum_fields"`
+	EnumFieldsWithGaps      int `json:"enum_fields_with_gaps"`
+	EnumMissingValues       int `json:"enum_missing_values"`
+	EnumExtraValues         int `json:"enum_extra_values"`
+	OptionStructs           int `json:"option_structs"`
+	OptionPaired            int `json:"option_structs_paired"`
+	OptionConverted         int `json:"option_structs_converted"`
+	OptionCopied            int `json:"option_structs_copied"`
+	OptionDeclared          int `json:"option_structs_declared"`
+	OptionUnpaired          int `json:"option_structs_unpaired"`
+	OptionCopyMissing       int `json:"option_copy_missing_fields"`
+	OptionNestedMissing     int `json:"option_nested_missing_fields"`
+	UpstreamWaits           int `json:"upstream_waits"`
+	WaitsHolding            int `json:"upstream_waits_holding"`
+	WaitsStalePredicate     int `json:"upstream_waits_stale_predicate"`
+	WaitsObsolete           int `json:"upstream_waits_obsolete"`
+	Workarounds             int `json:"workarounds"`
+	WorkaroundsUndeclared   int `json:"workarounds_undeclared"`
+	BodyEditKeysUnanswered  int `json:"body_edit_keys_unanswered"`
+	BodyEditsUnread         int `json:"body_edits_unread"`
+	SupersetNeedsUnanswered int `json:"superset_needs_unanswered"`
+	OptionMethodsUnanswered int `json:"option_methods_unanswered"`
+	CapturedTypes           int `json:"captured_types"`
+	CapturedKeysShared      int `json:"captured_keys_shared"`
+	CapturesKept            int `json:"captures_kept"`
+	CapturesRedundant       int `json:"captures_redundant"`
+	CapturesStalePredicate  int `json:"captures_stale_predicate"`
+	CapturesObsolete        int `json:"captures_obsolete"`
+	CapturesAnswerNoStruct  int `json:"captures_answer_no_struct"`
+	CapturesUnpaired        int `json:"captures_unpaired"`
+	IdentifierArguments     int `json:"identifier_arguments"`
+	IdentifiersIDOnly       int `json:"identifiers_id_only"`
+	IdentifiersDeclared     int `json:"identifiers_declared"`
+	IdentifiersNotFromInput int `json:"identifiers_not_from_input"`
+	IdentifiersNarrowed     int `json:"identifiers_narrowed"`
+	IdentifiersUndescribed  int `json:"identifiers_undescribed"`
+	IdentifiersUnplaced     int `json:"identifiers_unplaced"`
+	IdentifiersUntraced     int `json:"identifiers_untraced"`
+	IdentifiersUnfollowed   int `json:"identifiers_unfollowed"`
+	SDKNarrowed             int `json:"sdk_narrowed"`
+	StaleDeclarations       int `json:"stale_declarations"`
 }
 
 // clean reports whether the audited tree has no finding, i.e. whether the gate
 // passes.
 func (s reportSummary) clean() bool {
+	return s.surfaceClean() && s.waitsClean() && s.capturesClean() && s.identifiersClean() && s.StaleDeclarations == 0
+}
+
+// surfaceClean reports whether the services, the GraphQL operations, the
+// enum values and the option structs hold no finding.
+func (s reportSummary) surfaceClean() bool {
 	return s.ServicesUndeclared == 0 && s.GraphQLUnadjudicated == 0 &&
-		s.EnumMissingValues == 0 && s.EnumExtraValues == 0 && s.StaleDeclarations == 0
+		s.EnumMissingValues == 0 && s.EnumExtraValues == 0 &&
+		s.OptionUnpaired == 0 && s.OptionCopyMissing == 0 && s.OptionNestedMissing == 0
+}
+
+// waitsClean reports whether the upstream waits hold no finding.
+func (s reportSummary) waitsClean() bool {
+	return s.WaitsStalePredicate == 0 && s.WaitsObsolete == 0 && s.WorkaroundsUndeclared == 0 && s.BodyEditKeysUnanswered == 0 &&
+		s.BodyEditsUnread == 0 && s.SupersetNeedsUnanswered == 0 && s.OptionMethodsUnanswered == 0
+}
+
+// capturesClean reports whether the captures hold no finding.
+func (s reportSummary) capturesClean() bool {
+	return s.CapturesRedundant == 0 && s.CapturesStalePredicate == 0 && s.CapturesObsolete == 0 && s.CapturesUnpaired == 0
+}
+
+// identifiersClean reports whether the identifiers hold no finding.
+func (s reportSummary) identifiersClean() bool {
+	return s.IdentifiersNarrowed == 0 && s.IdentifiersUndescribed == 0 && s.IdentifiersUnplaced == 0 &&
+		s.IdentifiersUntraced == 0 && s.IdentifiersUnfollowed == 0
 }
 
 // Seams for the failures the real tree cannot produce: the JSON encoder never
@@ -97,7 +180,12 @@ func buildReport(root string, gapsOnly bool) (report, error) {
 	if err != nil {
 		return report{}, err
 	}
-	services := adjudicateServices(declared, shared.CollectServiceUsage(pkgs), declaredServices)
+	// A service a workaround replaces whole is declared COVERED_RAW by the
+	// entry, which is where its reason lives.
+	entries := waits.Entries()
+	serviceDeclarations, declaredTwice := withCoveredRawServices(declaredServices, entries)
+	usage := shared.CollectServiceUsage(pkgs)
+	services := adjudicateServices(declared, usage, serviceDeclarations)
 
 	graphQL, err := shared.GraphQLInterface(clientGo)
 	if err != nil {
@@ -113,12 +201,36 @@ func buildReport(root string, gapsOnly bool) (report, error) {
 		return report{}, err
 	}
 
-	stale := mergeStale(staleServiceDeclarations(services, declaredServices), staleGraphQLDecisions(operations, graphqlDecisions), enumRep.StaleExemptions)
+	// The option structs are held to the inputs the field diff pairs them
+	// with, read from the same packages the structs scope reads.
+	options, optionStale := buildOptionStructs(collectOptionUniverse(pkgs), structs.DiffInputPairs(pkgs), optionStructDeclarations)
+
+	upstream, waitsStale, err := analyzeUpstreamWaits(root, pkgs, clientGo, usage, entries)
+	if err != nil {
+		return report{}, err
+	}
+
+	captures, capturesStale := analyzeCaptures(pkgs, clientGo, captureDeclarations)
+
+	// The identifiers are held to the live API record, a pinned oracle a
+	// re-pin moves and a stack never regenerates, so reading it does not
+	// defer the scope.
+	identifiers, identifiersStale := analyzeIdentifiers(root, pkgs, usage, identifierDeclarations)
+
+	stale := mergeStale(staleServiceDeclarations(services, serviceDeclarations), declaredTwice, staleGraphQLDecisions(operations, graphqlDecisions), enumRep.StaleExemptions, optionStale, waitsStale, capturesStale, identifiersStale)
 	summary := summarize(services, operations, enumRep.Summary, stale)
+	summarizeOptionStructs(&summary, options)
+	summarizeUpstreamWaits(&summary, upstream)
+	summarizeCaptures(&summary, captures)
+	summarizeIdentifiers(&summary, identifiers)
 
 	if gapsOnly {
 		services = keepUndeclaredServices(services)
 		operations = keepUnadjudicatedOperations(operations)
+		options = keepOptionFindings(options)
+		upstream = keepWaitFindings(upstream)
+		captures = keepCaptureFindings(captures)
+		identifiers = keepIdentifierFindings(identifiers)
 	}
 	return report{
 		SchemaVersion:     shared.SchemaVersion,
@@ -127,6 +239,10 @@ func buildReport(root string, gapsOnly bool) (report, error) {
 		Services:          services,
 		GraphQLOperations: operations,
 		EnumFields:        flattenEnumFindings(enumRep),
+		OptionStructs:     options,
+		UpstreamWaits:     upstream,
+		Captures:          captures,
+		Identifiers:       identifiers,
 		StaleDeclarations: stale,
 	}, nil
 }

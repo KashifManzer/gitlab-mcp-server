@@ -144,16 +144,19 @@ func (args scopedSearchArgs[T]) wrap(err error) error {
 }
 
 // search sends the query to the narrowest scope the caller named: the
-// project, else the group, else the whole instance.
+// project, else the group, else the whole instance. Only the project search
+// declares ref, so a group or instance search is sent without it.
 func (args scopedSearchArgs[T]) search(ctx context.Context, opts *gl.SearchOptions) ([]T, *gl.Response, error) {
 	options := append([]gl.RequestOptionFunc{gl.WithContext(ctx)}, args.options...)
 	if args.projectID != "" {
 		return args.projectSearch(string(args.projectID), args.query, opts, options...)
 	}
+	unscoped := *opts
+	unscoped.Ref = nil
 	if args.groupID != "" {
-		return args.groupSearch(string(args.groupID), args.query, opts, options...)
+		return args.groupSearch(string(args.groupID), args.query, &unscoped, options...)
 	}
-	return args.globalSearch(args.query, opts, options...)
+	return args.globalSearch(args.query, &unscoped, options...)
 }
 
 func convertSearchResults[T, O any](items []T, convert func(T) O) []O {
@@ -373,6 +376,7 @@ type CommitsInput struct {
 	ProjectID toolutil.StringOrInt `json:"project_id,omitempty" jsonschema:"Project ID or URL-encoded path (optional)"`
 	GroupID   toolutil.StringOrInt `json:"group_id,omitempty"   jsonschema:"Group ID or URL-encoded path (optional)"`
 	Query     string               `json:"query"                jsonschema:"Search query string,required"`
+	Ref       string               `json:"ref,omitempty"        jsonschema:"Branch or tag whose commits a project search reads (default: the default branch). Group and instance searches do not take it"`
 	TypeInput
 	toolutil.PaginationInput
 }
@@ -397,7 +401,7 @@ func Commits(ctx context.Context, client *gitlabclient.Client, input CommitsInpu
 	searchClient := client.GL().Search
 	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	_, resp, err := runScopedSearch(ctx, scopedSearchArgs[*gl.Commit]{
-		query: input.Query, projectID: input.ProjectID, groupID: input.GroupID, page: input.Page, perPage: input.PerPage,
+		query: input.Query, projectID: input.ProjectID, groupID: input.GroupID, ref: input.Ref, page: input.Page, perPage: input.PerPage,
 		searchType: input.SearchType, operation: "searchCommits", projectSearch: searchClient.CommitsByProject,
 		groupSearch: searchClient.CommitsByGroup, globalSearch: searchClient.Commits,
 		capturesPage: true,
@@ -739,6 +743,7 @@ type WikiInput struct {
 	ProjectID toolutil.StringOrInt `json:"project_id,omitempty" jsonschema:"Project ID or URL-encoded path (optional)"`
 	GroupID   toolutil.StringOrInt `json:"group_id,omitempty"   jsonschema:"Group ID or URL-encoded path (optional)"`
 	Query     string               `json:"query"                jsonschema:"Search query string,required"`
+	Ref       string               `json:"ref,omitempty"        jsonschema:"Branch or tag of the wiki repository a project search reads (default: the default branch). Group and instance searches do not take it"`
 	TypeInput
 	toolutil.PaginationInput
 }
@@ -783,7 +788,7 @@ func Wiki(ctx context.Context, client *gitlabclient.Client, input WikiInput) (Wi
 	searchClient := client.GL().Search
 	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	_, resp, err := runScopedSearch(ctx, scopedSearchArgs[*gl.Wiki]{
-		query: input.Query, projectID: input.ProjectID, groupID: input.GroupID, page: input.Page, perPage: input.PerPage,
+		query: input.Query, projectID: input.ProjectID, groupID: input.GroupID, ref: input.Ref, page: input.Page, perPage: input.PerPage,
 		searchType: input.SearchType, operation: "searchWiki", projectSearch: searchClient.WikiBlobsByProject,
 		groupSearch: searchClient.WikiBlobsByGroup, globalSearch: searchClient.WikiBlobs,
 		capturesPage: true,

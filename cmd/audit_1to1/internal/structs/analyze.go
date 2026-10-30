@@ -209,12 +209,40 @@ const (
 	// account token lists offer no keyset field of the gl.ListOptions they
 	// page with.
 	serviceAccountPATsOffsetOnly = "GET /groups/:id/service_accounts/:user_id/personal_access_tokens and GET /projects/:id/service_accounts/:user_id/personal_access_tokens page a PersonalAccessToken relation with paginate_with_strategies (lib/api/group_service_accounts.rb and lib/api/project_service_accounts.rb at v19.5.0-ee); the class has no supported_keyset_orderings and is not a Project, so GitLab answers pagination=keyset with 405 and otherwise pages by offset, which reads page and per_page alone and ignores page_token; neither route declares order_by (gitlab-api-live.json, 19.5.0-ee), both hand the token finder their declared params alone, and the finder orders by sort; so gl.ListOptions pagination, page_token and order_by do nothing a caller wants there (issue 1165)"
+	// auditEventsUnordered is the reason the three audit event lists offer no
+	// ordering field of the gl.ListOptions their options struct embeds.
+	auditEventsUnordered = "GET /audit_events, GET /groups/:id/audit_events and GET /projects/:id/audit_events declare created_after, created_before, page and per_page, and the instance route entity_type and entity_id besides, and no order_by or sort (gitlab-api-live.json, 19.5.0-ee); gl.ListOptions ordering fields reach nothing there"
+	// projectIterationsOffsetOnly is the reason the project iteration list
+	// offers no ordering or keyset field of the gl.ListOptions it embeds.
+	projectIterationsOffsetOnly = "GET /projects/:id/iterations declares state, search, in, include_ancestors, include_descendants, updated_before, updated_after, page and per_page (gitlab-api-live.json, 19.5.0-ee); gl.ListOptions ordering and keyset fields reach nothing there"
+	// searchOffsetOnly is the reason the searches offer no ordering or keyset
+	// field of the gl.ListOptions gl.SearchOptions embeds.
+	searchOffsetOnly = "GET /search, GET /groups/:id/search and GET /projects/:id/search declare page and per_page and no order_by, sort, pagination or page_token (gitlab-api-live.json, 19.5.0-ee); gl.ListOptions ordering and keyset fields reach nothing there"
+	// searchRefRepositoryScopes is the reason the searches of a scope that
+	// reads no repository offer no ref.
+	searchRefRepositoryScopes = "ref names the branch or tag a blobs, commits or wiki_blobs search reads (search.md, search within a project), and of the three search routes only GET /projects/:id/search declares it (gitlab-api-live.json, 19.5.0-ee); the issues, merge_requests, milestones, notes, projects, snippet_titles and users scopes read no repository"
+	// envApprovalRuleDescription is the reason the protected environment
+	// approval rule inputs offer no access_level_description.
+	envApprovalRuleDescription = "approval_rules[access_level_description] is declared by none of POST /projects/:id/protected_environments, PUT /projects/:id/protected_environments/:name and their two group routes (gitlab-api-live.json, 19.5.0-ee): it is a field of the approval rule GitLab answers with, which client-go's options carry as well, so GitLab would drop the value"
 	// milestoneBurndownUnpaged is the reason the project milestone burndown
 	// offers none of the gl.ListOptions its options struct embeds.
 	milestoneBurndownUnpaged = "GET /projects/:id/milestones/:milestone_id/burndown_events declares no page, per_page, order_by or sort (gitlab-api-live.json, 19.5.0-ee), and ee/lib/ee/api/milestone_responses.rb presents the whole Burndown without paginate, so every gl.ListOptions field would be sent and ignored"
 	// groupMilestoneBurndownUnpaged is the reason the group milestone burndown
 	// offers none of the gl.ListOptions its options struct embeds.
 	groupMilestoneBurndownUnpaged = "GET /groups/:id/milestones/:milestone_id/burndown_events declares no page, per_page, order_by or sort (gitlab-api-live.json, 19.5.0-ee), and ee/lib/ee/api/group_milestones.rb answers it through milestone_burndown_events_for, which presents the whole Burndown without paginate (ee/lib/ee/api/milestone_responses.rb), so every gl.ListOptions field would be sent and ignored"
+	// overrideParamUndeclared is the reason the import's override_params input
+	// offers a field client-go's CreateProjectOptions carries.
+	overrideParamUndeclared = "not declared under override_params by POST /projects/import, which takes optional_project_params there (lib/api/project_import.rb, lib/api/helpers/projects_helpers.rb; gitlab-api-live.json, 19.5.0-ee), and import_params is declared_params, so Grape drops the key; client-go's CreateProjectOptions, the type of ImportFileOptions.OverrideParams, carries it for the project create"
+	// overrideParamPlacement is the reason the import's override_params input
+	// offers none of the project's name, path and namespace.
+	overrideParamPlacement = "not declared under override_params by POST /projects/import, which declares name, path and namespace as params of its own (lib/api/project_import.rb; gitlab-api-live.json, 19.5.0-ee), so Grape drops the override_params key; ImportFromFileInput offers the import's own name, path and namespace"
+	// overrideParamNotRestored is the reason the import's override_params
+	// input offers a field GitLab declares there and the import never applies.
+	overrideParamNotRestored = "declared under override_params by POST /projects/import (gitlab-api-live.json, 19.5.0-ee), but the import's tree restorer merges the overrides into the archive's project attributes and keeps only those lib/gitlab/import_export/project/import_export.yml permits for a project (Gitlab::ImportExport::AttributesPermitter, through Group::RelationTreeRestorer#filter_attributes), and this one is not among them, so the import drops it; client-go's CreateProjectOptions carries it for the project create"
+	// overrideParamNotAssignable is the reason the import's override_params
+	// input offers neither of the two keys the import permits and cannot
+	// assign.
+	overrideParamNotAssignable = "declared under override_params by POST /projects/import (gitlab-api-live.json, 19.5.0-ee) and permitted for a project by lib/gitlab/import_export/project/import_export.yml, but Group::RelationTreeRestorer#update_params! hands it to Project#assign_attributes, which cannot take it: topics is the has_many :topics association with Projects::Topic (app/models/project.rb), which a list of names does not fill, and the project has no jobs_enabled writer at all (lib/api/projects.rb renames it to builds_enabled for the create and the edit alone), so either one raises, the restore fails and the import with it; builds_access_level sets what jobs_enabled would, and client-go's CreateProjectOptions carries both for the project create"
 	// achievementAvatarUpload is the reason the avatar upload is absent under
 	// its SDK key.
 	achievementAvatarUpload = "offered as AvatarInput (avatar_filename, avatar_content_type, and avatar_file_path or avatar_content_base64), which the handler assembles into the *gl.GraphQLUpload opts.Avatar takes"
@@ -1089,6 +1117,79 @@ var acceptedMissingInputs = &declarationTable{name: "acceptedMissingInputs", ent
 	"projectserviceaccounts.ListPATInput.pagination": serviceAccountPATsOffsetOnly,
 	"projectserviceaccounts.ListPATInput.page_token": serviceAccountPATsOffsetOnly,
 	"projectserviceaccounts.ListPATInput.order_by":   serviceAccountPATsOffsetOnly,
+	// The audit event lists build their options in auditevents.buildListOpts, a
+	// helper each handler calls with its input's fields, and GitLab orders
+	// none of the three routes.
+	"auditevents.ListInstanceInput.order_by": auditEventsUnordered,
+	"auditevents.ListInstanceInput.sort":     auditEventsUnordered,
+	"auditevents.ListGroupInput.order_by":    auditEventsUnordered,
+	"auditevents.ListGroupInput.sort":        auditEventsUnordered,
+	"auditevents.ListProjectInput.order_by":  auditEventsUnordered,
+	"auditevents.ListProjectInput.sort":      auditEventsUnordered,
+	// The project iteration list builds its options in a helper of
+	// iterationdata, and GitLab pages that route by offset alone.
+	"projectiterations.ListInput.order_by":   projectIterationsOffsetOnly,
+	"projectiterations.ListInput.sort":       projectIterationsOffsetOnly,
+	"projectiterations.ListInput.pagination": projectIterationsOffsetOnly,
+	"projectiterations.ListInput.page_token": projectIterationsOffsetOnly,
+	// Every search builds its options in search.searchOpts, directly or
+	// through runScopedSearch, and GitLab pages every search by offset alone.
+	// The code, commit and wiki searches offer ref, since their scopes read a
+	// repository, and the others answer it here.
+	"search.CodeInput.order_by":            searchOffsetOnly,
+	"search.CodeInput.sort":                searchOffsetOnly,
+	"search.CodeInput.pagination":          searchOffsetOnly,
+	"search.CodeInput.page_token":          searchOffsetOnly,
+	"search.CommitsInput.order_by":         searchOffsetOnly,
+	"search.CommitsInput.sort":             searchOffsetOnly,
+	"search.CommitsInput.pagination":       searchOffsetOnly,
+	"search.CommitsInput.page_token":       searchOffsetOnly,
+	"search.WikiInput.order_by":            searchOffsetOnly,
+	"search.WikiInput.sort":                searchOffsetOnly,
+	"search.WikiInput.pagination":          searchOffsetOnly,
+	"search.WikiInput.page_token":          searchOffsetOnly,
+	"search.IssuesInput.order_by":          searchOffsetOnly,
+	"search.IssuesInput.sort":              searchOffsetOnly,
+	"search.IssuesInput.pagination":        searchOffsetOnly,
+	"search.IssuesInput.page_token":        searchOffsetOnly,
+	"search.IssuesInput.ref":               searchRefRepositoryScopes,
+	"search.MergeRequestsInput.order_by":   searchOffsetOnly,
+	"search.MergeRequestsInput.sort":       searchOffsetOnly,
+	"search.MergeRequestsInput.pagination": searchOffsetOnly,
+	"search.MergeRequestsInput.page_token": searchOffsetOnly,
+	"search.MergeRequestsInput.ref":        searchRefRepositoryScopes,
+	"search.MilestonesInput.order_by":      searchOffsetOnly,
+	"search.MilestonesInput.sort":          searchOffsetOnly,
+	"search.MilestonesInput.pagination":    searchOffsetOnly,
+	"search.MilestonesInput.page_token":    searchOffsetOnly,
+	"search.MilestonesInput.ref":           searchRefRepositoryScopes,
+	"search.UsersInput.order_by":           searchOffsetOnly,
+	"search.UsersInput.sort":               searchOffsetOnly,
+	"search.UsersInput.pagination":         searchOffsetOnly,
+	"search.UsersInput.page_token":         searchOffsetOnly,
+	"search.UsersInput.ref":                searchRefRepositoryScopes,
+	"search.NotesInput.order_by":           searchOffsetOnly,
+	"search.NotesInput.sort":               searchOffsetOnly,
+	"search.NotesInput.pagination":         searchOffsetOnly,
+	"search.NotesInput.page_token":         searchOffsetOnly,
+	"search.NotesInput.ref":                searchRefRepositoryScopes,
+	"search.ProjectsInput.order_by":        searchOffsetOnly,
+	"search.ProjectsInput.sort":            searchOffsetOnly,
+	"search.ProjectsInput.pagination":      searchOffsetOnly,
+	"search.ProjectsInput.page_token":      searchOffsetOnly,
+	"search.ProjectsInput.ref":             searchRefRepositoryScopes,
+	"search.SnippetsInput.order_by":        searchOffsetOnly,
+	"search.SnippetsInput.sort":            searchOffsetOnly,
+	"search.SnippetsInput.pagination":      searchOffsetOnly,
+	"search.SnippetsInput.page_token":      searchOffsetOnly,
+	"search.SnippetsInput.ref":             searchRefRepositoryScopes,
+	// The approval rules of a protected environment are paired with the
+	// input element each rule is built from, and GitLab declares no
+	// description of the access level among their params.
+	"protectedenvs.ApprovalRuleInput.access_level_description":            envApprovalRuleDescription,
+	"protectedenvs.UpdateApprovalRuleInput.access_level_description":      envApprovalRuleDescription,
+	"groupprotectedenvs.ApprovalRuleInput.access_level_description":       envApprovalRuleDescription,
+	"groupprotectedenvs.UpdateApprovalRuleInput.access_level_description": envApprovalRuleDescription,
 	// The project milestone burndown is presented whole: GitLab pages and
 	// orders nothing on that route, so the whole gl.ListOptions is plumbing.
 	"milestones.GetBurndownChartEventsInput.pagination": milestoneBurndownUnpaged,
@@ -1152,11 +1253,58 @@ var acceptedMissingInputs = &declarationTable{name: "acceptedMissingInputs", ent
 	"releaselinks.CreateBatchInput.filepath":          "modeled on the links[] slice element (LinkEntry.FilePath, deprecated alias)",
 	"releaselinks.CreateBatchInput.link_type":         "modeled on the links[] slice element (LinkEntry.LinkType)",
 
-	// Whole-type curated subset: override_params accepts the full CreateProjectOptions
-	// set (~79 fields); the import tool exposes the commonly-overridden subset — full
-	// project configuration is available via the dedicated gitlab_project create/update
-	// tools. (topics/tag_list are also excluded due to an SDK multipart []string bug.)
-	"projectimportexport.ImportOverrideParamsInput": "override_params curated subset; full project config via gitlab_project create/update tools",
+	// The CreateProjectOptions fields GitLab does not declare under the
+	// override_params of an import.
+	"projectimportexport.ImportOverrideParamsInput.name":                            overrideParamPlacement,
+	"projectimportexport.ImportOverrideParamsInput.path":                            overrideParamPlacement,
+	"projectimportexport.ImportOverrideParamsInput.namespace_id":                    overrideParamPlacement,
+	"projectimportexport.ImportOverrideParamsInput.default_branch":                  overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.build_coverage_regex":            overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.ci_forward_deployment_enabled":   overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.group_with_project_templates_id": overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.import_url":                      overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.initialize_with_readme":          overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.issues_template":                 overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.merge_pipelines_enabled":         overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.merge_requests_template":         overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.merge_train_enforcement":         overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.merge_trains_enabled":            overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.merge_trains_skip_train_allowed": overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.operations_access_level":         overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.protect_merge_request_pipelines": overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.reviewer_assignment_strategy":    overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.template_name":                   overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.template_project_id":             overrideParamUndeclared,
+	"projectimportexport.ImportOverrideParamsInput.use_custom_template":             overrideParamUndeclared,
+
+	// The CreateProjectOptions fields GitLab declares under the
+	// override_params of an import and the import never applies.
+	"projectimportexport.ImportOverrideParamsInput.ci_config_path":                               overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.cicd_catalog_enabled":                         overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.container_expiration_policy_attributes":       overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.emails_disabled":                              overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.emails_enabled":                               overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.enforce_auth_checks_on_uploads":               overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.group_runners_enabled":                        overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.issue_branch_template":                        overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.lfs_enabled":                                  overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.merge_request_title_regex":                    overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.merge_request_title_regex_description":        overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.mirror":                                       overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.mirror_trigger_builds":                        overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.mr_default_title_template":                    overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.only_allow_merge_if_all_status_checks_passed": overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.packages_enabled":                             overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.public_jobs":                                  overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.repository_storage":                           overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.resource_group_default_process_mode":          overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.show_default_award_emojis":                    overrideParamNotRestored,
+	"projectimportexport.ImportOverrideParamsInput.tag_list":                                     overrideParamNotRestored,
+
+	// The CreateProjectOptions fields the import permits under
+	// override_params and fails on.
+	"projectimportexport.ImportOverrideParamsInput.topics":       overrideParamNotAssignable,
+	"projectimportexport.ImportOverrideParamsInput.jobs_enabled": overrideParamNotAssignable,
 }}
 
 // isAcceptedMissingInput reports whether an input pair's missing field is an
@@ -1170,9 +1318,15 @@ func (r *diffRun) isAcceptedMissingInput(pkg, mcpType, tag string) bool {
 
 // gap is one diffed MCP↔SDK struct pair under a package.
 type gap struct {
-	Kind           string         `json:"kind"` // "input" or "output"
-	MCPType        string         `json:"mcp_type"`
-	SDKType        string         `json:"sdk_type"`
+	Kind    string `json:"kind"` // "input" or "output"
+	MCPType string `json:"mcp_type"`
+	SDKType string `json:"sdk_type"`
+	// Via says how an input pair was found when it was not by the literal in
+	// the handler that takes the input: "caller" for a literal a helper builds
+	// out of the fields its caller hands it, "nested" for a struct an options
+	// struct reaches through a field, paired with the struct its values are
+	// read from. Empty for a handler's own literal and for every output.
+	Via            string         `json:"via,omitempty"`
 	MissingFields  []missingField `json:"missing_fields,omitempty"`
 	TypeMismatches []typeMismatch `json:"type_mismatches,omitempty"`
 	// ExtraFields lists MCP output json tags with no SDK counterpart — invented
@@ -1283,7 +1437,7 @@ func buildReport(root string, gapsOnly bool) (report, error) {
 	}
 	run := newDiffRun()
 	reports := make([]packageReport, 0, len(pkgs))
-	for _, pkg := range pkgs {
+	for _, pkg := range withSharedShapes(pkgs) {
 		pr, ok := run.analyzePackage(pkg)
 		if !ok {
 			continue
@@ -1309,6 +1463,36 @@ func buildReport(root string, gapsOnly bool) (report, error) {
 	}, nil
 }
 
+// sharedShapesPathSuffix is how the package the domain packages share response
+// shapes through ends its import path.
+const sharedShapesPathSuffix = "/internal/toolutil"
+
+// withSharedShapes returns the tool packages followed by the shared shapes
+// package they import, when the load carries it with its syntax, which
+// [shared.LoadToolPackages] does for a tree that has one.
+//
+// The field diff is the one rule that reads a converter, and the converters of
+// the shapes every domain nests live there: toolutil.NewPipelineOutput fills a
+// merge request's head_pipeline, NewBasicUserOutput every author. Read from
+// the domain packages alone, a shape no domain package declares a converter of
+// was paired with nothing, so a key client-go adds to gl.Pipeline reached no
+// finding anywhere, since the domain's converter calls the shared one rather
+// than reading the field itself. [CollectPairs] and [CollectOutputPairings]
+// are left as they are: the enum rule and the type grain of the paths scope
+// join on them, and what they would make of the shared pairs is a measurement
+// of its own.
+func withSharedShapes(pkgs []*packages.Package) []*packages.Package {
+	out := slices.Clone(pkgs)
+	for _, pkg := range pkgs {
+		for path, imported := range pkg.Imports {
+			if strings.HasSuffix(path, sharedShapesPathSuffix) && len(imported.Syntax) > 0 && imported.TypesInfo != nil {
+				return append(out, imported)
+			}
+		}
+	}
+	return out
+}
+
 // Pair is one (MCP struct, SDK struct) pairing the field diff runs over,
 // exported for the enum rule, which walks the same pairs and asks a different
 // question of their fields: not whether a field exists on both sides, but
@@ -1330,10 +1514,28 @@ type Pair struct {
 	// the last segment of its package path.
 	SDKName string
 	SDKType *types.Struct
+	// SDKNamed is the client-go named type behind SDKName, the identity a rule
+	// that meets the same struct as a method's parameter keys on.
+	SDKNamed *types.Named
 	// SDKURLTags is true for an Options struct, whose fields are named by
 	// their url tag first and json tag second.
 	SDKURLTags bool
+	// Via is how an input pair was found, as [gap] spells it: empty for the
+	// literal in the handler that takes the input, ViaCaller or ViaNested
+	// otherwise.
+	Via string
 }
+
+// The two ways an input pair is found besides the literal in the handler that
+// takes the input.
+const (
+	// ViaCaller is a literal a helper with no input of its own builds, paired
+	// with the input of a function that calls it with that input's fields.
+	ViaCaller = "caller"
+	// ViaNested is a literal of a struct an options struct reaches through a
+	// field, paired with the struct its values are read from.
+	ViaNested = "nested"
+)
 
 // CollectPairs returns every pairing analyzePackage diffs for one tool
 // package, phantom inputs already dropped, inputs before outputs and each in
@@ -1356,6 +1558,11 @@ func CollectPairs(pkg *packages.Package) []Pair {
 // discoverPairs walks every function declaration of pkg and records the
 // converter-derived output pairs and the handler-derived input pairs, the
 // generic converters pkg instantiates with a type of its own included.
+//
+// The input pairs come in three kinds, recorded in that order so a pair two of
+// them find keeps the more direct route: the literal in a handler, the
+// literal a helper builds out of the fields a handler hands it, and the
+// nested struct paired with the struct its values are read from.
 func discoverPairs(pkg *packages.Package) (inputPairs, outputPairs map[[2]string]structPair) {
 	inputPairs = map[[2]string]structPair{}
 	outputPairs = map[[2]string]structPair{}
@@ -1369,6 +1576,8 @@ func discoverPairs(pkg *packages.Package) (inputPairs, outputPairs map[[2]string
 			collectHandlerInputs(pkg, fn, inputPairs)
 		}
 	}
+	collectCallerInputs(pkg, inputPairs)
+	collectNestedInputs(pkg, inputPairs)
 	collectInstantiatedConverters(pkg, outputPairs)
 	return inputPairs, outputPairs
 }
@@ -1528,8 +1737,11 @@ type structPair struct {
 	mcpNamed *types.Named
 	sdkName  string
 	sdkType  *types.Struct
+	sdkNamed *types.Named
 	// tag preference for the SDK side: url first for Options, json for results.
 	sdkURLTags bool
+	// via is how an input pair was found; see [Pair.Via].
+	via string
 }
 
 // exported renders the pair in its exported form.
@@ -1537,9 +1749,30 @@ func (p structPair) exported(kind string) Pair {
 	return Pair{
 		Kind:    kind,
 		MCPName: p.mcpName, MCPType: p.mcpType, MCPNamed: p.mcpNamed,
-		SDKName: p.sdkName, SDKType: p.sdkType,
+		SDKName: p.sdkName, SDKType: p.sdkType, SDKNamed: p.sdkNamed,
 		SDKURLTags: p.sdkURLTags,
+		Via:        p.via,
 	}
+}
+
+// inputPair is the record of an input pair between the MCP struct mcpNamed
+// and the client-go struct sdkNamed, found by the route via.
+func inputPair(mcpNamed *types.Named, mcpStruct *types.Struct, sdkNamed *types.Named, sdkStruct *types.Struct, via string) structPair {
+	return structPair{
+		mcpName: mcpNamed.Obj().Name(), mcpType: mcpStruct, mcpNamed: mcpNamed,
+		sdkName: sdkTypeName(sdkNamed), sdkType: sdkStruct, sdkNamed: sdkNamed,
+		sdkURLTags: true, via: via,
+	}
+}
+
+// recordInputPair records pair unless a more direct route already recorded
+// the same two structs.
+func recordInputPair(out map[[2]string]structPair, pair structPair) {
+	key := [2]string{pair.mcpName, pair.sdkNamed.Obj().Name()}
+	if _, recorded := out[key]; recorded {
+		return
+	}
+	out[key] = pair
 }
 
 func sortedPairs(pairs map[[2]string]structPair) []structPair {
@@ -1643,12 +1876,15 @@ func recordConverter(mcpNamed *types.Named, mcpStruct *types.Struct, mcpName str
 	key := [2]string{mcpName, sdkNamed.Obj().Name()}
 	out[key] = structPair{
 		mcpName: mcpName, mcpType: mcpStruct, mcpNamed: mcpNamed,
-		sdkName: sdkTypeName(sdkNamed), sdkType: sdkStruct, sdkURLTags: false,
+		sdkName: sdkTypeName(sdkNamed), sdkType: sdkStruct, sdkNamed: sdkNamed, sdkURLTags: false,
 	}
 }
 
-// collectHandlerInputs attributes every &gl.XxxOptions{} literal inside fn to
-// fn's MCP input struct.
+// collectHandlerInputs attributes every request literal inside fn to fn's MCP
+// input struct: an &gl.XxxOptions{}, or a struct a client-go service method
+// receives under another name. A nested struct is left to
+// [collectNestedInputs], which pairs it with the struct its values are read
+// from rather than with the handler's input.
 func collectHandlerInputs(pkg *packages.Package, fn *ast.FuncDecl, out map[[2]string]structPair) {
 	if fn.Body == nil {
 		return
@@ -1662,14 +1898,9 @@ func collectHandlerInputs(pkg *packages.Package, fn *ast.FuncDecl, out map[[2]st
 		if !isLit {
 			return true
 		}
-		named, st, isSDK := clientGoNamedStruct(pkg.TypesInfo.TypeOf(lit))
-		if !isSDK || !strings.HasSuffix(named.Obj().Name(), optionsSuffix) {
-			return true
-		}
-		key := [2]string{mcpNamed.Obj().Name(), named.Obj().Name()}
-		out[key] = structPair{
-			mcpName: mcpNamed.Obj().Name(), mcpType: mcpStruct, mcpNamed: mcpNamed,
-			sdkName: sdkTypeName(named), sdkType: st, sdkURLTags: true,
+		for _, named := range builtRequests(pkg.TypesInfo.TypeOf(lit)) {
+			_, st, _ := derefNamedStruct(named)
+			recordInputPair(out, inputPair(mcpNamed, mcpStruct, named, st, ""))
 		}
 		return true
 	})
@@ -1678,16 +1909,28 @@ func collectHandlerInputs(pkg *packages.Package, fn *ast.FuncDecl, out map[[2]st
 // handlerInputStruct returns the first parameter whose type is a struct named
 // in the handler's own package (the typed MCP input).
 func handlerInputStruct(pkg *packages.Package, fn *ast.FuncDecl) (*types.Named, *types.Struct, bool) {
+	named, st, _, ok := handlerInputParam(pkg, fn)
+	return named, st, ok
+}
+
+// handlerInputParam is [handlerInputStruct] together with the variable the
+// input is bound to, nil when the parameter is unnamed.
+func handlerInputParam(pkg *packages.Package, fn *ast.FuncDecl) (*types.Named, *types.Struct, *types.Var, bool) {
 	if fn.Type.Params == nil {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	for _, field := range fn.Type.Params.List {
 		named, st, ok := localNamedStruct(pkg, pkg.TypesInfo.TypeOf(field.Type))
-		if ok {
-			return named, st, true
+		if !ok {
+			continue
 		}
+		var bound *types.Var
+		if len(field.Names) > 0 {
+			bound, _ = pkg.TypesInfo.Defs[field.Names[0]].(*types.Var)
+		}
+		return named, st, bound, true
 	}
-	return nil, nil, false
+	return nil, nil, nil, false
 }
 
 // diffPair diffs one input pair (the MCP handler input struct against the SDK
@@ -1703,7 +1946,7 @@ func (r *diffRun) diffPair(pkg, kind string, pair structPair) gap {
 	}
 	sdkFields := flattenFields(pair.sdkType, sdkTagKeys)
 
-	g := gap{Kind: kind, MCPType: pair.mcpName, SDKType: pair.sdkName}
+	g := gap{Kind: kind, MCPType: pair.mcpName, SDKType: pair.sdkName, Via: pair.via}
 	tags := make([]string, 0, len(sdkFields))
 	for tag := range sdkFields {
 		tags = append(tags, tag)
@@ -1797,8 +2040,14 @@ func inputPairsOverlap(pair structPair) bool {
 // When the disjoint pairing is the input struct's only pairing it is kept, since
 // a path-id-only input legitimately pairs against an options struct it does not
 // surface and that remains a candidate gap a human adjudicates.
+//
+// A nested pair is never a phantom: it is paired with the struct its values
+// are read from, not attributed to whatever input the function it sits in
+// takes, so a nested struct whose fields the input carries under other names
+// (an export's upload url offered as upload_url) is a rename to adjudicate
+// rather than a mis-attribution to drop.
 func disjointPhantomInput(pair structPair, all map[[2]string]structPair) bool {
-	if inputPairsOverlap(pair) {
+	if pair.via == ViaNested || inputPairsOverlap(pair) {
 		return false
 	}
 	for _, other := range all {

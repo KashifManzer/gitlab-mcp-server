@@ -107,6 +107,9 @@ for the fork, branch, fix, test and MR workflow.
   - [ListPipelineTriggerJobsOptions models no include_retried, which the trigger job routes read and do not declare](#listpipelinetriggerjobsoptions-models-no-include_retried-which-the-trigger-job-routes-read-and-do-not-declare)
   - [BranchAccessDescription and GroupBranchAccessDescription model no member_role_name](#branchaccessdescription-and-groupbranchaccessdescription-model-no-member_role_name)
   - [The protected environment approval rule options model an access_level_description no route declares](#the-protected-environment-approval-rule-options-model-an-access_level_description-no-route-declares)
+  - [Five response structs miss keys this server reads through a raw request instead](#five-response-structs-miss-keys-this-server-reads-through-a-raw-request-instead)
+  - [Routes this server or its e2e suite sends have no client-go method, or one that takes no options](#routes-this-server-or-its-e2e-suite-sends-have-no-client-go-method-or-one-that-takes-no-options)
+  - [`UploadRequest` writes only the first value of each field](#uploadrequest-writes-only-the-first-value-of-each-field)
 - [MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)](#mcp-go-sdk-githubcommodelcontextprotocolgo-sdk)
   - [No keep-alive interval for SSE streams on StreamableHTTPOptions](#no-keep-alive-interval-for-sse-streams-on-streamablehttpoptions)
   - [A malformed message ends the session instead of answering -32700](#a-malformed-message-ends-the-session-instead-of-answering--32700)
@@ -406,6 +409,9 @@ readable without opening the tracker:
 | 146 | client-go | [`Orbit.GetTools` sends a route GitLab.com removed](#orbitgettools-sends-get-orbittools-which-gitlabcom-removed) | No | No | No | No here; yes for the SDK's callers, answered 404 | Yes, `orbit.Tools` sends `tools/list` to the Orbit MCP endpoint |
 | 147 | client-go | [`Orbit.GetDsl` sends a route GitLab.com removed](#orbitgetdsl-sends-get-orbitschemadsl-which-gitlabcom-removed) | No | No | No | No here; yes for the SDK's callers, answered 404 | Yes, `orbit.DSL` sends `list_commands` to the Orbit MCP endpoint |
 | 148 | client-go | [`Orbit.GetGraphStatus` sends a route GitLab.com removed](#orbitgetgraphstatus-sends-get-orbitgraph_status-which-gitlabcom-removed) | No | No | No | No here; yes for the SDK's callers, answered 404 | Yes, `orbit.GraphStatus` reads GraphQL `Group.orbit` and `Project.orbit` |
+| 149 | client-go | [Five response structs miss keys this server reads through a raw request instead](#five-response-structs-miss-keys-this-server-reads-through-a-raw-request-instead) | No | No | No | No | Yes, the deployment, job, approval rule, commit signature and epic board reads decode into structs of their own |
+| 150 | client-go | [Routes this server or its e2e suite sends have no client-go method, or one that takes no options](#routes-this-server-or-its-e2e-suite-sends-have-no-client-go-method-or-one-that-takes-no-options) | No | No | No | No | Yes, the Orbit reads of the MCP endpoint, the e2e fixture and the model registry scenario send their own request, and eighteen paginated lists write their query through a request option |
+| 151 | client-go | [`UploadRequest` writes only the first value of each field](#uploadrequest-writes-only-the-first-value-of-each-field) | No | No | No | No | Yes, the project and group creates send a list beside an avatar as one comma-separated value, and the group create refuses its alert list beside one; a unit test pins the behaviour |
 
 States verified against the upstream trackers on 2026-09-12, and rows 8 to 23
 again on 2026-09-13 when the go-sdk batch was filed. Rows 39 to 44 were added
@@ -3738,7 +3744,8 @@ at about 15:05 UTC it is otherwise as it was on 2026-10-16.
   `environment_scope`, `description`) wait on `respond_to?`, which neither
   model does, so `raw` is the only one the struct is short of on these
   routes. `pipeline.variables` and the schedule variable create and edit read
-  it off the captured answer.
+  it off the captured answer, and the schedule read decodes the variables
+  itself (`pipelineschedules.rawGetSchedule`).
 - `ImportStatus`, what `ImportFromFile` and `ImportStatus` return, tags its
   timestamp `create_at` where `lib/api/entities/project_identity.rb` sends
   `created_at`, so the field never decodes, and has no `failed_relations`
@@ -7868,8 +7875,11 @@ client-go option struct:
   `lock_require_sha_for_merge`, `duo_code_review_decisions_enabled` and
   `duo_auto_mode_availability` (`PUT /groups/:id`), and `CreateGroupOptions`
   the last (`POST /groups`).
-- `CreateProjectOptions`, `CreateProjectForUserOptions`, `EditProjectOptions`
-  and the import overrides lack `duo_code_review_decisions_enabled`.
+- `CreateProjectOptions`, `CreateProjectForUserOptions` and
+  `EditProjectOptions` lack `duo_code_review_decisions_enabled`. An import
+  declares it under `override_params` as well and would not apply it even once
+  client-go models it, since the import's tree restorer keeps only the project
+  attributes `import_export.yml` permits and this is not one of them.
 - `CreateServiceAccountUserOptions` and `UpdateServiceAccountOptions` lack
   `external` (`POST /service_accounts`, `PATCH /service_accounts/:user_id`).
 - `SearchOptions` lacks the merge request filters the group and project search
@@ -8282,6 +8292,173 @@ offered a property no route declares.
 **Effort**: small: the field removed from the four option structs, a
 breaking change of the module's API, or marked `Deprecated:` with the reason
 until the next major.
+
+### Five response structs miss keys this server reads through a raw request instead
+
+- **Reported**: no.
+- **In review**: no.
+- **Merged**: no. None of the keys below is modeled at v3.30.0, the version
+  `go.mod` pins, or at v3.38.0.
+- **Blocking**: no.
+- **Workaround**: yes. Each read below sends its own request through
+  client-go's `NewRequest` and decodes the answer into a struct of the
+  handler's own, the client-go struct embedded or copied, so the request
+  keeps client-go's base URL, retries and context. Each is an entry of the
+  upstream wait table (`cmd/audit_1to1/internal/waits`), with a `LacksKey`
+  predicate per key, so the `sdk` scope of `cmd/audit_1to1` says which read
+  can go back to its client-go method the day a pin models the keys.
+
+**Where** and **What**:
+
+- `Deployment` (`deployments.go`) models none of `approvals`,
+  `approval_summary` and `pending_approval_count`, and its
+  `DeploymentDeployable` has no `project`. `environment.deployment_get` and
+  `environment.deployment_list` decode into `deploymentAPI`
+  (`internal/tools/deployments`, `rawGetDeployment` and
+  `rawListDeployments`), in place of `GetProjectDeployment` and
+  `ListProjectDeployments`.
+- `Job` (`jobs.go`) models neither `archived` nor `runner_manager`, its
+  `JobRunner` none of `ip_address`, `paused`, `runner_type`, `online` and
+  `status`, and it types `duration`, `queued_duration` and `coverage`
+  `float64`, which reads a null as 0 (row 116). The job lists and reads
+  decode into `jobAPI` (`internal/tools/jobs`, `rawListJobs` and
+  `rawGetJob`), with the runner as a struct of its own and the three
+  measures as pointers, in place of `ListProjectJobs`.
+- `MergeRequestApprovalRule` (`merge_request_approvals.go`) has no
+  `overridden`, which each rule of the list, the create, the update and the
+  approval state carries. `internal/tools/mrapprovals` decodes all four into
+  a rule of its own, in place of `GetApprovalRules`, `CreateApprovalRule`,
+  `UpdateApprovalRule` and `GetApprovalState`.
+- `GPGSignature` (`commits.go`) models the PGP signature alone: no
+  `signature_type`, no `commit_source`, no `key` for an SSH signature and no
+  `x509_certificate`. The commit signature read decodes into
+  `gpgSignatureAPI` (`internal/tools/commits`, `rawGetGPGSignature`), in
+  place of `GetGPGSignature`.
+- `GroupEpicBoard` (`group_epic_boards.go`) models neither
+  `hide_backlog_list` nor `hide_closed_list`, and the elements of its two
+  lists fall short too: its `labels` are `LabelDetails` (`issues.go`), with
+  none of `title`, `group_id`, `project_id`, `template`, `created_at` and
+  `updated_at`, and its `lists` are `BoardList` (`boards.go`), with neither
+  `list_type` nor `collapsed`. `internal/tools/groupepicboards` reads both
+  epic board routes through `rawListBoards` and `rawGetBoard`, so no handler
+  calls `GroupEpicBoards`.
+
+**How we found it**: the upstream wait table. Every raw request of the tool
+packages has to name the register row it waits on, and these five had none:
+they were written before the register asked a workaround for its row. Each
+key above is one the struct a read decodes into carries beside client-go's,
+which the table's `sdk` scope holds to a predicate one by one.
+
+**Effort**: small: the keys added to the five structs and to the
+`JobRunner`, `LabelDetails` and `BoardList` they hold, and the three
+measures made pointers, each with its response test.
+
+### Routes this server or its e2e suite sends have no client-go method, or one that takes no options
+
+- **Reported**: no.
+- **In review**: no.
+- **Merged**: no, at v3.30.0, the version `go.mod` pins, or at v3.38.0.
+- **Blocking**: no.
+- **Workaround**: yes, a request of our own or a request option for each,
+  each an entry of the upstream wait table (`cmd/audit_1to1/internal/waits`)
+  with a `NoMethodFor` or `TakesNoOptions` predicate.
+
+**Where** and **What**:
+
+- `POST /orbit/mcp`, GitLab's Orbit MCP endpoint, which `orbit.tools`,
+  `orbit.dsl` and the llm text of `orbit.schema` read since GitLab.com
+  removed `GET /orbit/tools`, `GET /orbit/schema/dsl` and `GET /orbit/schema`,
+  the routes `Orbit.GetTools`, `Orbit.GetDsl` and `Orbit.GetSchema` send
+  (rows 145 to 147). No method sends it, so `orbit.callMCP` builds the POST
+  through `NewRequest`.
+- `GET /groups/:id/hooks/:hook_id/events`, the deliveries of a group hook.
+  client-go has `ResendGroupHookEvent` for one delivery and nothing that
+  lists them, so the e2e fixture reads them through `NewRequest`
+  (`test/e2e/internal/fixture`, `listGroupHookEvents`).
+- `PUT /projects/:id/packages/ml_models/:model_version_id/files/(*path/):file_name`,
+  the upload of a file into a model version's package. `ModelRegistry` has
+  the download and nothing that uploads, so the model registry scenario puts
+  the file through `NewRequest` (`test/e2e/gitlab/common`, `uploadModelFile`).
+- `ListProjectMarkdownUploads` takes no options struct, so the upload list
+  writes its paging and ordering into the query through a request option
+  (`internal/tools/uploads`, `listQueryParameters`).
+- `ListGroupSSHCertificates` takes no options struct, so the certificate list
+  writes its paging into the query the same way
+  (`internal/tools/groupsshcerts`, `listQueryParameters`).
+- Sixteen more methods of a paginated list take no options struct either:
+  `Attestations.ListAttestations`, `Commits.ListMergeRequestsByCommit`,
+  `Issues.GetParticipants`,
+  `MergeRequestContextCommits.ListMergeRequestContextCommits`, the four
+  `MergeRequests` lists `GetMergeRequestDependencies`,
+  `GetMergeRequestParticipants`, `GetMergeRequestReviewers` and
+  `ListMergeRequestPipelines`, `PagesDomains.ListAllPagesDomains`,
+  `ProjectAliases.ListProjectAliases`, the two `ResourceGroup` lists
+  `GetAllResourceGroupsForAProject` and
+  `ListUpcomingJobsForASpecificResourceGroup`, `SystemHooks.ListHooks`, and
+  `Users.ListEmails`, `Users.ListGPGKeys` and `Users.ListGPGKeysForUser`.
+  Without options a method can only ever ask for GitLab's first page, so
+  every action that lists through one writes `page` and `per_page` into the
+  query through `toolutil.PaginationRequestOption`.
+
+**How we found it**: the upstream wait table, for the reason the previous
+entry gives. The sixteen were declared a raw reason of their own until a
+review of the table asked why a method that takes no options waits on
+nothing upstream, when the upload and certificate lists, the same gap, did.
+
+**Effort**: small to medium: two methods, and an options struct, or a
+`ListOptions` parameter, for each of the eighteen lists.
+
+### `UploadRequest` writes only the first value of each field
+
+- **Reported**: no.
+- **In review**: no.
+- **Merged**: no, at v3.30.0, the version `go.mod` pins, or at v3.38.0.
+- **Blocking**: no.
+- **Workaround**: yes, in the two creates that send a list beside an
+  avatar. The upstream wait table cannot hold it, since its predicates read
+  types and routes and this is the body of a function, so
+  `TestSDK_CreateProjectWithAvatar_WritesTheFirstTopicAlone`
+  (`internal/tools/projects`) pins what client-go sends instead and fails
+  the day it sends more.
+
+**Where**: `gitlab.go`, `(*Client).UploadRequest` (line 1106 at v3.30.0,
+1108 at v3.38.0). It writes the options of an upload as multipart fields
+from go-querystring's `query.Values`, one `w.WriteField(name,
+fields.Get(name))` per name, and `url.Values.Get` is the first value. A
+list option therefore reaches GitLab as its first element alone, and only
+on the request that carries a file: the same options in a JSON body go out
+whole. Every method that switches to an upload when its options carry an
+avatar does it (`CreateProject`, `CreateProjectForUser`, `EditProject`,
+`CreateGroup`, `UpdateGroup`, `CreateTopic`, `UpdateTopic`, `CreateUser`
+and `ModifyUser`), and so does the project import. client-go knows the
+shape of it in one place: `CreateGroup` refuses an avatar beside more than
+one access level of the default branch protection, "as it will result in
+unexpected behavior".
+
+**What** this server does about it, in the handlers that send a list
+beside an avatar:
+
+- `projects.attachAvatar` sends the topics and the tags as one
+  comma-separated value (`commaJoined`), which GitLab splits back
+  (`API::Validations::Types::CommaSeparatedToArray`).
+- `groups.attachAvatar` sends `unique_project_download_limit_allowlist`
+  the same way, which `ee/lib/ee/api/helpers/groups_helpers.rb` splits
+  back.
+- `groups.Create` refuses `unique_project_download_limit_alertlist` beside
+  an avatar before any request, since it is an `Array[Integer]` GitLab does
+  not split, and points at `group.update`.
+
+Writing every value would not be the whole fix: Rack keeps the last value
+of a field sent twice under one name, and builds a list only from a name
+that ends in `[]`. So when the pin fails, each of the three sites is looked
+at again rather than removed.
+
+**How we found it**: offering the avatar R-PARAM listed as not offered on
+the project and group creates. The group create's test sent two usernames
+in the allowlist beside an avatar, and the mock read one.
+
+**Effort**: small: one part per value in `UploadRequest`, under a name a
+list can be read back from, and a test.
 
 ## MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`)
 
@@ -11414,7 +11591,8 @@ against the styleguide's `code:` is the prevailing idiom rather than a defect.
   `internal/gitlab/client.go`, which reads the version the client holds and
   reads `/api/v4/version` once when no read has answered yet. On 19.5 or
   later it posts to `cancel_auto_merge` with a request of its own
-  (`cancelAutoMergeRoute`, the `invites.postInvitation` pattern) and returns
+  (`cancelAutoMergeRoute`, which sends it through `postCancelAutoMerge`, the
+  `invites.postInvitation` pattern) and returns
   the merge request GitLab answers with, with no read-back, hinting a `409`
   as a merge request with nothing to cancel and a `403` as the role the
   cancel needs. Only a `404` from the new route falls back to the deprecated

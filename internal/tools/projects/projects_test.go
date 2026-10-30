@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -68,6 +69,26 @@ func TestUpdate_EmptyValues_ReachTheBody(t *testing.T) {
 		t.Fatalf("Update() error: %v", err)
 	}
 	recorder.AssertMembers(t, want)
+}
+
+// TestUpdate_RemoveAvatar_SendsTheBlankAvatarGitLabRemovesItFor verifies
+// that remove_avatar sends avatar as an empty value in the JSON body, which
+// PUT /projects/:id maps to CarrierWave's remove_avatar (lib/api/projects.rb),
+// and that an update without it sends no avatar at all.
+func TestUpdate_RemoveAvatar_SendsTheBlankAvatarGitLabRemovesItFor(t *testing.T) {
+	client, recorder := testutil.RecordWrites(t, `{}`, projectJSON)
+	if _, err := Update(t.Context(), client, UpdateInput{ProjectID: "42", RemoveAvatar: true}); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	recorder.AssertMembers(t, map[string]string{"avatar": `""`})
+
+	client, recorder = testutil.RecordWrites(t, `{}`, projectJSON)
+	if _, err := Update(t.Context(), client, UpdateInput{ProjectID: "42", Name: "renamed"}); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	if got, ok := recorder.Member("avatar"); ok {
+		t.Errorf("an update without remove_avatar sent avatar = %s", got)
+	}
 }
 
 // TestUpdate_NameRegexDelete_StillSetsTheDeletionRegex verifies that a
@@ -10463,4 +10484,190 @@ func TestListUserContributedProjects_Keyset_IsRefusedBeforeGitLab(t *testing.T) 
 			t.Errorf("pagination = %+v with %d projects, want next_page 2 and no token", out.Pagination, len(out.Projects))
 		}
 	})
+}
+
+// avatarForm is what a mock reads off a create sent with an avatar: the
+// file part's name and bytes, and every value field.
+type avatarForm struct {
+	filename, content string
+	values            map[string][]string
+}
+
+// avatarFormHandler answers a create at path with the project, handing the
+// multipart form it was sent to the test goroutine.
+func avatarFormHandler(t *testing.T, path string, forms chan<- avatarForm) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != path {
+			http.NotFound(w, r)
+			return
+		}
+		form, err := testutil.ReadMultipartForm(r, 1<<20)
+		if err != nil {
+			t.Errorf("the create was not a multipart form: %v", err)
+			http.Error(w, "not multipart", http.StatusBadRequest)
+			return
+		}
+		file, header, err := testutil.FormFile(form, "avatar")
+		if err != nil {
+			t.Errorf("the create carried no avatar part: %v", err)
+			http.Error(w, "no avatar", http.StatusBadRequest)
+			return
+		}
+		content, _ := io.ReadAll(file)
+		_ = file.Close()
+		forms <- avatarForm{filename: header.Filename, content: string(content), values: form.Value}
+		testutil.RespondJSON(w, http.StatusCreated, extProjectJSON)
+	})
+}
+
+// TestCreate_WithAvatar_UploadsItBesideTheOptions verifies that a create
+// given an avatar sends the image under avatar with its file name, from
+// base64 content and from a local file, and the options as the form's
+// fields. The topics and the tags arrive as one comma-separated value each,
+// because client-go's upload writes only the first value of a field, so the
+// list sent element by element reached GitLab as its first element.
+func TestCreate_WithAvatar_UploadsItBesideTheOptions(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "logo.png")
+	if err := os.WriteFile(file, []byte("file-image"), 0o600); err != nil {
+		t.Fatalf("write the avatar file: %v", err)
+	}
+	cases := []struct {
+		name        string
+		avatar      AvatarInput
+		wantContent string
+	}{
+		{name: "from base64", avatar: AvatarInput{Filename: "logo.png", ContentBase64: base64.StdEncoding.EncodeToString([]byte("b64-image"))}, wantContent: "b64-image"},
+		{name: "from a local file", avatar: AvatarInput{Filename: "logo.png", FilePath: file}, wantContent: "file-image"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			forms := make(chan avatarForm, 1)
+			client := testutil.NewTestClient(t, avatarFormHandler(t, "/api/v4/projects", forms))
+			out, err := Create(t.Context(), client, CreateInput{
+				Name: testRepoName, Topics: []string{"go", "mcp"}, TagList: []string{"a", "b"}, Avatar: &tc.avatar,
+			})
+			if err != nil {
+				t.Fatalf(fmtUnexpErr, err)
+			}
+			if out.ID != 42 {
+				t.Errorf("ID = %d, want 42", out.ID)
+			}
+			form := <-forms
+			if form.filename != "logo.png" || form.content != tc.wantContent {
+				t.Errorf("avatar part = %q holding %q, want logo.png holding %q", form.filename, form.content, tc.wantContent)
+			}
+			for field, want := range map[string][]string{"name": {testRepoName}, "topics": {"go,mcp"}, "tag_list": {"a,b"}} {
+				t.Run(field, func(t *testing.T) {
+					if got := form.values[field]; !slices.Equal(got, want) {
+						t.Errorf("%s = %q, want %q", field, got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestSDK_CreateProjectWithAvatar_WritesTheFirstTopicAlone pins what
+// client-go does with a list beside an avatar, which commaJoined,
+// groups.attachAvatar and the alert list refusal of groups.Create work
+// around: UploadRequest writes each multipart field with fields.Get, the
+// first of its values, so the second topic never leaves the process. A
+// client-go that writes more fails it, and that is when each of those sites
+// is looked at again (row 151 of docs/development/upstream-bugs.md): Rack
+// keeps the last value of a field sent twice under one name, so a join may
+// still be what GitLab needs.
+func TestSDK_CreateProjectWithAvatar_WritesTheFirstTopicAlone(t *testing.T) {
+	forms := make(chan avatarForm, 1)
+	client := testutil.NewTestClient(t, avatarFormHandler(t, "/api/v4/projects", forms))
+	_, _, err := client.GL().Projects.CreateProject(&gl.CreateProjectOptions{
+		Name:   new(testRepoName),
+		Topics: &[]string{"go", "mcp"},
+		Avatar: &gl.ProjectAvatar{Filename: "logo.png", Image: strings.NewReader("image")},
+	}, gl.WithContext(t.Context()))
+	if err != nil {
+		t.Fatalf("CreateProject() error: %v", err)
+	}
+	if got := (<-forms).values["topics"]; !slices.Equal(got, []string{"go"}) {
+		t.Errorf("topics = %q, want only the first, go: client-go's upload now writes more than the first value of a field "+
+			"(row 151 of docs/development/upstream-bugs.md), so look again at commaJoined, groups.attachAvatar and the alert "+
+			"list refusal of groups.Create", got)
+	}
+}
+
+// TestCreate_WithoutAvatar_SendsJSONWithTheListsWhole verifies that a create
+// without an avatar is left as it was: a JSON body, the lists sent whole.
+func TestCreate_WithoutAvatar_SendsJSONWithTheListsWhole(t *testing.T) {
+	bodies := make(chan map[string]any, 1)
+	client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("the create was not a JSON body: %v", err)
+		}
+		bodies <- body
+		testutil.RespondJSON(w, http.StatusCreated, extProjectJSON)
+	}))
+	if _, err := Create(t.Context(), client, CreateInput{Name: testRepoName, Topics: []string{"go", "mcp"}}); err != nil {
+		t.Fatalf(fmtUnexpErr, err)
+	}
+	body := <-bodies
+	if topics, _ := body["topics"].([]any); len(topics) != 2 {
+		t.Errorf("topics = %v, want the two topics as a list", body["topics"])
+	}
+}
+
+// TestCreateForUser_WithAvatar_UploadsIt verifies that a create for another
+// user uploads its avatar the same way, to that user's route.
+func TestCreateForUser_WithAvatar_UploadsIt(t *testing.T) {
+	forms := make(chan avatarForm, 1)
+	client := testutil.NewTestClient(t, avatarFormHandler(t, pathProjectForUser5, forms))
+	_, err := CreateForUser(t.Context(), client, CreateForUserInput{
+		UserID: 5, Name: testRepoName, Topics: []string{"one", "two"}, Avatar: &AvatarInput{
+			Filename: "u.png", ContentBase64: base64.StdEncoding.EncodeToString([]byte("user-image")),
+		},
+	})
+	if err != nil {
+		t.Fatalf(fmtUnexpErr, err)
+	}
+	form := <-forms
+	if form.filename != "u.png" || form.content != "user-image" || !slices.Equal(form.values["topics"], []string{"one,two"}) || !slices.Equal(form.values["name"], []string{testRepoName}) {
+		t.Errorf("form = %+v, want u.png holding user-image beside the name and the joined topics", form)
+	}
+}
+
+// TestCreate_AvatarItCannotRead_IsRefusedBeforeAnyRequest verifies that an
+// avatar with no file name, or whose content cannot be read, is refused
+// with the action and the field named, and that neither create reaches
+// GitLab.
+func TestCreate_AvatarItCannotRead_IsRefusedBeforeAnyRequest(t *testing.T) {
+	cases := []struct {
+		name   string
+		avatar AvatarInput
+		want   string
+	}{
+		{name: "no file name", avatar: AvatarInput{ContentBase64: "aW1n"}, want: ": avatar.filename is required"},
+		{name: "both sources", avatar: AvatarInput{Filename: "a.png", FilePath: "/tmp/a.png", ContentBase64: "aW1n"}, want: " avatar: provide either file_path or content_base64"},
+		{name: "no source", avatar: AvatarInput{Filename: "a.png"}, want: " avatar: either file_path or content_base64 is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var reached atomic.Bool
+			client := testutil.NewTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reached.Store(true)
+				http.NotFound(w, r)
+			}))
+			_, createErr := Create(t.Context(), client, CreateInput{Name: testRepoName, Avatar: &tc.avatar})
+			if createErr == nil || !strings.Contains(createErr.Error(), "projectCreate"+tc.want) {
+				t.Errorf("Create error = %v, want one reading projectCreate%s", createErr, tc.want)
+			}
+			_, forUserErr := CreateForUser(t.Context(), client, CreateForUserInput{UserID: 5, Name: testRepoName, Avatar: &tc.avatar})
+			if forUserErr == nil || !strings.Contains(forUserErr.Error(), "projectCreateForUser"+tc.want) {
+				t.Errorf("CreateForUser error = %v, want one reading projectCreateForUser%s", forUserErr, tc.want)
+			}
+			if reached.Load() {
+				t.Error("a create with an avatar it could not read reached GitLab")
+			}
+		})
+	}
 }

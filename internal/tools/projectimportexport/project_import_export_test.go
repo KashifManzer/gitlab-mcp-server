@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1164,71 +1166,178 @@ func TestScheduleExport_NestedUploadOverridesFlatFields(t *testing.T) {
 	}
 }
 
-// TestImportFromFile_OverrideParams verifies that override_params are mapped
-// onto the SDK ImportFileOptions and forwarded in the multipart request body.
-func TestImportFromFile_OverrideParams(t *testing.T) {
-	wantParams := map[string]string{
-		"override_params[visibility]":                      "private",
-		"override_params[description]":                     "overridden",
-		"override_params[name]":                            "renamed",
-		"override_params[path]":                            "renamed-path",
-		"override_params[namespace_id]":                    "42",
-		"override_params[shared_runners_enabled]":          "true",
-		"override_params[container_registry_access_level]": "private",
+// everyOverride sets every field of the override, each to a value its key
+// is checked for: a false among the booleans, since overriding a setting the
+// export carries as true is what a pointer is for.
+func everyOverride() *ImportOverrideParamsInput {
+	yes, no := true, false
+	return &ImportOverrideParamsInput{
+		Description: "overridden", Visibility: "private", MergeMethod: "ff",
+		RequestAccessEnabled: &yes, SharedRunnersEnabled: &no,
+		IssuesAccessLevel: "enabled", MergeRequestsAccessLevel: "private", WikiAccessLevel: "disabled",
+		BuildsAccessLevel: "enabled", SnippetsAccessLevel: "private", ContainerRegistryAccessLevel: "disabled",
+		RepositoryAccessLevel: "enabled", ForkingAccessLevel: "private", AnalyticsAccessLevel: "disabled",
+		PagesAccessLevel: "public", PackageRegistryAccessLevel: "private", ReleasesAccessLevel: "enabled",
+		EnvironmentsAccessLevel: "private", FeatureFlagsAccessLevel: "disabled", InfrastructureAccessLevel: "enabled",
+		MonitorAccessLevel: "private", RequirementsAccessLevel: "disabled", SecurityAndComplianceAccessLevel: "enabled",
+		ModelExperimentsAccessLevel: "private", ModelRegistryAccessLevel: "disabled",
+		SquashOption: "default_on", OnlyAllowMergeIfPipelineSucceeds: &yes, OnlyAllowMergeIfAllDiscussionsAreResolved: &no,
+		AllowMergeOnSkippedPipeline: &no, RemoveSourceBranchAfterMerge: &yes,
+		AutocloseReferencedIssues: &no, ResolveOutdatedDiffDiscussions: &yes, PrintingMergeRequestLinkEnabled: &no,
+		MergeCommitTemplate: "merge %{title}", SquashCommitTemplate: "squash %{title}",
+		SuggestionCommitMessage: "apply %{file_path}", ApprovalsBeforeMerge: new(int64(2)),
+		ServiceDeskEnabled: &yes, AutoDevopsEnabled: &no,
+		AutoDevopsDeployStrategy: "manual", AutoCancelPendingPipelines: "disabled", BuildGitStrategy: "clone",
+		BuildTimeout: new(int64(3600)), ExternalAuthorizationClassificationLabel: "secret",
+		IssuesEnabled: &yes, MergeRequestsEnabled: &no, WikiEnabled: &yes, SnippetsEnabled: &yes,
+		ContainerRegistryEnabled: &no, PublicBuilds: &yes,
 	}
+}
+
+// everyOverrideKey is the form field each override of everyOverride is sent
+// under, with its value.
+var everyOverrideKey = map[string]string{
+	"override_params[description]": "overridden", "override_params[visibility]": "private",
+	"override_params[merge_method]":           "ff",
+	"override_params[request_access_enabled]": "true", "override_params[shared_runners_enabled]": "false",
+	"override_params[issues_access_level]": "enabled", "override_params[merge_requests_access_level]": "private",
+	"override_params[wiki_access_level]": "disabled", "override_params[builds_access_level]": "enabled",
+	"override_params[snippets_access_level]": "private", "override_params[container_registry_access_level]": "disabled",
+	"override_params[repository_access_level]": "enabled", "override_params[forking_access_level]": "private",
+	"override_params[analytics_access_level]": "disabled", "override_params[pages_access_level]": "public",
+	"override_params[package_registry_access_level]": "private", "override_params[releases_access_level]": "enabled",
+	"override_params[environments_access_level]": "private", "override_params[feature_flags_access_level]": "disabled",
+	"override_params[infrastructure_access_level]": "enabled", "override_params[monitor_access_level]": "private",
+	"override_params[requirements_access_level]": "disabled", "override_params[security_and_compliance_access_level]": "enabled",
+	"override_params[model_experiments_access_level]": "private", "override_params[model_registry_access_level]": "disabled",
+	"override_params[squash_option]":                         "default_on",
+	"override_params[only_allow_merge_if_pipeline_succeeds]": "true", "override_params[only_allow_merge_if_all_discussions_are_resolved]": "false",
+	"override_params[allow_merge_on_skipped_pipeline]":  "false",
+	"override_params[remove_source_branch_after_merge]": "true", "override_params[autoclose_referenced_issues]": "false",
+	"override_params[resolve_outdated_diff_discussions]": "true", "override_params[printing_merge_request_link_enabled]": "false",
+	"override_params[merge_commit_template]": "merge %{title}", "override_params[squash_commit_template]": "squash %{title}",
+	"override_params[suggestion_commit_message]": "apply %{file_path}", "override_params[approvals_before_merge]": "2",
+	"override_params[service_desk_enabled]": "true", "override_params[auto_devops_enabled]": "false",
+	"override_params[auto_devops_deploy_strategy]": "manual", "override_params[auto_cancel_pending_pipelines]": "disabled",
+	"override_params[build_git_strategy]": "clone", "override_params[build_timeout]": "3600",
+	"override_params[external_authorization_classification_label]": "secret",
+	"override_params[issues_enabled]":                              "true",
+	"override_params[merge_requests_enabled]":                      "false", "override_params[wiki_enabled]": "true",
+	"override_params[snippets_enabled]":           "true",
+	"override_params[container_registry_enabled]": "false", "override_params[public_builds]": "true",
+}
+
+// TestImportFromFile_OverrideParams_SendsEveryKeyItModels verifies that
+// every override reaches GitLab in the multipart body under the key GitLab
+// declares, with the value given, and nothing else under override_params.
+func TestImportFromFile_OverrideParams_SendsEveryKeyItModels(t *testing.T) {
+	received := make(chan map[string][]string, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v4/projects/import" && r.Method == http.MethodPost {
-			form, err := testutil.ReadMultipartForm(r, 1<<20)
-			if err != nil {
-				t.Errorf("parse multipart: %v", err)
-				http.Error(w, "parse multipart", http.StatusInternalServerError)
-				return
-			}
-			for key, want := range wantParams {
-				t.Run(key, func(t *testing.T) {
-					if got := testutil.FormValue(form, key); got != want {
-						t.Errorf("%s = %q, want %q", key, got, want)
-					}
-				})
-			}
-			testutil.RespondJSON(w, http.StatusCreated,
-				`{"id":99,"name":"p","path":"p","path_with_namespace":"g/p","import_status":"scheduled"}`)
+		if r.URL.Path != "/api/v4/projects/import" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
 			return
 		}
-		http.NotFound(w, r)
+		form, err := testutil.ReadMultipartForm(r, 1<<20)
+		if err != nil {
+			t.Errorf("parse multipart: %v", err)
+			http.Error(w, "parse multipart", http.StatusInternalServerError)
+			return
+		}
+		received <- form.Value
+		testutil.RespondJSON(w, http.StatusCreated,
+			`{"id":99,"name":"p","path":"p","path_with_namespace":"g/p","import_status":"scheduled"}`)
 	})
 	client := testutil.NewTestClient(t, handler)
 
-	lfs := true
-	nsID := int64(42)
 	out, err := ImportFromFile(t.Context(), client, ImportFromFileInput{
-		ContentBase64: base64.StdEncoding.EncodeToString([]byte("archive")),
-		Name:          "p",
-		Path:          "p",
-		OverrideParams: &ImportOverrideParamsInput{
-			Name:                         "renamed",
-			Path:                         "renamed-path",
-			NamespaceID:                  &nsID,
-			Description:                  "overridden",
-			Visibility:                   "private",
-			DefaultBranch:                "main",
-			MergeMethod:                  "ff",
-			RequestAccessEnabled:         &lfs,
-			LFSEnabled:                   &lfs,
-			SharedRunnersEnabled:         &lfs,
-			IssuesAccessLevel:            "enabled",
-			MergeRequestsAccessLevel:     "private",
-			WikiAccessLevel:              "disabled",
-			BuildsAccessLevel:            "enabled",
-			SnippetsAccessLevel:          "private",
-			ContainerRegistryAccessLevel: "private",
-		},
+		ContentBase64:  base64.StdEncoding.EncodeToString([]byte("archive")),
+		Name:           "p",
+		Path:           "p",
+		OverrideParams: everyOverride(),
 	})
 	if err != nil {
 		t.Fatalf("ImportFromFile() error: %v", err)
 	}
 	if out.ID != 99 {
 		t.Errorf("ID = %d, want 99", out.ID)
+	}
+	form := <-received
+	sent := map[string]string{}
+	for key, values := range form {
+		if strings.HasPrefix(key, "override_params") {
+			sent[key] = strings.Join(values, " | ")
+		}
+	}
+	keys := slices.Sorted(maps.Keys(everyOverrideKey))
+	for _, key := range slices.Sorted(maps.Keys(sent)) {
+		if !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			if got, want := sent[key], everyOverrideKey[key]; got != want {
+				t.Errorf("%s = %q, want %q", key, got, want)
+			}
+		})
+	}
+}
+
+// TestImportOverrideParamsInput_OffersNoKeyGitLabDrops verifies that the
+// override offers no key GitLab drops before it reaches the project, nor one
+// the import cannot apply.
+//
+// Four POST /projects/import does not declare under override_params: Grape
+// keeps the declared params alone, so an override_params name, path,
+// namespace_id or default_branch changed nothing, while the import's own
+// name, path and namespace place the project. The rest it declares and the
+// import never applies: the tree restorer merges the overrides into the
+// archive's project attributes and keeps only those import_export.yml
+// permits for a project (Gitlab::ImportExport::AttributesPermitter, through
+// Group::RelationTreeRestorer#filter_attributes), and lfs_enabled, mirror,
+// repository_storage and tag_list it excludes by name. Two it permits and
+// cannot assign: topics is the project's association with Projects::Topic,
+// which a list of names does not fill, and the project has no jobs_enabled
+// at all (only lib/api/projects.rb renames it to builds_enabled, on the create
+// and the edit), so either one fails the restore, and the import with it.
+func TestImportOverrideParamsInput_OffersNoKeyGitLabDrops(t *testing.T) {
+	offered := map[string]bool{}
+	for field := range reflect.TypeFor[ImportOverrideParamsInput]().Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		offered[name] = true
+	}
+	for _, dropped := range []string{
+		"name", "path", "namespace_id", "default_branch",
+		"cicd_catalog_enabled", "ci_config_path", "container_expiration_policy_attributes", "emails_disabled",
+		"emails_enabled", "enforce_auth_checks_on_uploads", "group_runners_enabled", "issue_branch_template",
+		"lfs_enabled", "merge_request_title_regex", "merge_request_title_regex_description", "mirror",
+		"mirror_trigger_builds", "mr_default_title_template", "only_allow_merge_if_all_status_checks_passed",
+		"packages_enabled", "public_jobs", "repository_storage", "resource_group_default_process_mode",
+		"show_default_award_emojis", "tag_list", "topics", "jobs_enabled",
+	} {
+		t.Run(dropped, func(t *testing.T) {
+			if offered[dropped] {
+				t.Errorf("override_params offers %s, which the import never applies", dropped)
+			}
+		})
+	}
+}
+
+// TestBuildOverrideParams_OneFieldAlone_IsAnOverride verifies that each
+// override is enough on its own to send override_params, one of each kind of
+// field: a value the builder converts and a pointer it passes through.
+func TestBuildOverrideParams_OneFieldAlone_IsAnOverride(t *testing.T) {
+	cases := map[string]*ImportOverrideParamsInput{
+		"visibility":         {Visibility: "public"},
+		"squash option":      {SquashOption: "never"},
+		"a deprecated value": {PublicBuilds: new(false)},
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := buildOverrideParams(in); got == nil {
+				t.Errorf("buildOverrideParams(%+v) = nil, want the override sent", in)
+			}
+		})
 	}
 }
 

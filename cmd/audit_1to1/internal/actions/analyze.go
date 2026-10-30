@@ -6,18 +6,18 @@ package actions
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/shared"
+	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/waits"
 )
 
 const (
-	coveredRawGeneric     = "COVERED_RAW. Generic slug-dispatched integration action (gitlab_set_integration / gitlab_*_group_integration)"
 	coveredGraphQLEpicDsc = "COVERED_GRAPHQL. Epicdiscussions pkg"
 	coveredGraphQLEpicNts = "COVERED_GRAPHQL. Epicnotes pkg"
-	skipBinaryBytes       = "INTENTIONAL_SKIP_BINARY. File bytes"
 	coveredGraphQLEpics   = "COVERED_GRAPHQL. Epics pkg"
 	coveredGenericDeprPrj = "COVERED_GENERIC. Deprecated; project variant"
 )
@@ -88,7 +88,7 @@ func buildReport(root string, gapsOnly bool) (report, error) {
 		service := use.Service()
 		for method := range use.Called {
 			key := service + "." + method
-			if _, ok := acceptedMissingMethods[key]; ok {
+			if adjudicated(key) {
 				staleAcceptances = append(staleAcceptances, key)
 			}
 		}
@@ -110,12 +110,16 @@ func buildReport(root string, gapsOnly bool) (report, error) {
 // method of a client-go service interface, called in place or handed on as a
 // method value, so it misses: RAW REST handlers (client.GL().NewRequest+Do with
 // a path string), GraphQL handlers (ADR-0006), and capabilities covered by a
-// superseding/generic variant. It also can't know which endpoints are
-// INTENTIONALLY not exposed (binary file transfer, CI-job-token self-lookup).
-// Each entry carries a category+rationale. Key = "<Service>.<Method>" (service
-// name without the ServiceInterface suffix). Methods NOT listed here and still
-// uncovered are the genuine new-tool backlog, and an entry whose method a
-// handler reaches is reported as stale.
+// superseding/generic variant. It also can't know which endpoints a personal
+// access token cannot use (a CI job token's self-lookup). Each entry carries
+// a category+rationale. Key = "<Service>.<Method>" (service name without the
+// ServiceInterface suffix). Methods NOT listed here and still uncovered are
+// the genuine new-tool backlog, and an entry whose method a handler reaches
+// is reported as stale. A route no action sends is not settled here: a
+// download, a route another one covers only generically and a deprecated
+// write GitLab still serves are actions to implement, which R-ROUTE tracks,
+// and its gate refuses a tracked route whose method this table decides
+// COVERED_GENERIC or INTENTIONAL_SKIP_*.
 var acceptedMissingMethods = map[string]string{
 	// COVERED_VARIANT — an alternative SDK binding for an endpoint another
 	// covered method already drives; one action per endpoint is the rule.
@@ -142,48 +146,27 @@ var acceptedMissingMethods = map[string]string{
 	"Discussions.ListGroupEpicDiscussions": coveredGraphQLEpicDsc,
 	"Discussions.UpdateEpicDiscussionNote": coveredGraphQLEpicDsc,
 
-	// COVERED_GRAPHQL and COVERED_RAW: the Orbit methods that send the REST
-	// routes GitLab.com removed on 2026-10-15, -27 and -28. The actions read
-	// what GitLab serves in their place: GraphQL, or the Orbit MCP endpoint
-	// through NewRequest, which client-go has no method for. Rows 144 to 148
-	// of docs/development/upstream-bugs.md.
-	"Orbit.GetStatus":      "COVERED_GRAPHQL. orbit.status reads Query.orbit.serviceStatus; GetStatus sends GET /orbit/status, which GitLab.com answers 404 since gitlab-org/gitlab!265633 (upstream-bugs row 144)",
-	"Orbit.GetSchema":      "COVERED_GRAPHQL. orbit.schema reads Query.orbit.schema, and get_graph_schema of POST /orbit/mcp for its llm text; GetSchema sends GET /orbit/schema, removed by gitlab-org/gitlab!265633 (upstream-bugs row 145)",
-	"Orbit.GetTools":       "COVERED_RAW. orbit.tools sends tools/list to POST /orbit/mcp through NewRequest; GetTools sends GET /orbit/tools, removed by gitlab-org/gitlab!265998 (upstream-bugs row 146)",
-	"Orbit.GetDsl":         "COVERED_RAW. orbit.dsl sends list_commands to POST /orbit/mcp through NewRequest; GetDsl sends GET /orbit/schema/dsl, which GitLab.com answers 404 since it read every query as GQL (upstream-bugs row 147)",
-	"Orbit.GetGraphStatus": "COVERED_GRAPHQL. orbit.graph_status reads Group.orbit and Project.orbit; GetGraphStatus sends GET /orbit/graph_status, removed by gitlab-org/gitlab!264745 (upstream-bugs row 148)",
+	// SUPERSEDED_UPSTREAM: the Orbit methods that send the REST routes
+	// GitLab.com removed on 2026-10-15, -27 and -28, each replaced by what its
+	// action reads now: GraphQL, or the Orbit MCP endpoint, which client-go has
+	// no method for and orbit.callMCP posts to through NewRequest (a waits
+	// entry, row 150). Not COVERED_GRAPHQL: R-ROUTE carries that decision
+	// onto a route only with a GraphQL action of the self-managed catalog,
+	// which holds no Orbit action, while GitLab replacing the route carries
+	// on its own. Rows 144 to 148 of docs/development/upstream-bugs.md.
+	"Orbit.GetStatus":      "SUPERSEDED_UPSTREAM. GetStatus sends GET /orbit/status, which gitlab-org/gitlab!265633 removed in favor of GraphQL Query.orbit.serviceStatus, which orbit.status reads (upstream-bugs row 144)",
+	"Orbit.GetSchema":      "SUPERSEDED_UPSTREAM. GetSchema sends GET /orbit/schema, which gitlab-org/gitlab!265633 removed in favor of GraphQL Query.orbit.schema, which orbit.schema reads with get_graph_schema of POST /orbit/mcp for its llm text (upstream-bugs row 145)",
+	"Orbit.GetTools":       "SUPERSEDED_UPSTREAM. GetTools sends GET /orbit/tools, which gitlab-org/gitlab!265998 removed in favor of the Orbit MCP endpoint; orbit.tools sends tools/list to POST /orbit/mcp through orbit.callMCP (upstream-bugs rows 146 and 150)",
+	"Orbit.GetDsl":         "SUPERSEDED_UPSTREAM. GetDsl sends GET /orbit/schema/dsl, which GitLab.com answers 404 since it read every query as GQL; orbit.dsl sends list_commands to POST /orbit/mcp through orbit.callMCP (upstream-bugs rows 147 and 150)",
+	"Orbit.GetGraphStatus": "SUPERSEDED_UPSTREAM. GetGraphStatus sends GET /orbit/graph_status, which gitlab-org/gitlab!264745 removed in favor of GraphQL Group.orbit and Project.orbit, which orbit.graph_status reads (upstream-bugs row 148)",
 
-	// COVERED_RAW — raw REST (NewRequest/Do or URL-built); SDK method not called.
-	"Commits.GetGPGSignature":                  "COVERED_RAW. gitlab_commit_signature",
-	"Deployments.GetProjectDeployment":         "COVERED_RAW. gitlab_deployment_get",
-	"Deployments.ListProjectDeployments":       "COVERED_RAW. gitlab_deployment_list",
-	"Jobs.ListProjectJobs":                     "COVERED_RAW. gitlab_job_list_project",
-	"MergeRequestApprovals.CreateApprovalRule": "COVERED_RAW. gitlab_mr_approval_rule_create",
-	"MergeRequestApprovals.GetApprovalRules":   "COVERED_RAW. gitlab_mr_approval_rules",
-	"MergeRequestApprovals.GetApprovalState":   "COVERED_RAW. gitlab_mr_approval_state",
-	"MergeRequestApprovals.UpdateApprovalRule": "COVERED_RAW. gitlab_mr_approval_rule_update",
-	"PipelineSchedules.GetPipelineSchedule":    "COVERED_RAW. gitlab_pipeline_schedule_get",
-	"GroupIssueBoards.UpdateIssueBoard":        "COVERED_RAW. group.group_board_update sends the PUT itself because UpdateGroupIssueBoardOptions models neither hide_backlog_list nor hide_closed_list (row 98 of docs/development/upstream-bugs.md), and reads its answer like the list, get and create, which call client-go",
-	"Projects.AddProjectHook":                  "COVERED_RAW. gitlab_project_hook_add",
-	"Projects.CreateProjectForkRelation":       "COVERED_RAW. gitlab_project_create_fork_relation issues the same POST directly because the wrapper declares ProjectForkRelation, a five-field pair GitLab's response (a Project) fills none of. Tracked in docs/development/upstream-bugs.md",
-	"Projects.EditProjectHook":                 "COVERED_RAW. gitlab_project_hook_edit",
-	"Projects.GetProjectHook":                  "COVERED_RAW. gitlab_project_hook_get",
-	"Projects.ListProjectHooks":                "COVERED_RAW. gitlab_project_hook_list",
-	"ProjectImportExport.ImportFromFile":       "COVERED_RAW. gitlab_import_project_from_file",
-	"ProjectImportExport.ImportStatus":         "COVERED_RAW. gitlab_get_project_import_status",
-	"Features.SetFeatureFlag":                  "COVERED_RAW. gitlab_set_feature_flag (raw POST)",
-	"Invites.GroupInvites":                     "COVERED_RAW. gitlab_group_invite; InvitesOptions models neither invite_source nor member_role_id, and InvitesResult models no queued_users. Tracked in docs/development/upstream-bugs.md",
-	"Invites.ProjectInvites":                   "COVERED_RAW. gitlab_project_invite, for the same three fields",
-	"Repositories.Archive":                     "COVERED_RAW. gitlab_repository_archive (URL-built)",
-	"GenericPackages.DownloadPackageFile":      "COVERED_RAW. gitlab_package_download (streamed)",
+	// COVERED_RAW is not declared here: a method a raw request, a URL the
+	// handler builds or a generic slug dispatch stands in for is replaced by
+	// an entry of the waits table, which holds the workaround to the pinned
+	// SDK, and coveredRaw derives the adjudication from it.
 
 	// COVERED_GENERIC — superseding/generic variant covers the same capability.
 	"MergeRequests.GetMergeRequestApprovals":                      "COVERED_GENERIC. Mrapprovals config/state",
-	"MergeRequests.GetMergeRequestChanges":                        "COVERED_GENERIC. gitlab_mr_changes_get (ListMergeRequestDiffs)",
-	"ProjectMembers.ListProjectMembers":                           "COVERED_GENERIC. gitlab_project_members_list (ListAllProjectMembers)",
-	"Groups.ListGroupMembers":                                     "COVERED_GENERIC. gitlab_group_members_list (ListAllGroupMembers)",
-	"Groups.ListSubGroups":                                        "COVERED_GENERIC. gitlab_subgroups_list (ListDescendantGroups)",
-	"Groups.DeleteGroupLDAPLink":                                  "COVERED_GENERIC. Groupldap ForProvider/WithCNOrFilter variants",
 	"PersonalAccessTokens.RotatePersonalAccessTokenByID":          "COVERED_GENERIC. gitlab_personal_access_token_rotate",
 	"ExternalStatusChecks.CreateExternalStatusCheck":              coveredGenericDeprPrj,
 	"ExternalStatusChecks.DeleteExternalStatusCheck":              coveredGenericDeprPrj,
@@ -192,89 +175,48 @@ var acceptedMissingMethods = map[string]string{
 	"ExternalStatusChecks.SetExternalStatusCheckStatus":           "COVERED_GENERIC. Deprecated; SetProjectMergeRequestExternalStatusCheckStatus",
 	"ExternalStatusChecks.UpdateExternalStatusCheck":              coveredGenericDeprPrj,
 	"ErrorTracking.EnableDisableErrorTracking":                    "COVERED_GENERIC. Deprecated; gitlab_enable_disable_error_tracking",
-	"ErrorTracking.CreateErrorTrackingSettings":                   "COVERED_GENERIC. Same settings resource as UpdateErrorTrackingSettings",
-
-	// INTENTIONAL_SKIP_BINARY — raw file/archive/state bytes, unsuitable for JSON tools.
-	"GroupMarkdownUploads.DownloadGroupMarkdownUploadByID":                    skipBinaryBytes,
-	"GroupMarkdownUploads.DownloadGroupMarkdownUploadBySecretAndFilename":     skipBinaryBytes,
-	"ProjectMarkdownUploads.DownloadProjectMarkdownUploadByID":                skipBinaryBytes,
-	"ProjectMarkdownUploads.DownloadProjectMarkdownUploadBySecretAndFilename": skipBinaryBytes,
-	"GroupRelationsExport.ExportDownload":                                     "INTENTIONAL_SKIP_BINARY. Export archive bytes",
-	"SecureFiles.DownloadSecureFile":                                          "INTENTIONAL_SKIP_BINARY. Secure file bytes",
-	"TerraformStates.Download":                                                "INTENTIONAL_SKIP_BINARY. Tfstate bytes",
-	"TerraformStates.DownloadLatest":                                          "INTENTIONAL_SKIP_BINARY. Tfstate bytes",
-	"Groups.DownloadAvatar":                                                   "INTENTIONAL_SKIP_BINARY. Group avatar image bytes (*bytes.Reader); upload IS exposed",
 
 	// INTENTIONAL_SKIP_OTHER
-	"Jobs.GetJobTokensJob":       "INTENTIONAL_SKIP_OTHER. CI-job-token self-lookup; not usable with a PAT",
-	"Repositories.StreamArchive": "INTENTIONAL_SKIP_OTHER. Streaming dup of Repositories.Archive (gitlab_repository_archive)",
-	// This used to read "COVERED_RAW. gitlab_mr_approval_config", and it was
-	// the paper trail behind twenty phantom output fields: that action calls
-	// the GET at this path and never the POST, but the claim of coverage made
-	// the POST's 24-field response look like the shape the action should
-	// publish. Set approval requirements through the approval rules instead.
-	"MergeRequestApprovals.ChangeApprovalConfiguration": "INTENTIONAL_SKIP_OTHER. Deprecated in GitLab 16.0; approval rules supersede it (gitlab_mr_approval_rule_create/update)",
+	"Jobs.GetJobTokensJob": "INTENTIONAL_SKIP_OTHER. CI-job-token self-lookup; not usable with a PAT",
+}
 
-	// COVERED_RAW — the generic slug-dispatched integration actions (project
-	// gitlab_set_integration + group list/get/set/delete) cover the full integration
-	// slug surface at project and group scope via raw REST PUT/GET/DELETE.
-	"Integrations.DeleteGroupMattermostIntegration":              coveredRawGeneric,
-	"Integrations.DeleteGroupMattermostSlashCommandsIntegration": coveredRawGeneric,
-	"Integrations.DisableGroupHarbor":                            coveredRawGeneric,
-	"Integrations.DisableGroupJira":                              coveredRawGeneric,
-	"Integrations.DisableGroupMicrosoftTeamsNotifications":       coveredRawGeneric,
-	"Integrations.DisableGroupSlack":                             coveredRawGeneric,
-	"Integrations.DisableGroupWebexTeams":                        coveredRawGeneric,
-	"Integrations.DisableProjectGoogleChat":                      coveredRawGeneric,
-	"Integrations.GetGroupDiscordSettings":                       coveredRawGeneric,
-	"Integrations.GetGroupGoogleChatSettings":                    coveredRawGeneric,
-	"Integrations.GetGroupHarborSettings":                        coveredRawGeneric,
-	"Integrations.GetGroupJiraSettings":                          coveredRawGeneric,
-	"Integrations.GetGroupMatrixSettings":                        coveredRawGeneric,
-	"Integrations.GetGroupMattermostIntegration":                 coveredRawGeneric,
-	"Integrations.GetGroupMattermostSettings":                    coveredRawGeneric,
-	"Integrations.GetGroupMattermostSlashCommandsIntegration":    coveredRawGeneric,
-	"Integrations.GetGroupMicrosoftTeamsNotifications":           coveredRawGeneric,
-	"Integrations.GetGroupSlackSettings":                         coveredRawGeneric,
-	"Integrations.GetGroupTelegramSettings":                      coveredRawGeneric,
-	"Integrations.GetGroupWebexTeamsSettings":                    coveredRawGeneric,
-	"Integrations.GetProjectGoogleChatSettings":                  coveredRawGeneric,
-	"Integrations.SetGroupMattermostIntegration":                 coveredRawGeneric,
-	"Integrations.SetGroupMattermostSlashCommandsIntegration":    coveredRawGeneric,
-	"Integrations.SetGroupMicrosoftTeamsNotifications":           coveredRawGeneric,
-	"Integrations.SetGroupSlackSettings":                         coveredRawGeneric,
-	"Integrations.SetGroupWebexTeamsSettings":                    coveredRawGeneric,
-	"Integrations.SetProjectGoogleChatSettings":                  coveredRawGeneric,
-	"Integrations.SetUpGroupHarbor":                              coveredRawGeneric,
-	"Integrations.SetUpGroupJira":                                coveredRawGeneric,
-	"Services.GetSlackApplication":                               coveredRawGeneric,
-	"Services.SetCustomIssueTrackerService":                      coveredRawGeneric,
-	"Services.SetDataDogService":                                 coveredRawGeneric,
-	"Services.SetDiscordService":                                 coveredRawGeneric,
-	"Services.SetDroneCIService":                                 coveredRawGeneric,
-	"Services.SetEmailsOnPushService":                            coveredRawGeneric,
-	"Services.SetExternalWikiService":                            coveredRawGeneric,
-	"Services.SetGithubService":                                  coveredRawGeneric,
-	"Services.SetHarborService":                                  coveredRawGeneric,
-	"Services.SetJenkinsCIService":                               coveredRawGeneric,
-	"Services.SetMatrixService":                                  coveredRawGeneric,
-	"Services.SetMattermostService":                              coveredRawGeneric,
-	"Services.SetMattermostSlashCommandsService":                 coveredRawGeneric,
-	"Services.SetMicrosoftTeamsService":                          coveredRawGeneric,
-	"Services.SetPipelinesEmailService":                          coveredRawGeneric,
-	"Services.SetRedmineService":                                 coveredRawGeneric,
-	"Services.SetSlackApplication":                               coveredRawGeneric,
-	"Services.SetSlackService":                                   coveredRawGeneric,
-	"Services.SetSlackSlashCommandsService":                      coveredRawGeneric,
-	"Services.SetTelegramService":                                coveredRawGeneric,
-	"Services.SetYouTrackService":                                coveredRawGeneric,
+// AcceptedMissingMethods returns the adjudications acceptedMissingMethods
+// writes, as a copy a caller may keep, keyed "Service.Method" and each
+// opening with its category ("COVERED_GRAPHQL. Epics pkg"). R-ROUTE reads
+// them to decide whether a route no action reaches inherits the decision
+// about the methods that send it. The COVERED_RAW adjudications are not
+// among them: they are derived from the waits table, which a reader takes
+// them from with the entry that says why.
+func AcceptedMissingMethods() map[string]string { return maps.Clone(acceptedMissingMethods) }
+
+// coveredRawCategory is how a COVERED_RAW adjudication opens, the category
+// the rest of acceptedMissingMethods spells its entries with.
+const coveredRawCategory = "COVERED_RAW. "
+
+// coveredRaw adjudicates the methods a workaround of the waits table stands
+// in for, derived from the table rather than written here a second time: the
+// table is where the sdk scope holds each workaround to the pinned SDK and to
+// the tree, so the method retires from here the day its entry does.
+var coveredRaw = func() map[string]string {
+	out := map[string]string{}
+	for key, reason := range waits.CoveredRawMethods(waits.Entries()) {
+		out[key] = coveredRawCategory + reason
+	}
+	return out
+}()
+
+// adjudicated reports whether either table answers an SDK method the scanner
+// reports as uncovered, keyed "Service.Method".
+func adjudicated(key string) bool {
+	_, accepted := acceptedMissingMethods[key]
+	_, replaced := coveredRaw[key]
+	return accepted || replaced
 }
 
 // isAcceptedMissingMethod reports whether an uncovered SDK method is adjudicated as
 // covered-another-way or intentionally not exposed (so not a genuine R-ACTION gap).
 func isAcceptedMissingMethod(service, method string) bool {
-	_, ok := acceptedMissingMethods[service+"."+method]
-	return ok
+	return adjudicated(service + "." + method)
 }
 
 func coverageForService(use *shared.ServiceUsage) serviceCoverage {

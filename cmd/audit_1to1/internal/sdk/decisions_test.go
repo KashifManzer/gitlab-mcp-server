@@ -25,11 +25,12 @@ const minReasonLength = 40
 // TestDeclaredServices_Entries_CarryAKnownCategoryAndEvidence verifies every
 // service declaration is well formed: a category from the agreed set, a
 // substantial reason, and a key that is a bare service name rather than a
-// Client struct field or an interface name.
+// Client struct field or an interface name. COVERED_RAW is not in the set: a
+// service a raw request stands in for is declared by the waits entry that
+// holds the request to the pinned SDK, and only from there.
 func TestDeclaredServices_Entries_CarryAKnownCategoryAndEvidence(t *testing.T) {
 	known := map[string]bool{
-		coveredRaw: true, coveredGraphQL: true,
-		supersededUpstream: true, unwrappedTracked: true,
+		coveredGraphQL: true, supersededUpstream: true, unwrappedTracked: true,
 	}
 	for service, declared := range declaredServices {
 		t.Run(service, func(t *testing.T) {
@@ -46,6 +47,26 @@ func TestDeclaredServices_Entries_CarryAKnownCategoryAndEvidence(t *testing.T) {
 				t.Errorf("key %q is not a bare service name", service)
 			}
 		})
+	}
+}
+
+// TestDeclaredServices_TheAccessor_ReturnsEveryDeclarationAsACopy verifies
+// the accessor R-ROUTE reads hands out every declaration with its category
+// and reason, and that a caller writing into what it was handed changes
+// nothing a later caller reads.
+func TestDeclaredServices_TheAccessor_ReturnsEveryDeclarationAsACopy(t *testing.T) {
+	got := DeclaredServices()
+	if len(got) != len(declaredServices) {
+		t.Fatalf("DeclaredServices holds %d services, the table %d", len(got), len(declaredServices))
+	}
+	for service, declared := range declaredServices {
+		if got[service] != ServiceDeclaration(declared) {
+			t.Errorf("DeclaredServices()[%s] = %+v, want %+v", service, got[service], declared)
+		}
+	}
+	got["GeoNodes"] = ServiceDeclaration{Category: "written by a caller"}
+	if again := DeclaredServices(); again["GeoNodes"].Category != supersededUpstream {
+		t.Errorf("a caller's write reached the table: GeoNodes = %+v", again["GeoNodes"])
 	}
 }
 

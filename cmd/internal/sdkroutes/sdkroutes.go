@@ -9,6 +9,16 @@ import (
 	"strings"
 )
 
+// The two constructors a client-go method builds a REST request with, which
+// decide how its options are encoded: NewRequest writes a PATCH, POST or PUT
+// body with encoding/json and every other verb's query with go-querystring,
+// and UploadRequest writes every option as a multipart form field with
+// go-querystring whatever the verb.
+const (
+	ConstructorNewRequest = "NewRequest"
+	ConstructorUpload     = "UploadRequest"
+)
+
 // Route is one REST request a client-go method sends.
 type Route struct {
 	// Method is the HTTP verb, uppercase.
@@ -41,6 +51,17 @@ type Method struct {
 	Options []string
 	// Routes is every REST request the method can send, sorted.
 	Routes []Route
+	// Constructors names, sorted, the constructors the method and what it
+	// delegates to can build a REST request with: UploadRequest for a call
+	// of do handed withUpload and for a legacy UploadRequest, NewRequest for
+	// any other call of do and for a legacy NewRequest. A method that hands
+	// do withUpload only under a condition (CreateGroup does when an avatar
+	// is given) can build either, and names both.
+	Constructors []string
+	// UploadFields names, sorted, the form fields an upload of the method
+	// sends its file under (UploadAvatar is "avatar", UploadFile "file"),
+	// which no option struct field carries.
+	UploadFields []string
 	// GraphQL is true when the method, or something it delegates to, posts to
 	// the GraphQL endpoint; [SDK.Documents] names the documents it posts.
 	GraphQL bool
@@ -58,6 +79,9 @@ type SDK struct {
 	methods map[string]Method
 	keys    []string
 	reading *reading
+	// entries maps a method's key to the body it was resolved from, which
+	// [SDK.Placements] reads a second time.
+	entries map[string]*function
 }
 
 // Read parses the client-go root package in dir and resolves every exported
@@ -69,11 +93,12 @@ type SDK struct {
 // reports rather than gates on what it finds missing.
 func Read(dir string) *SDK {
 	parsed := parseDir(dir)
-	sdk := &SDK{methods: map[string]Method{}, reading: parsed}
+	sdk := &SDK{methods: map[string]Method{}, reading: parsed, entries: map[string]*function{}}
 	for _, entry := range parsed.entries {
 		method := parsed.resolve(entry)
 		key := method.Key()
 		sdk.methods[key] = method
+		sdk.entries[key] = entry
 		sdk.keys = append(sdk.keys, key)
 	}
 	sort.Strings(sdk.keys)

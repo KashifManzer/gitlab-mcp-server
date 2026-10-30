@@ -16,8 +16,10 @@ import (
 	"testing"
 
 	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/grants"
+	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/params"
 	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/paths"
 	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/required"
+	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/audit_1to1/internal/routes"
 	"github.com/jmrplens/gitlab-mcp-server/v3/cmd/internal/apidocs"
 	"github.com/jmrplens/gitlab-mcp-server/v3/internal/cmdutil"
 	_ "github.com/jmrplens/gitlab-mcp-server/v3/internal/testutil/serialtypecheck" // serial type-checking under -race, golang/go#81122
@@ -294,6 +296,74 @@ func TestMain_RequiredScope_CarriesGapsOnly(t *testing.T) {
 	}
 }
 
+// TestMain_ParamsScope_CarriesGapsOnly runs main with -scope=params and
+// holds -gaps-only to the one option it sets, both ways.
+func TestMain_ParamsScope_CarriesGapsOnly(t *testing.T) {
+	original := paramsRun
+	t.Cleanup(func() { paramsRun = original })
+	var got params.Options
+	paramsRun = func(_ string, opts params.Options) ([]byte, bool, error) {
+		got = opts
+		return []byte("{}\n"), true, nil
+	}
+	for name, testCase := range map[string]struct {
+		args     []string
+		wantGaps bool
+	}{
+		"gaps_only": {args: []string{"-gaps-only"}, wantGaps: true},
+		"full":      {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got = params.Options{GapsOnly: !testCase.wantGaps}
+			messages := captureFatal(t)
+			resetFlags(t, append([]string{"-scope=params", "-output", filepath.Join(t.TempDir(), "params.json")}, testCase.args...)...)
+
+			main()
+
+			if len(*messages) != 0 {
+				t.Fatalf("main reported %v, want a clean run", *messages)
+			}
+			if got.GapsOnly != testCase.wantGaps {
+				t.Errorf("Options.GapsOnly = %t, want %t", got.GapsOnly, testCase.wantGaps)
+			}
+		})
+	}
+}
+
+// TestMain_RoutesScope_CarriesGapsOnly runs main with -scope=routes and
+// holds -gaps-only to the one option it sets, both ways.
+func TestMain_RoutesScope_CarriesGapsOnly(t *testing.T) {
+	original := routesRun
+	t.Cleanup(func() { routesRun = original })
+	var got routes.Options
+	routesRun = func(_ string, opts routes.Options) ([]byte, bool, error) {
+		got = opts
+		return []byte("{}\n"), true, nil
+	}
+	for name, testCase := range map[string]struct {
+		args     []string
+		wantGaps bool
+	}{
+		"gaps_only": {args: []string{"-gaps-only"}, wantGaps: true},
+		"full":      {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got = routes.Options{GapsOnly: !testCase.wantGaps}
+			messages := captureFatal(t)
+			resetFlags(t, append([]string{"-scope=routes", "-output", filepath.Join(t.TempDir(), "routes.json")}, testCase.args...)...)
+
+			main()
+
+			if len(*messages) != 0 {
+				t.Fatalf("main reported %v, want a clean run", *messages)
+			}
+			if got.GapsOnly != testCase.wantGaps {
+				t.Errorf("Options.GapsOnly = %t, want %t", got.GapsOnly, testCase.wantGaps)
+			}
+		})
+	}
+}
+
 // TestRun_AnalyzerFailures_AreNamedByStream verifies each seam-reachable
 // failure of the merged run and the single-scope run surfaces with the name
 // of the stream that failed, and that a gate reporting findings fails the run
@@ -423,6 +493,46 @@ func TestRun_AnalyzerFailures_AreNamedByStream(t *testing.T) {
 				original := requiredRun
 				t.Cleanup(func() { requiredRun = original })
 				requiredRun = func(string, required.Options) ([]byte, bool, error) { return nil, false, boom }
+			},
+			wantErr: "boom",
+		},
+		{
+			name: "params_gate_reports_stale_declarations", scope: scopeParams,
+			arrange: func(t *testing.T) {
+				t.Helper()
+				original := paramsRun
+				t.Cleanup(func() { paramsRun = original })
+				paramsRun = func(string, params.Options) ([]byte, bool, error) { return []byte("{}\n"), false, nil }
+			},
+			wantErr: "param declarations that answer nothing", wantReport: true,
+		},
+		{
+			name: "params_scope_fails", scope: scopeParams,
+			arrange: func(t *testing.T) {
+				t.Helper()
+				original := paramsRun
+				t.Cleanup(func() { paramsRun = original })
+				paramsRun = func(string, params.Options) ([]byte, bool, error) { return nil, false, boom }
+			},
+			wantErr: "boom",
+		},
+		{
+			name: "routes_gate_reports_unanswered_routes_and_stale_declarations", scope: scopeRoutes,
+			arrange: func(t *testing.T) {
+				t.Helper()
+				original := routesRun
+				t.Cleanup(func() { routesRun = original })
+				routesRun = func(string, routes.Options) ([]byte, bool, error) { return []byte("{}\n"), false, nil }
+			},
+			wantErr: "live routes nothing answers, or route declarations that no longer describe the tree", wantReport: true,
+		},
+		{
+			name: "routes_scope_fails", scope: scopeRoutes,
+			arrange: func(t *testing.T) {
+				t.Helper()
+				original := routesRun
+				t.Cleanup(func() { routesRun = original })
+				routesRun = func(string, routes.Options) ([]byte, bool, error) { return nil, false, boom }
 			},
 			wantErr: "boom",
 		},
@@ -803,7 +913,7 @@ func TestRun_EachScope_WritesItsReportShape(t *testing.T) {
 		{name: "structs", scope: "structs", wantKeys: []string{"schema_version", "client_go_path", "summary", "packages"}},
 		{name: "actions", scope: "actions", wantKeys: []string{"schema_version", "client_go_path", "summary", "services"}},
 		{name: "enums", scope: "enums", wantKeys: []string{"schema_version", "client_go_path", "summary", "packages"}},
-		{name: "sdk", scope: "sdk", wantKeys: []string{"schema_version", "client_go_path", "summary", "services", "graphql_operations", "enum_fields"}},
+		{name: "sdk", scope: "sdk", wantKeys: []string{"schema_version", "client_go_path", "summary", "services", "graphql_operations", "enum_fields", "option_structs", "upstream_waits", "captures", "identifiers"}},
 		{name: "merged", scope: "all", wantKeys: []string{"schema_version", "note", "summary", "packages"}},
 	}
 	for _, tc := range cases {

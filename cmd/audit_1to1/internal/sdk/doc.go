@@ -29,6 +29,52 @@
 // declares, and a constant added upstream is invisible to the struct rule,
 // which projects an enum type to a scalar and calls the field covered.
 //
+// The option structs rule is folded in on the same ground: its universe is
+// the structs client-go's methods take, and the field diff starts
+// from the literals our handlers build, so a struct a helper builds, a
+// struct nested in a request, and a copy of one struct into another were
+// compared with nothing or with the wrong input. Every struct a service
+// method takes, and every struct a raw request carries as its options (typed,
+// embedded in a struct of ours, or handed one call up as any), is held to an
+// input a model sends, converted from a held struct, copied from one field
+// for field, or declared.
+//
+// The upstream waits rule is folded in because its predicates are about the
+// pinned SDK: a workaround carried because client-go does something wrong
+// (a raw request, a request option written by hand, a body edit, a raw
+// request of the e2e fixture or of an e2e scenario) is held to an entry of
+// the waits table, and the entry to a predicate on client-go that says the
+// workaround is still needed, so the pin that makes it obsolete fails the
+// gate the day it lands. Every reason the walk can read off a workaround (a
+// key a raw request carries beside the client-go struct it embeds, a body
+// key, a method a request option pages) has to be one of those predicates,
+// or a pin that fixes only the reasons written down would retire a
+// workaround still needed.
+//
+// The captures rule is folded in on the same ground: a struct a handler
+// decodes off a captured response (ADR-0021) reads what the client-go
+// struct decoded from the same answer does not model, and a pin that models
+// one of its keys leaves the key read twice with nothing to say so. Every key
+// a capture shares with the client-go struct beside it is held to a
+// declaration whose category requires a predicate on the pinned SDK, so the
+// pin that takes the reason away fails the gate the day it lands.
+//
+// The identifiers rule is folded in because its universe is the parameters
+// client-go takes as any: a handler that hands one an integer narrows what a
+// model can send wherever GitLab takes a name or a path too, and nothing
+// compared the two. Every such integer, whether the method is called by name
+// or through a method value, is followed to the input field it is read from
+// and held to what the live API record says the placeholder it fills takes,
+// at the segment cmd/internal/sdkroutes places the parameter in; a
+// placeholder that takes a name or a path, or that the record does not
+// describe, fails the gate until the input is widened or a declaration says
+// why. So does an integer whose trace stops where the walk cannot follow it,
+// and a method value the walk does not follow to its calls, until the walk
+// is taught the shape. The record is a pinned oracle a stack never
+// regenerates, so reading it does not defer the scope. The rule lists beside
+// them the integer parameters client-go itself narrows, which only an
+// upstream change widens.
+//
 // Unlike the three candidate-backlog scopes, this one is a gate: Run reports
 // whether the tree is clean, and the command exits non-zero when it is not.
 package sdk

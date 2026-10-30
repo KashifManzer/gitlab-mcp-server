@@ -93,6 +93,20 @@ func TestRun_SeamFailures_AreReported(t *testing.T) {
 	}
 }
 
+// TestRun_AnE2EFixtureThatDoesNotParse_FailsTheRun verifies the one failure
+// the upstream waits section can raise reaches Run's caller as an error
+// rather than as a report that read none of the fixture's raw requests.
+func TestRun_AnE2EFixtureThatDoesNotParse_FailsTheRun(t *testing.T) {
+	root := fixtureModule(t, map[string]string{fixtureDir + "/broken.go": "package fixture\n\nfunc {\n"})
+	content, clean, err := Run(root, true)
+	if err == nil || !strings.Contains(err.Error(), "parse the e2e fixture") {
+		t.Fatalf("Run = %v, want the fixture's parse error", err)
+	}
+	if clean || content != nil {
+		t.Errorf("failed run returned clean=%v content=%d bytes, want false and nil", clean, len(content))
+	}
+}
+
 // TestReportSummaryClean_Counters_EachFindingFailsTheGateAlone verifies the
 // verdict the command's exit status is taken from: every counter the summary
 // carries a finding in fails the gate on its own, and the counters that merely
@@ -106,14 +120,39 @@ func TestReportSummaryClean_Counters_EachFindingFailsTheGateAlone(t *testing.T) 
 		want    bool
 	}{
 		{
-			name:    "no finding",
-			summary: reportSummary{SDKServices: 120, ServicesCovered: 118, ServicesDeclared: 2, GraphQLOperations: 9, GraphQLAdjudicated: 9, EnumFields: 40},
-			want:    true,
+			name: "no finding",
+			summary: reportSummary{
+				SDKServices: 120, ServicesCovered: 118, ServicesDeclared: 2, GraphQLOperations: 9, GraphQLAdjudicated: 9, EnumFields: 40,
+				OptionStructs: 9, OptionPaired: 5, OptionConverted: 1, OptionCopied: 1, OptionDeclared: 2,
+				UpstreamWaits: 47, WaitsHolding: 41, Workarounds: 55,
+				CapturedTypes: 86, CapturedKeysShared: 77, CapturesKept: 77, CapturesAnswerNoStruct: 2,
+				IdentifierArguments: 10, IdentifiersIDOnly: 6, IdentifiersDeclared: 3, IdentifiersNotFromInput: 1, SDKNarrowed: 18,
+			},
+			want: true,
 		},
+		{name: "an integer handed where the record takes a name or a path", summary: reportSummary{IdentifiersNarrowed: 1}},
+		{name: "an integer handed where the record describes nothing", summary: reportSummary{IdentifiersUndescribed: 1}},
+		{name: "an integer handed where the record holds no route", summary: reportSummary{IdentifiersUnplaced: 1}},
+		{name: "an integer whose trace stopped where the record takes a name", summary: reportSummary{IdentifiersUntraced: 1}},
+		{name: "a client-go method value the walk does not follow", summary: reportSummary{IdentifiersUnfollowed: 1}},
+		{name: "a captured key the client-go struct beside it models", summary: reportSummary{CapturesRedundant: 1}},
+		{name: "a captured struct the walk pairs with nothing", summary: reportSummary{CapturesUnpaired: 1}},
+		{name: "a capture declaration with a predicate to edit", summary: reportSummary{CapturesStalePredicate: 1}},
+		{name: "a capture the pinned SDK made obsolete", summary: reportSummary{CapturesObsolete: 1}},
 		{name: "an undeclared service", summary: reportSummary{ServicesUndeclared: 1}},
 		{name: "an unadjudicated GraphQL operation", summary: reportSummary{GraphQLUnadjudicated: 1}},
 		{name: "an enum value the SDK declares and we do not", summary: reportSummary{EnumMissingValues: 1}},
 		{name: "an enum value we publish and the SDK does not", summary: reportSummary{EnumExtraValues: 1}},
+		{name: "an option struct nothing holds", summary: reportSummary{OptionUnpaired: 1}},
+		{name: "a field a copy leaves out", summary: reportSummary{OptionCopyMissing: 1}},
+		{name: "a field of a nested struct its input lacks", summary: reportSummary{OptionNestedMissing: 1}},
+		{name: "a workaround with a predicate to edit", summary: reportSummary{WaitsStalePredicate: 1}},
+		{name: "a workaround the pinned SDK made obsolete", summary: reportSummary{WaitsObsolete: 1}},
+		{name: "a workaround no entry answers", summary: reportSummary{WorkaroundsUndeclared: 1}},
+		{name: "a body key no predicate explains", summary: reportSummary{BodyEditKeysUnanswered: 1}},
+		{name: "a body edit whose keys the walk cannot read", summary: reportSummary{BodyEditsUnread: 1}},
+		{name: "a key a superset carries that no predicate explains", summary: reportSummary{SupersetNeedsUnanswered: 1}},
+		{name: "a method a request option is handed to that no predicate names", summary: reportSummary{OptionMethodsUnanswered: 1}},
 		{name: "a declaration that no longer describes the code", summary: reportSummary{StaleDeclarations: 1}},
 	}
 	for _, tc := range cases {
@@ -492,11 +531,48 @@ func TestRun_Repository_GateIsGreenAndShapeIsStable(t *testing.T) {
 	if len(rep.Services) != 0 || len(rep.GraphQLOperations) != 0 {
 		t.Errorf("gaps-only report kept %d services and %d operations, want none", len(rep.Services), len(rep.GraphQLOperations))
 	}
+	if options := rep.OptionStructs; len(options.Structs) != 0 || len(options.Copies) != 0 || len(options.Conversions) != 0 {
+		t.Errorf("gaps-only report kept option structs %+v, want none", options)
+	}
+	checkGapsOnlyCaptures(t, rep)
+	checkGapsOnlyIdentifiers(t, rep)
+	if s := rep.Summary; s.OptionStructs != s.OptionPaired+s.OptionConverted+s.OptionCopied+s.OptionDeclared+s.OptionUnpaired || s.OptionStructs < 400 {
+		t.Errorf("option struct statuses do not add up to the SDK's request surface: %+v", s)
+	}
 	if rep.Summary.SDKServices != rep.Summary.ServicesCovered+rep.Summary.ServicesDeclared+rep.Summary.ServicesUndeclared {
 		t.Errorf("service statuses do not add up: %+v", rep.Summary)
 	}
 	if rep.Summary.SDKServices < 100 {
 		t.Errorf("sdk_services = %d, want the SDK's full service surface", rep.Summary.SDKServices)
+	}
+}
+
+// checkGapsOnlyCaptures holds the captures section of a gaps-only report on
+// the real tree to keeping nothing, since there is no finding, and its
+// counters to adding up over the captures the tree decodes.
+func checkGapsOnlyCaptures(t *testing.T, rep report) {
+	t.Helper()
+	if captures := rep.Captures; len(captures.Types) != 0 || len(captures.Keys) != 0 || len(captures.Unpaired) != 0 {
+		t.Errorf("gaps-only report kept captures %+v, want none", captures)
+	}
+	if s := rep.Summary; s.CapturedKeysShared != s.CapturesKept+s.CapturesRedundant+s.CapturesStalePredicate+s.CapturesObsolete || s.CapturedTypes < 50 {
+		t.Errorf("capture statuses do not add up to the captures the tree decodes: %+v", s)
+	}
+}
+
+// checkGapsOnlyIdentifiers holds the identifiers section of a gaps-only
+// report on the real tree to keeping nothing, since there is no finding, no
+// method value the walk does not follow, and the client-go narrowings are
+// no finding of this gate, and its counters to adding up over the integers
+// the handlers hand a parameter of type any.
+func checkGapsOnlyIdentifiers(t *testing.T, rep report) {
+	t.Helper()
+	if identifiers := rep.Identifiers; len(identifiers.Arguments) != 0 || len(identifiers.Unfollowed) != 0 || len(identifiers.SDKNarrowed) != 0 {
+		t.Errorf("gaps-only report kept identifiers %+v, want none", identifiers)
+	}
+	s := rep.Summary
+	if s.IdentifierArguments != s.IdentifiersIDOnly+s.IdentifiersDeclared+s.IdentifiersNotFromInput+s.IdentifiersNarrowed+s.IdentifiersUndescribed+s.IdentifiersUnplaced+s.IdentifiersUntraced || s.IdentifierArguments == 0 {
+		t.Errorf("identifier statuses do not add up to the integers the tree hands client-go: %+v", s)
 	}
 }
 

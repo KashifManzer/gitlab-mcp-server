@@ -52,6 +52,30 @@
 // ":", which is client-go's own normalization of a route template, so the
 // shapes produced here meet the ones its route registry reports.
 //
+// # Which constructor builds it
+//
+// A method also says which of client-go's two constructors builds its
+// request ([Method.Constructors]), because the constructor decides how the
+// options are encoded: NewRequest writes the body of a PATCH, POST or PUT
+// with encoding/json and the query of every other verb with go-querystring,
+// and UploadRequest writes every option as a multipart field with
+// go-querystring under any verb. A call of do handed withUpload is an upload,
+// any other is NewRequest, and a body that appends withUpload to the options
+// only under a condition builds either.
+//
+// # Where a parameter lands
+//
+// [SDK.Placements] answers which of those placeholders each parameter of a
+// method fills, which the sdk scope's identifiers rule asks of a parameter
+// that takes an ID or a path as any. It reads the method again with every
+// parameter folded to a mark that names it, carried wherever a piece of a
+// path is (into a delegated function, through a format) and through what the
+// reading cannot name but builds out of a marked parameter (ProjectID{pid},
+// the string parseID returns), so a segment that comes out as one mark is the
+// segment that parameter fills. The marks change nothing the first reading
+// spells: Methods and Method read without them, so the routes every other
+// reader asks of are what they were.
+//
 // # What it cannot read
 //
 // A legacy request whose path folds to nothing static (a parameter passed

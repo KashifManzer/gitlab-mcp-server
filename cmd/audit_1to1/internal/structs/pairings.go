@@ -6,6 +6,7 @@ package structs
 import (
 	"go/types"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -42,6 +43,17 @@ type OutputPairing struct {
 	// holds **client-go** against GitLab. That is the comparison whose findings
 	// belong upstream rather than here, and it needs exactly this list.
 	SDKFields []string
+	// SDKNested is the same one level down: per json name of that struct
+	// whose field carries another client-go struct, through a pointer, a
+	// slice, an array or a map value, what that struct deserializes, sorted.
+	// A name whose field carries anything else is absent.
+	//
+	// It is what lets the type grain say of a key GitLab sends inside a
+	// nested object whether client-go could already give it to us: a merge
+	// request's head_pipeline is a gl.Pipeline, and whether gl.Pipeline
+	// carries archived is the difference between an upstream contribution
+	// and a field this server only has to publish.
+	SDKNested map[string][]string
 }
 
 // Pairings is one pass over the tool packages, for a caller outside this
@@ -75,7 +87,7 @@ func CollectOutputPairings(root string) (Pairings, error) {
 	if err != nil {
 		return Pairings{}, err
 	}
-	found := Pairings{ClientGoDir: clientGoDir(pkgs)}
+	found := Pairings{ClientGoDir: ClientGoDir(pkgs)}
 	for _, pkg := range pkgs {
 		short := shared.ShortPackage(pkg.PkgPath)
 		for _, pair := range CollectPairs(pkg) {
@@ -87,6 +99,7 @@ func CollectOutputPairings(root string) (Pairings, error) {
 				MCPType:   pair.MCPName,
 				SDKType:   pair.SDKName[strings.LastIndexByte(pair.SDKName, '.')+1:],
 				SDKFields: sdkFieldNames(pair.SDKType),
+				SDKNested: sdkNestedNames(pair.SDKType),
 			})
 		}
 		found.Projections = append(found.Projections, CollectProjections(pkg)...)
@@ -94,15 +107,65 @@ func CollectOutputPairings(root string) (Pairings, error) {
 	return found, nil
 }
 
-// clientGoDir finds the directory of the client-go root package in the import
-// graph of the loaded tool packages.
+// InputPairDiff is one input pair the field diff runs over, with the SDK
+// fields its input lacks, for a rule outside this package that holds a pair
+// to its fields.
+//
+// The option structs section of the sdk scope reads it twice: the pairs say
+// which client-go structs an input is compared with at all, and the missing
+// fields of a nested pair are the finding that section gates on, where the
+// structs scope only lists them. The missing fields come out of the same diff,
+// the declared omissions of acceptedMissingInputs already taken out, so the
+// two scopes answer a missing field with one table.
+type InputPairDiff struct {
+	// Package is the internal/tools domain name, spelled the way
+	// [shared.ShortPackage] spells it.
+	Package string
+	// MCPType is the input struct's Go name.
+	MCPType string
+	// SDKNamed is the client-go struct it is compared with.
+	SDKNamed *types.Named
+	// Via is how the pair was found, as [Pair.Via] has it.
+	Via string
+	// Missing lists the SDK tags the input carries no counterpart of and no
+	// declaration answers, sorted.
+	Missing []string
+}
+
+// DiffInputPairs returns the diff of every input pair of pkgs, package by
+// package in load order and within a package in the order [CollectPairs]
+// returns them.
+func DiffInputPairs(pkgs []*packages.Package) []InputPairDiff {
+	run := newDiffRun()
+	var out []InputPairDiff
+	for _, pkg := range pkgs {
+		short := shared.ShortPackage(pkg.PkgPath)
+		inputPairs, _ := discoverPairs(pkg)
+		for _, pair := range sortedPairs(inputPairs) {
+			if disjointPhantomInput(pair, inputPairs) {
+				continue
+			}
+			g := run.diffPair(short, "input", pair)
+			missing := make([]string, 0, len(g.MissingFields))
+			for _, field := range g.MissingFields {
+				missing = append(missing, field.Tag)
+			}
+			out = append(out, InputPairDiff{Package: short, MCPType: pair.mcpName, SDKNamed: pair.sdkNamed, Via: pair.via, Missing: missing})
+		}
+	}
+	return out
+}
+
+// ClientGoDir finds the directory of the client-go root package in the import
+// graph of the loaded tool packages. The sdk scope reads it too, to ask
+// cmd/internal/sdkroutes which routes the pinned SDK sends.
 //
 // The root is identified by the Client struct rather than by its import path,
 // because the path carries a major-version suffix that moves with every major
 // release and several client-go packages share the prefix. A package with no
 // files on disk is passed over: the answer is a directory to parse, and one
 // that names nothing is worse than none.
-func clientGoDir(pkgs []*packages.Package) string {
+func ClientGoDir(pkgs []*packages.Package) string {
 	for _, pkg := range pkgs {
 		for path, imported := range pkg.Imports {
 			if !strings.Contains(path, shared.ClientGoPkgPath) || imported.Types == nil {
@@ -135,4 +198,63 @@ func sdkFieldNames(st *types.Struct) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// sdkNestedNames is, per json name of a client-go struct whose field carries
+// another client-go struct, what that struct deserializes (see
+// [OutputPairing.SDKNested]), or nil when no field does.
+//
+// The name is the one [flattenFields] keys, so an embed's fields are reached
+// and a name two fields share resolves to the one encoding/json writes: a
+// field is taken only when its type is the type flattenFields labels the name
+// with, and the shallowest of those is met first.
+func sdkNestedNames(st *types.Struct) map[string][]string {
+	written := flattenFields(st, []string{tagKeyJSON})
+	out := map[string][]string{}
+	collectSDKNested(st, written, out, map[*types.Struct]bool{})
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// collectSDKNested records in out the nested structs of one struct's own
+// fields and then of its untagged embeds, under the names written keys.
+//
+// It walks each struct once rather than to a depth: written already holds no
+// name deeper than [flattenFields] reads, so the only thing a bound would add
+// is an end to a struct that embeds itself through a pointer, which walked
+// gives directly.
+func collectSDKNested(st *types.Struct, written map[string]string, out map[string][]string, walked map[*types.Struct]bool) {
+	if walked[st] {
+		return
+	}
+	walked[st] = true
+	var embeds []*types.Struct
+	for i := range st.NumFields() {
+		field := st.Field(i)
+		name := shared.TagName(reflect.StructTag(st.Tag(i)), []string{tagKeyJSON})
+		if field.Embedded() && name == "" {
+			if embedded, ok := structUnder(field.Type()); ok {
+				embeds = append(embeds, embedded)
+				continue
+			}
+		}
+		if name == "" {
+			name = field.Name()
+		}
+		if _, recorded := out[name]; recorded || written[name] != types.TypeString(field.Type(), shortQualifier) {
+			continue
+		}
+		_, nested, isSDK := clientGoNamedStruct(elementType(field.Type()))
+		if !isSDK {
+			continue
+		}
+		if names := sdkFieldNames(nested); len(names) > 0 {
+			out[name] = names
+		}
+	}
+	for _, embedded := range embeds {
+		collectSDKNested(embedded, written, out, walked)
+	}
 }
