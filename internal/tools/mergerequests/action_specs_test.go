@@ -237,9 +237,11 @@ func TestActionSpecs_ListGlobal_SaysWhatAnOmittedScopeReturns(t *testing.T) {
 // promising the refusal on every 19.5 instance told a fine-grained token
 // without Metadata: Read the opposite of what it gets. A node that has not
 // received the new route also uses the deprecated route after its 404.
+// That route returns the merge request only on success; a refused fallback
+// reports its own error instead.
 func TestActionSpecs_CancelAutoMerge_SaysTheRefusalNeedsAnAvailableRoute(t *testing.T) {
 	usage := mergeRequestSpecsByTool(t, ActionSpecs(testutil.NewTestClient(t, testutil.ForbiddenHandler(t))))["gitlab_mr_cancel_auto_merge"].Usage
-	for _, fragment := range []string{"known to run GitLab 19.5 or later", "cancel_auto_merge is available", "is refused", "version cannot be read", "route answers 404 uses the deprecated route", "merge request as it is"} {
+	for _, fragment := range []string{"known to run GitLab 19.5 or later", "cancel_auto_merge is available", "is refused", "version cannot be read", "route answers 404 uses the deprecated route", "merge request as it is on success", "reports its error if it fails"} {
 		t.Run(fragment, func(t *testing.T) {
 			if !strings.Contains(usage, fragment) {
 				t.Errorf("Usage = %q, want it to carry %q", usage, fragment)
