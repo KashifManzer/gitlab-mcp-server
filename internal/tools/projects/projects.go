@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	gl "gitlab.com/gitlab-org/api/client-go/v3"
@@ -230,6 +231,58 @@ type CreateInput struct {
 
 	// Deprecated fields surfaced for 1:1 SDK parity
 	TagList []string `json:"tag_list,omitempty" jsonschema:"Project tags (deprecated: use topics)"`
+
+	// Avatar is uploaded with the create, which GitLab takes only as a
+	// multipart form.
+	Avatar *AvatarInput `json:"avatar,omitempty" jsonschema:"Avatar image to upload with the project, from a local file or base64 content"`
+}
+
+// AvatarInput is an image a project create uploads as the new project's
+// avatar, as [gl.ProjectAvatar] carries it: the file name GitLab reads the
+// image type from, and the content, from a local file or as base64.
+type AvatarInput struct {
+	Filename      string `json:"filename" jsonschema:"Avatar file name such as avatar.png, whose extension GitLab reads the image type from,required"`
+	FilePath      string `json:"file_path,omitempty" jsonschema:"Absolute path to a local image file on the MCP server filesystem. Alternative to content_base64 for files too large to base64-encode. Only one of file_path or content_base64 should be provided."`
+	ContentBase64 string `json:"content_base64,omitempty" jsonschema:"Base64-encoded image content. Only one of file_path or content_base64 should be provided."`
+}
+
+// openAvatar opens the image an avatar input names, nil for no avatar, with
+// the function that releases it.
+func openAvatar(op string, in *AvatarInput) (*gl.ProjectAvatar, func(), error) {
+	if in == nil {
+		return nil, func() { /* no avatar: nothing to release */ }, nil
+	}
+	if in.Filename == "" {
+		return nil, nil, fmt.Errorf("%s: avatar.filename is required with an avatar, since GitLab reads the image type from its extension", op)
+	}
+	reader, _, release, err := toolutil.OpenFileOrBase64Source(op+" avatar", in.FilePath, in.ContentBase64)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &gl.ProjectAvatar{Filename: in.Filename, Image: reader}, release, nil
+}
+
+// attachAvatar puts an avatar on the create options. With one, client-go
+// sends the create as a multipart upload (UploadRequest), which writes only
+// the first value of each field, so the topics and the tags go as one
+// comma-separated value, which GitLab splits back into the list
+// (CommaSeparatedToArray) a JSON body would have carried.
+func attachAvatar(opts *gl.CreateProjectOptions, avatar *gl.ProjectAvatar) {
+	if avatar == nil {
+		return
+	}
+	opts.Avatar = avatar
+	opts.Topics = commaJoined(opts.Topics)
+	opts.TagList = commaJoined(opts.TagList) //nolint:staticcheck // 1:1 SDK parity; prefer topics.
+}
+
+// commaJoined returns a list as its one comma-separated element, nil for
+// none.
+func commaJoined(list *[]string) *[]string {
+	if list == nil {
+		return nil
+	}
+	return new([]string{strings.Join(*list, ",")})
 }
 
 // BasicOutput is a project as API::Entities::BasicProjectDetails renders it:
@@ -663,6 +716,11 @@ type UpdateInput struct {
 	SecurityAndComplianceAccessLevel string `json:"security_and_compliance_access_level,omitempty" jsonschema:"Security and compliance access level (disabled, private, enabled)"`
 	ModelExperimentsAccessLevel      string `json:"model_experiments_access_level,omitempty" jsonschema:"Model experiments access level (disabled, private, enabled)"`
 	ModelRegistryAccessLevel         string `json:"model_registry_access_level,omitempty" jsonschema:"Model registry access level (disabled, private, enabled)"`
+
+	// RemoveAvatar sends avatar as an empty value, which PUT /projects/:id
+	// maps to CarrierWave's remove_avatar (lib/api/projects.rb). A new
+	// image goes through project.upload_avatar.
+	RemoveAvatar bool `json:"remove_avatar,omitempty" jsonschema:"Remove the project's avatar. To replace it instead, use project.upload_avatar"`
 }
 
 // projectOutput finishes a handler that answers with one project: it reads the
@@ -1209,6 +1267,12 @@ func Create(ctx context.Context, client *gitlabclient.Client, input CreateInput)
 		return Output{}, errors.New("projectCreate: name or path is required. Give the project a name, a path or both, and GitLab derives the one left out")
 	}
 	opts := buildCreateOpts(input)
+	avatar, release, err := openAvatar("projectCreate", input.Avatar)
+	if err != nil {
+		return Output{}, err
+	}
+	defer release()
+	attachAvatar(opts, avatar)
 	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	p, _, err := client.GL().Projects.CreateProject(opts, gl.WithContext(ctx))
 	if err != nil {
@@ -1478,6 +1542,12 @@ func buildUpdateOpts(input UpdateInput) (*gl.EditProjectOptions, toolutil.BodyEd
 		opts.OnlyAllowMergeIfAllDiscussionsAreResolved = input.OnlyAllowMergeIfAllDiscussionsAreResolved
 	}
 	applyUpdateFeatureOpts(opts, input)
+	if input.RemoveAvatar {
+		// An avatar with neither a file name nor an image is the one
+		// client-go writes as "avatar": "" in the JSON body rather than
+		// uploading.
+		opts.Avatar = &gl.ProjectAvatar{}
+	}
 	// GitLab stores neither limit as 0: the artifact size must be above 0 and
 	// pipelines are kept at least a day. Each goes back to its default, the
 	// instance's limit and no deletion, only on null, which client-go's
@@ -4016,6 +4086,12 @@ func CreateForUser(ctx context.Context, client *gitlabclient.Client, input Creat
 	create := input.CreateInput
 	create.Name = input.Name
 	createOpts := buildCreateOpts(create)
+	avatar, release, err := openAvatar("projectCreateForUser", input.Avatar)
+	if err != nil {
+		return Output{}, err
+	}
+	defer release()
+	attachAvatar(createOpts, avatar)
 	opts := (*gl.CreateProjectForUserOptions)(createOpts)
 	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	p, _, err := client.GL().Projects.CreateProjectForUser(input.UserID, opts, gl.WithContext(ctx))

@@ -186,29 +186,38 @@ func ExportDownload(ctx context.Context, client *gitlabclient.Client, input Expo
 // Import From File
 // ---------------------------------------------------------------------------.
 
-// ImportOverrideParamsInput mirrors the project-create attributes that GitLab
-// accepts under the import-from-file `override_params` field. It maps to
-// [gl.CreateProjectOptions] (the type of [gl.ImportFileOptions.OverrideParams]).
+// ImportOverrideParamsInput mirrors the project attributes an import from
+// file applies from its `override_params` field: every one that
+// [gl.CreateProjectOptions] (the type of [gl.ImportFileOptions.OverrideParams])
+// models and the import keeps. Only set fields are forwarded, so a boolean or
+// a number is a pointer: overriding a setting the export carries as true with
+// false is the point of the field.
 //
-// GitLab documents override_params as accepting the full set of create-project
-// attributes (the entire [gl.CreateProjectOptions] set, ~79 fields). Exposing
-// all of them as flat MCP input fields would bloat this tool's schema and
-// duplicate the dedicated gitlab_project create/update tools, so this struct
-// deliberately surfaces only the commonly-overridden subset a user realistically
-// changes during an import (identity, visibility, default branch, merge method,
-// access-request/LFS/shared-runner toggles, and the high-traffic feature access
-// levels). Full project configuration remains available via the dedicated
-// gitlab_project create/update tools. Only set fields are forwarded.
+// The project's name, path and namespace are not among them: GitLab declares
+// them as the import's own params and not under override_params, whose
+// declared params (optional_project_params) Grape keeps alone, so an
+// override_params name, path, namespace_id or default_branch was dropped.
+// The name, path and namespace of [ImportFromFileInput] place the project.
+//
+// Nor is any key GitLab declares under override_params and the import never
+// applies. The tree restorer merges the overrides into the archive's project
+// attributes and keeps only those import_export.yml permits for a project
+// (Gitlab::ImportExport::AttributesPermitter, through
+// Group::RelationTreeRestorer#filter_attributes), which leaves out the CI/CD
+// configuration path, the cleanup policy, the email, mirroring, runner and
+// template settings among others, and excludes lfs_enabled, mirror,
+// repository_storage and tag_list by name. Two keys it permits are left out
+// too, because the restorer cannot assign them: topics is the project's
+// association with Projects::Topic, which a list of names does not fill, and
+// the project has no jobs_enabled (lib/api/projects.rb renames it to
+// builds_enabled for the create and the edit alone), so either one fails the
+// restore and the import with it. builds_access_level sets what jobs_enabled
+// would.
 type ImportOverrideParamsInput struct {
-	Name                         string `json:"name,omitempty" jsonschema:"Override the imported project's name"`
-	Path                         string `json:"path,omitempty" jsonschema:"Override the imported project's URL path (slug)"`
-	NamespaceID                  *int64 `json:"namespace_id,omitempty" jsonschema:"Override the namespace ID the imported project is created in"`
 	Description                  string `json:"description,omitempty" jsonschema:"Override the imported project's description"`
 	Visibility                   string `json:"visibility,omitempty" jsonschema:"Override visibility level (private, internal, public)"`
-	DefaultBranch                string `json:"default_branch,omitempty" jsonschema:"Override the default branch name"`
 	MergeMethod                  string `json:"merge_method,omitempty" jsonschema:"Override merge method (merge, rebase_merge, ff)"`
 	RequestAccessEnabled         *bool  `json:"request_access_enabled,omitempty" jsonschema:"Override whether users can request access"`
-	LFSEnabled                   *bool  `json:"lfs_enabled,omitempty" jsonschema:"Override Git LFS enablement"`
 	SharedRunnersEnabled         *bool  `json:"shared_runners_enabled,omitempty" jsonschema:"Override whether shared (instance) CI runners are enabled"`
 	IssuesAccessLevel            string `json:"issues_access_level,omitempty" jsonschema:"Override issues access level (disabled, private, enabled)"`
 	MergeRequestsAccessLevel     string `json:"merge_requests_access_level,omitempty" jsonschema:"Override merge requests access level (disabled, private, enabled)"`
@@ -216,11 +225,58 @@ type ImportOverrideParamsInput struct {
 	BuildsAccessLevel            string `json:"builds_access_level,omitempty" jsonschema:"Override CI/CD builds access level (disabled, private, enabled)"`
 	SnippetsAccessLevel          string `json:"snippets_access_level,omitempty" jsonschema:"Override snippets access level (disabled, private, enabled)"`
 	ContainerRegistryAccessLevel string `json:"container_registry_access_level,omitempty" jsonschema:"Override container registry access level (disabled, private, enabled)"`
+
+	RepositoryAccessLevel            string `json:"repository_access_level,omitempty" jsonschema:"Override repository access level (disabled, private, enabled)"`
+	ForkingAccessLevel               string `json:"forking_access_level,omitempty" jsonschema:"Override forking access level (disabled, private, enabled)"`
+	AnalyticsAccessLevel             string `json:"analytics_access_level,omitempty" jsonschema:"Override analytics access level (disabled, private, enabled)"`
+	PagesAccessLevel                 string `json:"pages_access_level,omitempty" jsonschema:"Override Pages access level (disabled, private, enabled, public)"`
+	PackageRegistryAccessLevel       string `json:"package_registry_access_level,omitempty" jsonschema:"Override package registry access level (disabled, private, enabled)"`
+	ReleasesAccessLevel              string `json:"releases_access_level,omitempty" jsonschema:"Override releases access level (disabled, private, enabled)"`
+	EnvironmentsAccessLevel          string `json:"environments_access_level,omitempty" jsonschema:"Override environments access level (disabled, private, enabled)"`
+	FeatureFlagsAccessLevel          string `json:"feature_flags_access_level,omitempty" jsonschema:"Override feature flags access level (disabled, private, enabled)"`
+	InfrastructureAccessLevel        string `json:"infrastructure_access_level,omitempty" jsonschema:"Override infrastructure access level (disabled, private, enabled)"`
+	MonitorAccessLevel               string `json:"monitor_access_level,omitempty" jsonschema:"Override monitor access level (disabled, private, enabled)"`
+	RequirementsAccessLevel          string `json:"requirements_access_level,omitempty" jsonschema:"Override requirements access level (disabled, private, enabled)"`
+	SecurityAndComplianceAccessLevel string `json:"security_and_compliance_access_level,omitempty" jsonschema:"Override security and compliance access level (disabled, private, enabled)"`
+	ModelExperimentsAccessLevel      string `json:"model_experiments_access_level,omitempty" jsonschema:"Override model experiments access level (disabled, private, enabled)"`
+	ModelRegistryAccessLevel         string `json:"model_registry_access_level,omitempty" jsonschema:"Override model registry access level (disabled, private, enabled)"`
+
+	SquashOption                              string `json:"squash_option,omitempty" jsonschema:"Override the squash option (never, always, default_on, default_off)"`
+	OnlyAllowMergeIfPipelineSucceeds          *bool  `json:"only_allow_merge_if_pipeline_succeeds,omitempty" jsonschema:"Override whether a merge waits for a successful pipeline"`
+	OnlyAllowMergeIfAllDiscussionsAreResolved *bool  `json:"only_allow_merge_if_all_discussions_are_resolved,omitempty" jsonschema:"Override whether a merge waits for every discussion to be resolved"`
+	AllowMergeOnSkippedPipeline               *bool  `json:"allow_merge_on_skipped_pipeline,omitempty" jsonschema:"Override whether a merge is allowed when the pipeline is skipped"`
+	RemoveSourceBranchAfterMerge              *bool  `json:"remove_source_branch_after_merge,omitempty" jsonschema:"Override whether the source branch is removed after a merge by default"`
+	AutocloseReferencedIssues                 *bool  `json:"autoclose_referenced_issues,omitempty" jsonschema:"Override whether a merge closes the issues it references"`
+	ResolveOutdatedDiffDiscussions            *bool  `json:"resolve_outdated_diff_discussions,omitempty" jsonschema:"Override whether outdated diff discussions are resolved on push"`
+	PrintingMergeRequestLinkEnabled           *bool  `json:"printing_merge_request_link_enabled,omitempty" jsonschema:"Override whether a push prints the create-merge-request link"`
+	MergeCommitTemplate                       string `json:"merge_commit_template,omitempty" jsonschema:"Override the merge commit message template"`
+	SquashCommitTemplate                      string `json:"squash_commit_template,omitempty" jsonschema:"Override the squash commit message template"`
+	SuggestionCommitMessage                   string `json:"suggestion_commit_message,omitempty" jsonschema:"Override the default commit message for applied suggestions"`
+	ApprovalsBeforeMerge                      *int64 `json:"approvals_before_merge,omitempty" tier:"premium" jsonschema:"Override how many approvals a merge request needs (deprecated: use the merge request approvals API)"`
+
+	ServiceDeskEnabled *bool `json:"service_desk_enabled,omitempty" jsonschema:"Override whether Service Desk is enabled"`
+	AutoDevopsEnabled  *bool `json:"auto_devops_enabled,omitempty" jsonschema:"Override whether Auto DevOps is enabled"`
+
+	AutoDevopsDeployStrategy                 string `json:"auto_devops_deploy_strategy,omitempty" jsonschema:"Override the Auto DevOps deploy strategy (continuous, manual, timed_incremental)"`
+	AutoCancelPendingPipelines               string `json:"auto_cancel_pending_pipelines,omitempty" jsonschema:"Override whether pending pipelines are auto-canceled (enabled, disabled)"`
+	BuildGitStrategy                         string `json:"build_git_strategy,omitempty" jsonschema:"Override the Git strategy of jobs (fetch, clone)"`
+	BuildTimeout                             *int64 `json:"build_timeout,omitempty" jsonschema:"Override the job timeout in seconds"`
+	ExternalAuthorizationClassificationLabel string `json:"external_authorization_classification_label,omitempty" jsonschema:"Override the external authorization classification label"`
+
+	// The deprecated toggles GitLab still declares under override_params
+	// and the import applies, each sent as the caller gives it.
+	IssuesEnabled            *bool `json:"issues_enabled,omitempty" jsonschema:"Override whether issues are enabled (deprecated: use issues_access_level)"`
+	MergeRequestsEnabled     *bool `json:"merge_requests_enabled,omitempty" jsonschema:"Override whether merge requests are enabled (deprecated: use merge_requests_access_level)"`
+	WikiEnabled              *bool `json:"wiki_enabled,omitempty" jsonschema:"Override whether the wiki is enabled (deprecated: use wiki_access_level)"`
+	SnippetsEnabled          *bool `json:"snippets_enabled,omitempty" jsonschema:"Override whether snippets are enabled (deprecated: use snippets_access_level)"`
+	ContainerRegistryEnabled *bool `json:"container_registry_enabled,omitempty" jsonschema:"Override whether the container registry is enabled (deprecated: use container_registry_access_level)"`
+	PublicBuilds             *bool `json:"public_builds,omitempty" jsonschema:"Override whether pipelines and job logs are public (the import applies this name, not public_jobs)"`
 }
 
 // ImportFromFileInput is the input for importing a project from an archive
-// file. Fields mirror [gl.ImportFileOptions] 1:1 (override_params is exposed as
-// a curated nested struct over [gl.CreateProjectOptions]).
+// file. Fields mirror [gl.ImportFileOptions] 1:1, override_params as the
+// nested struct over [gl.CreateProjectOptions] that ImportOverrideParamsInput
+// mirrors.
 type ImportFromFileInput struct {
 	FilePath       string                     `json:"file_path,omitempty" jsonschema:"Canonical path to a local export archive (.tar.gz) under the current working directory, OS temp directory, or GITLAB_MCP_ALLOWED_IMPORT_DIRS. Symlinks are resolved and escapes are rejected. Only one of file_path or content_base64 should be provided."`
 	ContentBase64  string                     `json:"content_base64,omitempty" jsonschema:"Base64-encoded export archive content. Only one of file_path or content_base64 should be provided."`
@@ -461,92 +517,117 @@ func GetImportStatus(ctx context.Context, client *gitlabclient.Client, input Get
 // Helpers
 // ---------------------------------------------------------------------------.
 
-// buildOverrideParams maps the curated [ImportOverrideParamsInput] onto the
-// SDK's [gl.CreateProjectOptions] used by [gl.ImportFileOptions.OverrideParams].
+// buildOverrideParams maps [ImportOverrideParamsInput] onto the SDK's
+// [gl.CreateProjectOptions] used by [gl.ImportFileOptions.OverrideParams].
 // It returns nil when no override field is set so the API receives no
 // override_params payload.
 func buildOverrideParams(in *ImportOverrideParamsInput) *gl.CreateProjectOptions {
 	if in == nil {
 		return nil
 	}
-	opts := &gl.CreateProjectOptions{}
-	set := false
-	if in.Name != "" {
-		opts.Name = new(in.Name)
-		set = true
-	}
-	if in.Path != "" {
-		opts.Path = new(in.Path)
-		set = true
-	}
-	if in.NamespaceID != nil {
-		opts.NamespaceID = in.NamespaceID
-		set = true
-	}
-	if in.Description != "" {
-		opts.Description = new(in.Description)
-		set = true
+	opts := &gl.CreateProjectOptions{
+		Description:          optionalString(in.Description),
+		RequestAccessEnabled: in.RequestAccessEnabled,
+		SharedRunnersEnabled: in.SharedRunnersEnabled,
 	}
 	if in.Visibility != "" {
-		v := gl.VisibilityValue(in.Visibility)
-		opts.Visibility = &v
-		set = true
+		opts.Visibility = new(gl.VisibilityValue(in.Visibility))
 	}
-	if in.DefaultBranch != "" {
-		opts.DefaultBranch = new(in.DefaultBranch)
-		set = true
-	}
-	if in.MergeMethod != "" {
-		m := gl.MergeMethodValue(in.MergeMethod)
-		opts.MergeMethod = &m
-		set = true
-	}
-	if in.RequestAccessEnabled != nil {
-		opts.RequestAccessEnabled = in.RequestAccessEnabled
-		set = true
-	}
-	if in.LFSEnabled != nil {
-		opts.LFSEnabled = in.LFSEnabled
-		set = true
-	}
-	if in.SharedRunnersEnabled != nil {
-		opts.SharedRunnersEnabled = in.SharedRunnersEnabled
-		set = true
-	}
-	if in.IssuesAccessLevel != "" {
-		v := gl.AccessControlValue(in.IssuesAccessLevel)
-		opts.IssuesAccessLevel = &v
-		set = true
-	}
-	if in.MergeRequestsAccessLevel != "" {
-		v := gl.AccessControlValue(in.MergeRequestsAccessLevel)
-		opts.MergeRequestsAccessLevel = &v
-		set = true
-	}
-	if in.WikiAccessLevel != "" {
-		v := gl.AccessControlValue(in.WikiAccessLevel)
-		opts.WikiAccessLevel = &v
-		set = true
-	}
-	if in.BuildsAccessLevel != "" {
-		v := gl.AccessControlValue(in.BuildsAccessLevel)
-		opts.BuildsAccessLevel = &v
-		set = true
-	}
-	if in.SnippetsAccessLevel != "" {
-		v := gl.AccessControlValue(in.SnippetsAccessLevel)
-		opts.SnippetsAccessLevel = &v
-		set = true
-	}
-	if in.ContainerRegistryAccessLevel != "" {
-		v := gl.AccessControlValue(in.ContainerRegistryAccessLevel)
-		opts.ContainerRegistryAccessLevel = &v
-		set = true
-	}
-	if !set {
+	applyOverrideAccessLevels(opts, in)
+	applyOverrideMergeSettings(opts, in)
+	applyOverrideFeatureSettings(opts, in)
+	applyOverrideDeprecatedToggles(opts, in)
+	if *opts == (gl.CreateProjectOptions{}) {
 		return nil
 	}
 	return opts
+}
+
+// applyOverrideAccessLevels sets the feature access levels an override names.
+func applyOverrideAccessLevels(opts *gl.CreateProjectOptions, in *ImportOverrideParamsInput) {
+	opts.IssuesAccessLevel = accessLevel(in.IssuesAccessLevel)
+	opts.MergeRequestsAccessLevel = accessLevel(in.MergeRequestsAccessLevel)
+	opts.WikiAccessLevel = accessLevel(in.WikiAccessLevel)
+	opts.BuildsAccessLevel = accessLevel(in.BuildsAccessLevel)
+	opts.SnippetsAccessLevel = accessLevel(in.SnippetsAccessLevel)
+	opts.ContainerRegistryAccessLevel = accessLevel(in.ContainerRegistryAccessLevel)
+	opts.RepositoryAccessLevel = accessLevel(in.RepositoryAccessLevel)
+	opts.ForkingAccessLevel = accessLevel(in.ForkingAccessLevel)
+	opts.AnalyticsAccessLevel = accessLevel(in.AnalyticsAccessLevel)
+	opts.PagesAccessLevel = accessLevel(in.PagesAccessLevel)
+	opts.PackageRegistryAccessLevel = accessLevel(in.PackageRegistryAccessLevel)
+	opts.ReleasesAccessLevel = accessLevel(in.ReleasesAccessLevel)
+	opts.EnvironmentsAccessLevel = accessLevel(in.EnvironmentsAccessLevel)
+	opts.FeatureFlagsAccessLevel = accessLevel(in.FeatureFlagsAccessLevel)
+	opts.InfrastructureAccessLevel = accessLevel(in.InfrastructureAccessLevel)
+	opts.MonitorAccessLevel = accessLevel(in.MonitorAccessLevel)
+	opts.RequirementsAccessLevel = accessLevel(in.RequirementsAccessLevel)
+	opts.SecurityAndComplianceAccessLevel = accessLevel(in.SecurityAndComplianceAccessLevel)
+	opts.ModelExperimentsAccessLevel = accessLevel(in.ModelExperimentsAccessLevel)
+	opts.ModelRegistryAccessLevel = accessLevel(in.ModelRegistryAccessLevel)
+}
+
+// applyOverrideMergeSettings sets the merge request settings an override
+// names.
+func applyOverrideMergeSettings(opts *gl.CreateProjectOptions, in *ImportOverrideParamsInput) {
+	if in.MergeMethod != "" {
+		opts.MergeMethod = new(gl.MergeMethodValue(in.MergeMethod))
+	}
+	if in.SquashOption != "" {
+		opts.SquashOption = new(gl.SquashOptionValue(in.SquashOption))
+	}
+	opts.OnlyAllowMergeIfPipelineSucceeds = in.OnlyAllowMergeIfPipelineSucceeds
+	opts.OnlyAllowMergeIfAllDiscussionsAreResolved = in.OnlyAllowMergeIfAllDiscussionsAreResolved
+	opts.AllowMergeOnSkippedPipeline = in.AllowMergeOnSkippedPipeline
+	opts.RemoveSourceBranchAfterMerge = in.RemoveSourceBranchAfterMerge
+	opts.AutocloseReferencedIssues = in.AutocloseReferencedIssues
+	opts.ResolveOutdatedDiffDiscussions = in.ResolveOutdatedDiffDiscussions
+	opts.PrintingMergeRequestLinkEnabled = in.PrintingMergeRequestLinkEnabled
+	opts.MergeCommitTemplate = optionalString(in.MergeCommitTemplate)
+	opts.SquashCommitTemplate = optionalString(in.SquashCommitTemplate)
+	opts.SuggestionCommitMessage = optionalString(in.SuggestionCommitMessage)
+	opts.ApprovalsBeforeMerge = in.ApprovalsBeforeMerge //nolint:staticcheck // 1:1 with the param GitLab declares under override_params; the approvals API is its replacement.
+}
+
+// applyOverrideFeatureSettings sets the feature and CI/CD settings an
+// override names.
+func applyOverrideFeatureSettings(opts *gl.CreateProjectOptions, in *ImportOverrideParamsInput) {
+	opts.ServiceDeskEnabled = in.ServiceDeskEnabled
+	opts.AutoDevopsEnabled = in.AutoDevopsEnabled
+	opts.AutoDevopsDeployStrategy = optionalString(in.AutoDevopsDeployStrategy)
+	opts.AutoCancelPendingPipelines = optionalString(in.AutoCancelPendingPipelines)
+	opts.BuildGitStrategy = optionalString(in.BuildGitStrategy)
+	opts.BuildTimeout = in.BuildTimeout
+	opts.ExternalAuthorizationClassificationLabel = optionalString(in.ExternalAuthorizationClassificationLabel)
+}
+
+// applyOverrideDeprecatedToggles sets the deprecated toggles GitLab still
+// declares under override_params and the import applies, each as the caller
+// gave it.
+func applyOverrideDeprecatedToggles(opts *gl.CreateProjectOptions, in *ImportOverrideParamsInput) {
+	opts.IssuesEnabled = in.IssuesEnabled                       //nolint:staticcheck // 1:1 with the declared param; prefer issues_access_level.
+	opts.MergeRequestsEnabled = in.MergeRequestsEnabled         //nolint:staticcheck // 1:1 with the declared param; prefer merge_requests_access_level.
+	opts.WikiEnabled = in.WikiEnabled                           //nolint:staticcheck // 1:1 with the declared param; prefer wiki_access_level.
+	opts.SnippetsEnabled = in.SnippetsEnabled                   //nolint:staticcheck // 1:1 with the declared param; prefer snippets_access_level.
+	opts.ContainerRegistryEnabled = in.ContainerRegistryEnabled //nolint:staticcheck // 1:1 with the declared param; prefer container_registry_access_level.
+	opts.PublicBuilds = in.PublicBuilds                         //nolint:staticcheck // 1:1 with the declared param, the name the import applies.
+}
+
+// optionalString returns a pointer to s, or nil for the empty string so an
+// override left out is not sent.
+func optionalString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return new(s)
+}
+
+// accessLevel returns s as an access level, or nil for the empty string.
+func accessLevel(s string) *gl.AccessControlValue {
+	if s == "" {
+		return nil
+	}
+	return new(gl.AccessControlValue(s))
 }
 
 // ---------------------------------------------------------------------------

@@ -18,14 +18,16 @@ const (
 	// client-go models the param.
 	categoryUpstream = "upstream"
 	// categoryDeclaredNotApplied is a param GitLab declares on the route and
-	// drops before it acts, so offering it would offer nothing.
+	// drops before it acts, or cannot apply, so offering it would offer
+	// nothing. It answers a param no input offers alone.
 	categoryDeclaredNotApplied = "declared-not-applied"
 	// categoryMapInput is a route whose action takes its params as a free
 	// map the caller fills, so every param GitLab declares is offered by
 	// the map and none by name.
 	categoryMapInput = "map-input"
 	// categoryWebhookPayload is a param of a payload another service posts
-	// to the route, which no caller of an action chooses.
+	// to the route, which no caller of an action chooses. It answers a param
+	// no input offers alone.
 	categoryWebhookPayload = "webhook-payload"
 	// categoryBranchNotTaken is a param of a route the client-go method
 	// sends only for an argument the handler never passes, so the action
@@ -63,9 +65,17 @@ type paramDeclaration struct {
 // offers what the struct it is decoded into carries, or, sent as it is,
 // whatever the caller writes, so it answers a param an option struct models
 // and a param whose options are a free map, and never one neither can send.
+// A param GitLab drops, or a payload another service posts, is one no input
+// should offer, so those two answer a param no input offers and never an
+// offered one: an input that starts offering a key GitLab drops is a finding
+// again rather than an offer the declaration hides. A branch not taken
+// answers any class, since what its route's input offers goes to the route
+// the method takes instead.
 var answeredClasses = map[string][]string{
-	categoryUpstream: {ClassUnmodeled},
-	categoryMapInput: {ClassNotOffered, ClassUnjudged},
+	categoryUpstream:           {ClassUnmodeled},
+	categoryMapInput:           {ClassNotOffered, ClassUnjudged},
+	categoryDeclaredNotApplied: {ClassUnmodeled, ClassNotOffered, ClassUnjudged},
+	categoryWebhookPayload:     {ClassUnmodeled, ClassNotOffered, ClassUnjudged},
 }
 
 // answers reports whether the declaration answers a finding: on its route,
@@ -155,11 +165,28 @@ func paramDeclarations() []paramDeclaration {
 		reasonDuoOnCreate = "ee/lib/ee/api/helpers/projects_helpers.rb filter_duo_vulnerability_attributes! deletes " +
 			"duo_sast_fp_detection_enabled, duo_sast_vr_workflow_enabled, duo_secret_detection_fp_enabled and " +
 			"duo_dependency_bump_breaking_changes_enabled unless params[:id] is present, so a create applies none of them"
+		reasonDeploymentMRs = "lib/api/deployments.rb takes merge_requests_base_params on GET :id/deployments/:deployment_id/merge_requests " +
+			"and presents Entities::MergeRequestBasic with current_user alone: view, with_labels_details and " +
+			"with_merge_status_recheck become presenter options only through serializer_options_for in lib/api/merge_requests.rb, " +
+			"which this route does not call, and MergeRequestsFinder reads none of them, so the route applies none"
+		reasonProjectChecksums = "ee/lib/ee/api/helpers/projects_helpers.rb:38-42 at v19.5.0-ee declares repository_checksum_failed " +
+			"and wiki_checksum_failed among the optional_filter_params_ee of every route that takes the project list filters, " +
+			"and nothing reads them: the finder params the routes build carry neither (EE::API::Helpers#project_finder_params_ee, " +
+			"ee/lib/ee/api/helpers.rb:119-127) and no finder, model or service names them, so a list applies neither"
+		reasonImportNotRestored = "the import's tree restorer merges override_params into the archive's project attributes " +
+			"and keeps only those lib/gitlab/import_export/project/import_export.yml permits for a project " +
+			"(Gitlab::ImportExport::AttributesPermitter, through Group::RelationTreeRestorer#filter_attributes), " +
+			"and this key is not among them, so the import drops it"
+		reasonImportNotAssignable = "lib/gitlab/import_export/project/import_export.yml permits this key for a project, " +
+			"and Group::RelationTreeRestorer#update_params! hands it to Project#assign_attributes, which cannot take it: " +
+			"topics is the has_many :topics association with Projects::Topic (app/models/project.rb), which a list of names " +
+			"does not fill, and the project has no jobs_enabled writer (lib/api/projects.rb renames it to builds_enabled for " +
+			"the create and the edit alone), so either one raises, the restore fails and the import with it"
 		reasonMirrorWebhook = "ee/lib/api/project_mirror.rb declares action and the pull_request.* keys for the GitHub " +
 			"pull request event a webhook posts to the route (ProcessGithubEventService), which no caller of an action writes"
 		reasonPlanLimits    = "ChangePlanLimitOptions models eight of the twenty-nine limits PUT /application/plan_limits takes"
 		reasonRow133Groups  = "UpdateGroupOptions and CreateGroupOptions lack the group params GitLab 19.5 added"
-		reasonRow133Duo     = "the project create, create-for-user, edit and import options lack duo_code_review_decisions_enabled"
+		reasonRow133Duo     = "the project create, create-for-user and edit options lack duo_code_review_decisions_enabled"
 		reasonRow133Account = "CreateServiceAccountUserOptions and UpdateServiceAccountOptions lack external"
 		reasonRow133Search  = "SearchOptions lacks the merge request filters the group and project search routes take"
 		reasonLabelRoutes   = "client-go's UpdateLabel, DeleteLabel, UpdateGroupLabel and DeleteGroupLabel send the " +
@@ -183,6 +210,42 @@ func paramDeclarations() []paramDeclaration {
 		} {
 			declared = append(declared, paramDeclaration{Route: route, Param: param, Category: categoryDeclaredNotApplied, Reason: reasonDuoOnCreate})
 		}
+	}
+	for _, param := range []string{"view", "with_labels_details", "with_merge_status_recheck"} {
+		declared = append(declared, paramDeclaration{
+			Route: "GET /projects/:id/deployments/:deployment_id/merge_requests", Param: param,
+			Category: categoryDeclaredNotApplied, Reason: reasonDeploymentMRs,
+		})
+	}
+	for _, route := range []string{
+		"GET /projects", "GET /projects/:id/forks", "GET /users/:user_id/projects", "GET /users/:user_id/starred_projects",
+	} {
+		for _, param := range []string{"repository_checksum_failed", "wiki_checksum_failed"} {
+			declared = append(declared, paramDeclaration{Route: route, Param: param, Category: categoryDeclaredNotApplied, Reason: reasonProjectChecksums})
+		}
+	}
+	for _, key := range []string{
+		"auto_duo_code_review_enabled", "avatar", "ci_config_path", "cicd_catalog_enabled",
+		"container_expiration_policy_attributes", "duo_code_review_decisions_enabled",
+		"duo_dependency_bump_breaking_changes_enabled", "duo_remote_flows_enabled", "duo_sast_fp_detection_enabled",
+		"duo_sast_vr_workflow_enabled", "duo_secret_detection_fp_enabled", "emails_disabled", "emails_enabled",
+		"enforce_auth_checks_on_uploads", "group_runners_enabled", "issue_branch_template", "lfs_enabled",
+		"merge_request_title_regex", "merge_request_title_regex_description", "mirror", "mirror_trigger_builds",
+		"mr_default_target_self", "mr_default_title_template", "only_allow_merge_if_all_status_checks_passed",
+		"packages_enabled", "prevent_merge_without_jira_issue", "public_jobs", "repository_storage",
+		"resource_group_default_process_mode", "show_default_award_emojis", "show_diff_preview_in_email",
+		"spp_repository_pipeline_access", "tag_list", "warn_about_potentially_unwanted_characters",
+	} {
+		declared = append(declared, paramDeclaration{
+			Route: "POST /projects/import", Param: "override_params[" + key + "]",
+			Category: categoryDeclaredNotApplied, Reason: reasonImportNotRestored,
+		})
+	}
+	for _, key := range []string{"jobs_enabled", "topics"} {
+		declared = append(declared, paramDeclaration{
+			Route: "POST /projects/import", Param: "override_params[" + key + "]",
+			Category: categoryDeclaredNotApplied, Reason: reasonImportNotAssignable,
+		})
 	}
 	for _, param := range []string{
 		"action", "pull_request.base.ref", "pull_request.base.repo.full_name", "pull_request.base.sha",
@@ -210,7 +273,6 @@ func paramDeclarations() []paramDeclaration {
 	for _, route := range []string{"POST /projects", "POST /projects/user/:user_id", "PUT /projects/:id"} {
 		upstream133(route, reasonRow133Duo, "duo_code_review_decisions_enabled")
 	}
-	upstream133("POST /projects/import", reasonRow133Duo, "override_params[duo_code_review_decisions_enabled]")
 	upstream133("POST /service_accounts", reasonRow133Account, "external")
 	upstream133("PATCH /service_accounts/:user_id", reasonRow133Account, "external")
 	for _, route := range []string{"GET /groups/:id/(-/)search", "GET /projects/:id/(-/)search"} {

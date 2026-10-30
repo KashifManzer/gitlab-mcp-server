@@ -1107,6 +1107,10 @@ type CreateInput struct {
 	UniqueProjectDownloadLimitAllowlist         []string `json:"unique_project_download_limit_allowlist,omitempty" tier:"ultimate"             jsonschema:"Usernames excluded from the unique project download limit (Ultimate)"`
 	UniqueProjectDownloadLimitAlertlist         []int64  `json:"unique_project_download_limit_alertlist,omitempty" tier:"ultimate"             jsonschema:"User IDs notified when the unique project download limit is exceeded (Ultimate)"`
 	AutoBanUserOnExcessiveProjectsDownload      *bool    `json:"auto_ban_user_on_excessive_projects_download,omitempty" tier:"ultimate"        jsonschema:"Automatically ban users who exceed the unique project download limit (Ultimate)"`
+
+	// Avatar is uploaded with the create, which GitLab takes only as a
+	// multipart form.
+	Avatar *AvatarInput `json:"avatar,omitempty" jsonschema:"Avatar image to upload with the group, from a local file or base64 content. The upload carries a single value per field, so with it default_branch_protection_defaults may name one access level each for allowed_to_push and allowed_to_merge, and the unique project download alert list is refused (set it with group.update)"`
 }
 
 // UpdateInput defines parameters for updating a group.
@@ -1163,6 +1167,11 @@ type UpdateInput struct {
 	UniqueProjectDownloadLimitAllowlist         []string `json:"unique_project_download_limit_allowlist,omitempty" tier:"ultimate"             jsonschema:"Usernames excluded from the unique project download limit (Ultimate)"`
 	UniqueProjectDownloadLimitAlertlist         []int64  `json:"unique_project_download_limit_alertlist,omitempty" tier:"ultimate"             jsonschema:"User IDs notified when the unique project download limit is exceeded (Ultimate)"`
 	AutoBanUserOnExcessiveProjectsDownload      *bool    `json:"auto_ban_user_on_excessive_projects_download,omitempty" tier:"ultimate"        jsonschema:"Automatically ban users who exceed the unique project download limit (Ultimate)"`
+
+	// RemoveAvatar sends avatar as an empty value, which PUT /groups/:id
+	// answers by removing the group's avatar (lib/api/groups.rb). A new
+	// image goes through group.upload_avatar.
+	RemoveAvatar bool `json:"remove_avatar,omitempty" jsonschema:"Remove the group's avatar. To replace it instead, use group.upload_avatar"`
 }
 
 // DeleteInput defines parameters for deleting a group.
@@ -1299,22 +1308,17 @@ func Create(ctx context.Context, client *gitlabclient.Client, input CreateInput)
 	if input.AllowPersonalSnippets != nil {
 		opts.AllowPersonalSnippets = input.AllowPersonalSnippets
 	}
-	if input.UniqueProjectDownloadLimit != nil {
-		opts.UniqueProjectDownloadLimit = input.UniqueProjectDownloadLimit
-	}
-	if input.UniqueProjectDownloadLimitIntervalInSeconds != nil {
-		opts.UniqueProjectDownloadLimitIntervalInSeconds = input.UniqueProjectDownloadLimitIntervalInSeconds
-	}
-	if len(input.UniqueProjectDownloadLimitAllowlist) > 0 {
-		opts.UniqueProjectDownloadLimitAllowlist = &input.UniqueProjectDownloadLimitAllowlist
-	}
-	if len(input.UniqueProjectDownloadLimitAlertlist) > 0 {
-		opts.UniqueProjectDownloadLimitAlertlist = &input.UniqueProjectDownloadLimitAlertlist
-	}
-	if input.AutoBanUserOnExcessiveProjectsDownload != nil {
-		opts.AutoBanUserOnExcessiveProjectsDownload = input.AutoBanUserOnExcessiveProjectsDownload
-	}
+	applyCreateDownloadLimits(input, opts)
 	applyCreateGroupExtras(input, opts)
+	if input.Avatar != nil && len(input.UniqueProjectDownloadLimitAlertlist) > 0 {
+		return DetailOutput{}, errors.New("groupCreate: unique_project_download_limit_alertlist cannot be sent beside an avatar, since the upload carries it as one string and GitLab reads it as a list of user IDs. Create the group with the avatar, then set the alert list with group.update")
+	}
+	avatar, release, err := openAvatar("groupCreate", input.Avatar)
+	if err != nil {
+		return DetailOutput{}, err
+	}
+	defer release()
+	attachAvatar(opts, avatar)
 
 	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	g, _, err := client.GL().Groups.CreateGroup(opts, gl.WithContext(ctx))
@@ -1325,6 +1329,21 @@ func Create(ctx context.Context, client *gitlabclient.Client, input CreateInput)
 		return DetailOutput{}, toolutil.WrapErrWithMessage("groupCreate", err)
 	}
 	return groupDetail("Create", g, captured)
+}
+
+// applyCreateDownloadLimits copies the unique project download limits onto
+// the create options, each only when the caller gave it. Split out of Create
+// to keep that handler's cyclomatic complexity flat.
+func applyCreateDownloadLimits(input CreateInput, opts *gl.CreateGroupOptions) {
+	opts.UniqueProjectDownloadLimit = input.UniqueProjectDownloadLimit
+	opts.UniqueProjectDownloadLimitIntervalInSeconds = input.UniqueProjectDownloadLimitIntervalInSeconds
+	if len(input.UniqueProjectDownloadLimitAllowlist) > 0 {
+		opts.UniqueProjectDownloadLimitAllowlist = &input.UniqueProjectDownloadLimitAllowlist
+	}
+	if len(input.UniqueProjectDownloadLimitAlertlist) > 0 {
+		opts.UniqueProjectDownloadLimitAlertlist = &input.UniqueProjectDownloadLimitAlertlist
+	}
+	opts.AutoBanUserOnExcessiveProjectsDownload = input.AutoBanUserOnExcessiveProjectsDownload
 }
 
 // applyCreateGroupExtras copies the remaining optional CreateGroup settings
@@ -1401,6 +1420,12 @@ func Update(ctx context.Context, client *gitlabclient.Client, input UpdateInput)
 	}
 	applyUpdateGroupPointers(input, opts)
 	applyUpdateGroupEnums(input, opts)
+	if input.RemoveAvatar {
+		// An avatar with neither a file name nor an image is the one
+		// client-go writes as "avatar": "" in the JSON body rather than
+		// uploading.
+		opts.Avatar = &gl.GroupAvatar{}
+	}
 
 	ctx, captured := gitlabclient.WithResponseCapture(ctx)
 	g, _, err := client.GL().Groups.UpdateGroup(string(input.GroupID), opts, gl.WithContext(ctx))
