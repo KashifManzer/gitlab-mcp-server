@@ -42,7 +42,11 @@ type UnsurfacedField struct {
 	Grain   string `json:"grain"`
 	Package string `json:"package"`
 	// Type is the output type the finding is about, at type grain only.
-	Type  string `json:"type,omitempty"`
+	Type string `json:"type,omitempty"`
+	// Under is the response property a nested type sits under, set on a
+	// nested finding only, as [UnpublishedField.Under] is: one nested type can
+	// sit under several properties, and the object each is read on differs.
+	Under string `json:"under,omitempty"`
 	Field string `json:"field"`
 	// Operations are the endpoints whose responses carry the field, as the
 	// inventory spells them.
@@ -168,10 +172,13 @@ func notModelledBySDK(fields []UnsurfacedField) int {
 }
 
 // sortUnsurfaced orders the findings the way a reader reads them: down the
-// tree, then by type, then by field.
+// tree, then by type, then by the property a nested type sits under, then by
+// field, and last by the client-go struct and the endpoints each was judged
+// against, for the reasons [sortFindings] records.
 func sortUnsurfaced(found []UnsurfacedField) {
 	slices.SortFunc(found, func(a, b UnsurfacedField) int {
-		return cmp.Or(strings.Compare(a.Package, b.Package), strings.Compare(a.Type, b.Type), strings.Compare(a.Field, b.Field))
+		return cmp.Or(strings.Compare(a.Package, b.Package), strings.Compare(a.Type, b.Type), strings.Compare(a.Under, b.Under), strings.Compare(a.Field, b.Field),
+			strings.Compare(a.SDKType, b.SDKType), slices.Compare(a.Operations, b.Operations))
 	})
 }
 
@@ -226,6 +233,15 @@ func sentCheck(conditions *conditionIndex, sources responseSources, published []
 	// as failing to surface the fields of its own rows. A row another tools
 	// package declares (`commits: []commits.Output`) arrives here as a type of
 	// its own, marked borrowed, and counts the same way.
+	//
+	// What an inner type nests is left out. The inner type is itself one level
+	// down, so its nested types are two, and this grain joins on key names
+	// alone: a created_at two levels down would count as the created_at of the
+	// project the vulnerabilities package reads for its own use, and answer a
+	// finding about an object the package never publishes. Counted, nine
+	// package-grain findings of that kind went silent. The type grain,
+	// which judges each nested type under the property it sits under, is
+	// where those are read.
 	publishedBy := map[string]map[string]bool{}
 	for _, publishedType := range published {
 		fields := publishedBy[publishedType.Package]
@@ -235,6 +251,9 @@ func sentCheck(conditions *conditionIndex, sources responseSources, published []
 		}
 		for _, field := range publishedType.Fields {
 			fields[field] = true
+		}
+		if publishedType.Inner {
+			continue
 		}
 		for _, nested := range publishedType.Nested {
 			for _, field := range nested.Fields {
