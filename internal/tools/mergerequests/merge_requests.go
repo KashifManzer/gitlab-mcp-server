@@ -1968,19 +1968,9 @@ const (
 // is not known because its version endpoint did not answer or refused this
 // token, is sent the deprecated cancel_merge_when_pipeline_succeeds, as every
 // instance used to be. A 404 from cancel_auto_merge also falls back to that
-// route: during a rolling upgrade, the node answering the cancel may be older
-// than the one that answered the version read. Other failures are not retried.
-//
-// The deprecated route does not send the merge request back. Its Grape
-// annotation names API::Entities::MergeRequest, which is what the API
-// documentation and docs/development/gitlab-api-live.json both record, but the
-// endpoint ends in AutoMergeService#cancel and renders that service's status
-// hash instead, so the body is {"status":"success"} with no merge request in
-// it. client-go decodes that into a zero-valued struct and reports no error,
-// and this handler used to hand the model an empty object: no IID, no state,
-// no title. A cancel that answers nothing is read back the way
-// toggleSubscription reads back a 304, with a Get of the merge request the
-// caller named.
+// route: the release an instance reports does not always match the routes it
+// serves, as with a node not yet upgraded or a proxy that does not forward the
+// new path. Other failures are not retried.
 func CancelAutoMerge(ctx context.Context, client *gitlabclient.Client, input GetInput) (Output, error) {
 	if err := ctx.Err(); err != nil {
 		return Output{}, err
@@ -2001,6 +1991,17 @@ func CancelAutoMerge(ctx context.Context, client *gitlabclient.Client, input Get
 
 // cancelMergeWhenPipelineSucceedsRoute uses the deprecated route for an older
 // or unknown release, or a node that has not received cancel_auto_merge yet.
+//
+// The deprecated route does not send the merge request back. Its Grape
+// annotation names API::Entities::MergeRequest, which is what the API
+// documentation and docs/development/gitlab-api-live.json both record, but the
+// endpoint ends in AutoMergeService#cancel and renders that service's status
+// hash instead, so the body is {"status":"success"} with no merge request in
+// it. client-go decodes that into a zero-valued struct and reports no error,
+// and this handler used to hand the model an empty object: no IID, no state,
+// no title. A cancel that answers nothing is read back the way
+// toggleSubscription reads back a 304, with a Get of the merge request the
+// caller named.
 func cancelMergeWhenPipelineSucceedsRoute(ctx context.Context, client *gitlabclient.Client, input GetInput) (Output, error) {
 	// The capture rides its own context so the fall-back Get below starts from
 	// the caller's, with a capture of its own.
