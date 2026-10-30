@@ -11429,8 +11429,9 @@ against the styleguide's `code:` is the prevailing idiom rather than a defect.
   version read as an optional request needing Metadata: Read,
   declared in `cmd/gen_action_grants/request_declarations.go` because the
   client's health client reads it outside client-go. Pinned by
-  `TestCancelAutoMerge_NineteenFiveOrLater_PostsToCancelAutoMergeOnly` and
-  `TestCancelAutoMerge_OlderOrUnknownInstance_KeepsTheDeprecatedRoute`. What
+  `TestCancelAutoMerge_NineteenFiveOrLater_PostsToCancelAutoMergeOnly`,
+  `TestCancelAutoMerge_OlderOrUnknownInstance_KeepsTheDeprecatedRoute` and
+  `TestCancelAutoMerge_NewRouteNotFound_FallsBackToDeprecatedRoute`. What
   retires the rest: a client-go release carrying
   [gitlab-org/api/client-go!3101](https://gitlab.com/gitlab-org/api/client-go/-/merge_requests/3101)
   moves the new route to `MergeRequests.CancelAutoMerge` in a change of its
